@@ -852,6 +852,99 @@ impl Program {
                 } => {
                     // At this point we know it's not a rollback
                     if *current_index >= views.len() {
+                        // Notify before clearing - callback gets view output changes (actual changes to the view's result set)
+                        let callbacks = self.connection.db.view_change_callbacks.read();
+
+                        // Invoke ALL registered callbacks
+                        if !callbacks.is_empty() {
+                            // Convert output deltas to DatabaseChange format for each view
+                            for view_name in views.iter() {
+                                if let Some(state) =
+                                    self.connection.view_transaction_states.get(view_name)
+                                {
+                                    // Extract column names from the view's schema
+                                    let column_names = self
+                                        .connection
+                                        .schema
+                                        .read()
+                                        .get_materialized_view(view_name)
+                                        .and_then(|view_arc| {
+                                            view_arc.lock().ok().map(|view| {
+                                                view.column_schema
+                                                    .flat_columns()
+                                                    .iter()
+                                                    .filter_map(|col| col.name.clone())
+                                                    .collect::<Vec<String>>()
+                                            })
+                                        })
+                                        .unwrap_or_else(|| {
+                                            // Fallback: if we can't get schema, generate generic column names
+                                            // This should rarely happen but ensures callback always has column names
+                                            if let Some(output_delta) = state.get_output_delta() {
+                                                if let Some((first_row, _)) =
+                                                    output_delta.changes.first()
+                                                {
+                                                    (0..first_row.values.len())
+                                                        .map(|i| format!("col_{}", i))
+                                                        .collect()
+                                                } else {
+                                                    Vec::new()
+                                                }
+                                            } else {
+                                                Vec::new()
+                                            }
+                                        });
+
+                                    let mut changes = Vec::new();
+
+                                    // Get the output delta (changes to the view's result set)
+                                    if let Some(output_delta) = state.get_output_delta() {
+                                        let mut change_id = 0i64;
+
+                                        // Convert each delta entry to DatabaseChange
+                                        for (row, weight) in &output_delta.changes {
+                                            change_id += 1;
+
+                                            // Create ImmutableRecord from the row values
+                                            let record = crate::types::ImmutableRecord::from_values(
+                                                row.values.iter(),
+                                                row.values.len(),
+                                            );
+                                            let bin_record = record.get_payload().to_vec();
+
+                                            let change_type = match weight {
+                                                1 => crate::types::DatabaseChangeType::Insert {
+                                                    bin_record,
+                                                },
+                                                -1 => crate::types::DatabaseChangeType::Delete,
+                                                _ => continue, // Skip if weight is 0 or unexpected
+                                            };
+
+                                            changes.push(crate::types::DatabaseChange {
+                                                change_id,
+                                                change_time: 0, // We don't track time for view changes
+                                                change: change_type,
+                                                table_name: view_name.clone(), // The "table" is the view itself
+                                                id: row.rowid,
+                                            });
+                                        }
+                                    }
+
+                                    // Build the event with schema metadata
+                                    let event = crate::types::RelationChangeEvent {
+                                        relation_name: view_name.clone(),
+                                        columns: column_names,
+                                        changes,
+                                    };
+
+                                    // Call all registered callbacks with the complete event
+                                    for (_id, callback) in callbacks.iter() {
+                                        callback(&event);
+                                    }
+                                }
+                            }
+                        }
+
                         // All done, clear the transaction states
                         self.connection.view_transaction_states.clear();
                         state.view_delta_state = ViewDeltaCommitState::Done;
@@ -878,8 +971,16 @@ impl Program {
                         }
 
                         // Handle I/O from merge_delta - pass pager, circuit will create its own cursor
+                        // merge_delta returns the output delta (changes to the view's result set)
                         match view.merge_delta(delta_set, pager.clone())? {
-                            IOResult::Done(_) => {
+                            IOResult::Done(output_delta) => {
+                                // Store the output delta in the transaction state for the callback
+                                if let Some(view_state) =
+                                    self.connection.view_transaction_states.get(view_name)
+                                {
+                                    view_state.set_output_delta(output_delta);
+                                }
+
                                 // Move to next view
                                 state.view_delta_state = ViewDeltaCommitState::Processing {
                                     views: views.clone(),

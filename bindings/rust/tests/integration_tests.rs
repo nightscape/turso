@@ -477,3 +477,176 @@ async fn test_encryption() {
     fs::remove_file("test-encrypted.db").await.unwrap();
     fs::remove_file("test-encrypted.db-wal").await.unwrap();
 }
+
+#[tokio::test]
+async fn test_view_change_callback_multi_connection() {
+    use std::sync::{Arc, Mutex};
+
+    let builder = Builder::new_local(":memory:").with_views(true);
+    let db = builder.build().await.unwrap();
+
+    let conn_a = db.connect().unwrap();
+    let conn_b = db.connect().unwrap();
+
+    conn_a.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)", ()).await.unwrap();
+    conn_a.execute("CREATE MATERIALIZED VIEW test_view AS SELECT * FROM test", ()).await.unwrap();
+
+    let received_changes = Arc::new(Mutex::new(Vec::new()));
+    let received_changes_clone = received_changes.clone();
+
+    let _callback_id = conn_a.set_view_change_callback(move |event: &turso::RelationChangeEvent| {
+        received_changes_clone.lock().unwrap().push((
+            event.relation_name.clone(),
+            event.columns.clone(),
+            event.changes.len()
+        ));
+    }).unwrap();
+
+    conn_b.execute("INSERT INTO test VALUES (1, 'hello')", ()).await.unwrap();
+
+    let changes = received_changes.lock().unwrap();
+    assert_eq!(changes.len(), 1, "Callback should fire when connection B commits");
+    assert_eq!(changes[0].0, "test_view");
+    assert_eq!(changes[0].1, vec!["id", "value"], "Should have column names");
+    assert!(changes[0].2 > 0, "Should have received changes");
+}
+
+#[tokio::test]
+async fn test_view_change_callback_multiple_callbacks() {
+    use std::sync::{Arc, Mutex};
+
+    let builder = Builder::new_local(":memory:").with_views(true);
+    let db = builder.build().await.unwrap();
+
+    let conn_a = db.connect().unwrap();
+    let conn_b = db.connect().unwrap();
+    let conn_c = db.connect().unwrap();
+
+    conn_a.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)", ()).await.unwrap();
+    conn_a.execute("CREATE MATERIALIZED VIEW test_view AS SELECT * FROM test", ()).await.unwrap();
+
+    let callback1_called = Arc::new(Mutex::new(false));
+    let callback2_called = Arc::new(Mutex::new(false));
+
+    let callback1_clone = callback1_called.clone();
+    let callback2_clone = callback2_called.clone();
+
+    let _id1 = conn_a.set_view_change_callback(move |_event: &turso::RelationChangeEvent| {
+        *callback1_clone.lock().unwrap() = true;
+    }).unwrap();
+
+    let _id2 = conn_b.set_view_change_callback(move |_event: &turso::RelationChangeEvent| {
+        *callback2_clone.lock().unwrap() = true;
+    }).unwrap();
+
+    conn_c.execute("INSERT INTO test VALUES (1, 'test')", ()).await.unwrap();
+
+    assert!(*callback1_called.lock().unwrap(), "Callback 1 should have been called");
+    assert!(*callback2_called.lock().unwrap(), "Callback 2 should have been called");
+}
+
+#[tokio::test]
+async fn test_view_change_callback_removal() {
+    use std::sync::{Arc, Mutex};
+
+    let builder = Builder::new_local(":memory:").with_views(true);
+    let db = builder.build().await.unwrap();
+
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)", ()).await.unwrap();
+    conn.execute("CREATE MATERIALIZED VIEW test_view AS SELECT * FROM test", ()).await.unwrap();
+
+    let callback_count = Arc::new(Mutex::new(0));
+    let callback_count_clone = callback_count.clone();
+
+    let callback_id = conn.set_view_change_callback(move |_event: &turso::RelationChangeEvent| {
+        *callback_count_clone.lock().unwrap() += 1;
+    }).unwrap();
+
+    conn.execute("INSERT INTO test VALUES (1, 'first')", ()).await.unwrap();
+    assert_eq!(*callback_count.lock().unwrap(), 1, "Callback should fire before removal");
+
+    conn.clear_view_change_callback(callback_id).unwrap();
+
+    conn.execute("INSERT INTO test VALUES (2, 'second')", ()).await.unwrap();
+    assert_eq!(*callback_count.lock().unwrap(), 1, "Callback should NOT fire after removal");
+}
+
+#[tokio::test]
+async fn test_view_change_callback_clear_all() {
+    use std::sync::{Arc, Mutex};
+
+    let builder = Builder::new_local(":memory:").with_views(true);
+    let db = builder.build().await.unwrap();
+
+    let conn_a = db.connect().unwrap();
+    let conn_b = db.connect().unwrap();
+
+    conn_a.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)", ()).await.unwrap();
+    conn_a.execute("CREATE MATERIALIZED VIEW test_view AS SELECT * FROM test", ()).await.unwrap();
+
+    let callback1_count = Arc::new(Mutex::new(0));
+    let callback2_count = Arc::new(Mutex::new(0));
+
+    let callback1_clone = callback1_count.clone();
+    let callback2_clone = callback2_count.clone();
+
+    let _id1 = conn_a.set_view_change_callback(move |_event: &turso::RelationChangeEvent| {
+        *callback1_clone.lock().unwrap() += 1;
+    }).unwrap();
+
+    let _id2 = conn_b.set_view_change_callback(move |_event: &turso::RelationChangeEvent| {
+        *callback2_clone.lock().unwrap() += 1;
+    }).unwrap();
+
+    conn_a.execute("INSERT INTO test VALUES (1, 'first')", ()).await.unwrap();
+    assert_eq!(*callback1_count.lock().unwrap(), 1);
+    assert_eq!(*callback2_count.lock().unwrap(), 1);
+
+    conn_a.clear_all_view_change_callbacks().unwrap();
+
+    conn_a.execute("INSERT INTO test VALUES (2, 'second')", ()).await.unwrap();
+    assert_eq!(*callback1_count.lock().unwrap(), 1, "Callbacks should NOT fire after clear_all");
+    assert_eq!(*callback2_count.lock().unwrap(), 1, "Callbacks should NOT fire after clear_all");
+}
+
+#[tokio::test]
+async fn test_view_change_callback_column_names() {
+    use std::sync::{Arc, Mutex};
+
+    let builder = Builder::new_local(":memory:").with_views(true);
+    let db = builder.build().await.unwrap();
+
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)", ()).await.unwrap();
+    conn.execute("CREATE MATERIALIZED VIEW users_view AS SELECT id, name, age FROM users", ()).await.unwrap();
+
+    let received_events = Arc::new(Mutex::new(Vec::new()));
+    let received_events_clone = received_events.clone();
+
+    let _callback_id = conn.set_view_change_callback(move |event: &turso::RelationChangeEvent| {
+        received_events_clone.lock().unwrap().push((
+            event.relation_name.clone(),
+            event.columns.clone(),
+            event.changes.len()
+        ));
+    }).unwrap();
+
+    conn.execute("INSERT INTO users VALUES (1, 'Alice', 30)", ()).await.unwrap();
+    conn.execute("INSERT INTO users VALUES (2, 'Bob', 25)", ()).await.unwrap();
+
+    let events = received_events.lock().unwrap();
+    assert_eq!(events.len(), 2, "Should have received 2 change events");
+
+    // Verify first event has correct column names
+    assert_eq!(events[0].0, "users_view");
+    assert_eq!(events[0].1, vec!["id", "name", "age"], "Should have correct column names");
+    assert_eq!(events[0].2, 1, "First insert should have 1 change");
+
+    // Verify second event has same column names
+    assert_eq!(events[1].0, "users_view");
+    assert_eq!(events[1].1, vec!["id", "name", "age"], "Should have correct column names");
+    assert_eq!(events[1].2, 1, "Second insert should have 1 change");
+}

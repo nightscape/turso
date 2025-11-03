@@ -18,6 +18,7 @@ use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{turso_assert, Completion, CompletionError, Result, IO};
 use std::fmt::{Debug, Display};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Waker;
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
@@ -2529,6 +2530,46 @@ pub struct DatabaseChange {
     pub change: DatabaseChangeType,
     pub table_name: String,
     pub id: i64,
+}
+
+impl DatabaseChange {
+    /// Parse the binary record data into a vector of owned values.
+    /// Returns Some(values) for Insert and Update changes, None for Delete changes.
+    /// Each value corresponds to a column in the table.
+    pub fn parse_record(&self) -> Option<Vec<Value>> {
+        match &self.change {
+            DatabaseChangeType::Insert { bin_record }
+            | DatabaseChangeType::Update { bin_record } => {
+                let record = ImmutableRecord::from_bin_record(bin_record.clone());
+                let value_refs = record.get_values();
+                // Convert ValueRef to owned Value
+                Some(value_refs.iter().map(|v| v.to_owned()).collect())
+            }
+            DatabaseChangeType::Delete => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CallbackId(u64);
+
+impl CallbackId {
+    pub fn new() -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        Self(COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+/// Event data for materialized view change callbacks.
+/// Provides both the changes and the schema metadata needed to interpret them.
+#[derive(Debug)]
+pub struct RelationChangeEvent {
+    /// Name of the materialized view that changed
+    pub relation_name: String,
+    /// Column names in the view, in the same order as values in DatabaseChange records
+    pub columns: Vec<String>,
+    /// The actual row changes (inserts, updates, deletes)
+    pub changes: Vec<DatabaseChange>,
 }
 
 #[derive(Debug)]

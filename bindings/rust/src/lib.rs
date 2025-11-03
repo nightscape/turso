@@ -59,6 +59,9 @@ use std::task::Poll;
 pub use turso_core::EncryptionOpts;
 use turso_core::OpenFlags;
 
+pub use turso_core::CallbackId;
+pub use turso_core::types::{DatabaseChange, DatabaseChangeType, RelationChangeEvent};
+
 // Re-exports rows
 pub use crate::rows::{Row, Rows};
 use crate::transaction::DropBehavior;
@@ -94,6 +97,7 @@ pub struct Builder {
     path: String,
     enable_mvcc: bool,
     enable_encryption: bool,
+    enable_views: bool,
     vfs: Option<String>,
     encryption_opts: Option<EncryptionOpts>,
 }
@@ -105,6 +109,7 @@ impl Builder {
             path: path.to_string(),
             enable_mvcc: false,
             enable_encryption: false,
+            enable_views: false,
             vfs: None,
             encryption_opts: None,
         }
@@ -112,6 +117,11 @@ impl Builder {
 
     pub fn with_mvcc(mut self, mvcc_enabled: bool) -> Self {
         self.enable_mvcc = mvcc_enabled;
+        self
+    }
+
+    pub fn with_views(mut self, views_enabled: bool) -> Self {
+        self.enable_views = views_enabled;
         self
     }
 
@@ -136,6 +146,7 @@ impl Builder {
         let io = self.get_io()?;
         let opts = turso_core::DatabaseOpts::default()
             .with_mvcc(self.enable_mvcc)
+            .with_views(self.enable_views)
             .with_encryption(self.enable_encryption);
         let db = turso_core::Database::open_file_with_flags(
             io,
@@ -506,6 +517,53 @@ impl Connection {
             .lock()
             .map_err(|e| Error::MutexError(e.to_string()))?;
         conn.set_busy_timeout(duration);
+        Ok(())
+    }
+
+    /// Register a database-wide view change callback.
+    /// The callback will fire when ANY connection commits changes affecting materialized views.
+    /// Works in both auto-commit and explicit transaction modes.
+    /// Returns a callback ID that can be used to unregister.
+    ///
+    /// The callback receives a RelationChangeEvent containing:
+    /// - relation_name: The name of the materialized view
+    /// - columns: Column names in order, matching the values in DatabaseChange records
+    /// - changes: The actual row changes (inserts, updates, deletes)
+    pub fn set_view_change_callback<F>(&self, callback: F) -> Result<CallbackId>
+    where
+        F: Fn(&RelationChangeEvent) + Send + Sync + 'static,
+    {
+        let mut conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        let id = Arc::get_mut(&mut conn)
+            .ok_or_else(|| Error::MutexError("Cannot get mutable reference to connection".to_string()))?
+            .set_view_change_callback(callback);
+        Ok(id)
+    }
+
+    /// Remove a specific view change callback by ID
+    pub fn clear_view_change_callback(&self, id: CallbackId) -> Result<()> {
+        let mut conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        Arc::get_mut(&mut conn)
+            .ok_or_else(|| Error::MutexError("Cannot get mutable reference to connection".to_string()))?
+            .clear_view_change_callback(id);
+        Ok(())
+    }
+
+    /// Clear all view change callbacks (for cleanup/testing)
+    pub fn clear_all_view_change_callbacks(&self) -> Result<()> {
+        let mut conn = self
+            .inner
+            .lock()
+            .map_err(|e| Error::MutexError(e.to_string()))?;
+        Arc::get_mut(&mut conn)
+            .ok_or_else(|| Error::MutexError("Cannot get mutable reference to connection".to_string()))?
+            .clear_all_view_change_callbacks();
         Ok(())
     }
 }

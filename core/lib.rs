@@ -102,6 +102,9 @@ use tracing::{instrument, Level};
 use turso_macros::{match_ignore_ascii_case, AtomicEnum};
 use turso_parser::ast::fmt::ToTokens;
 use turso_parser::{ast, ast::Cmd, parser::Parser};
+pub use types::CallbackId;
+pub use types::DatabaseChange;
+pub use types::DatabaseChangeType;
 use types::IOResult;
 pub use types::Value;
 pub use types::ValueRef;
@@ -245,6 +248,12 @@ pub struct Database {
     builtin_syms: RwLock<SymbolTable>,
     opts: DatabaseOpts,
     n_connections: AtomicUsize,
+    view_change_callbacks: RwLock<
+        Vec<(
+            types::CallbackId,
+            Arc<dyn Fn(&types::RelationChangeEvent) + Send + Sync>,
+        )>,
+    >,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -500,6 +509,7 @@ impl Database {
             opts,
             buffer_pool: BufferPool::begin_init(&io, arena_size),
             n_connections: AtomicUsize::new(0),
+            view_change_callbacks: RwLock::new(Vec::new()),
         });
 
         db.register_global_builtin_extensions()
@@ -1156,6 +1166,7 @@ pub struct Connection {
     /// Per-connection view transaction states for uncommitted changes. This represents
     /// one entry per view that was touched in the transaction.
     view_transaction_states: AllViewsTxState,
+
     /// Connection-level metrics aggregation
     pub metrics: RwLock<ConnectionMetrics>,
     /// Greater than zero if connection executes a program within a program
@@ -2358,6 +2369,39 @@ impl Connection {
         let pager = self.pager.load();
         pager.set_reserved_space_bytes(reserved_bytes);
         Ok(())
+    }
+
+    /// Register a database-wide view change callback.
+    /// The callback will fire when ANY connection commits changes affecting materialized views.
+    /// Returns a callback ID that can be used to unregister.
+    ///
+    /// The callback receives a RelationChangeEvent containing:
+    /// - relation_name: The name of the materialized view
+    /// - columns: Column names in order, matching the values in DatabaseChange records
+    /// - changes: The actual row changes (inserts, updates, deletes)
+    pub fn set_view_change_callback<F>(&mut self, callback: F) -> types::CallbackId
+    where
+        F: Fn(&types::RelationChangeEvent) + Send + Sync + 'static,
+    {
+        let id = types::CallbackId::new();
+        self.db
+            .view_change_callbacks
+            .write()
+            .push((id, Arc::new(callback)));
+        id
+    }
+
+    /// Remove a specific callback by ID
+    pub fn clear_view_change_callback(&mut self, id: types::CallbackId) {
+        self.db
+            .view_change_callbacks
+            .write()
+            .retain(|(callback_id, _)| *callback_id != id);
+    }
+
+    /// Clear all view change callbacks (for cleanup/testing)
+    pub fn clear_all_view_change_callbacks(&mut self) {
+        self.db.view_change_callbacks.write().clear();
     }
 
     pub fn get_encryption_cipher_mode(&self) -> Option<CipherMode> {

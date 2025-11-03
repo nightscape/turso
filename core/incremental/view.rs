@@ -79,10 +79,13 @@ impl fmt::Debug for PopulateState {
 /// Per-connection transaction state for incremental views
 #[derive(Debug, Clone, Default)]
 pub struct ViewTransactionState {
-    // Per-table deltas for uncommitted changes
+    // Per-table deltas for uncommitted changes (input to the view)
     // Maps table_name -> Delta for that table
     // Using RefCell for interior mutability
     table_deltas: RefCell<HashMap<String, Delta>>,
+    // Output delta for the view (the actual changes to the view's result set)
+    // Computed when merge_delta is called
+    output_delta: RefCell<Option<Delta>>,
 }
 
 impl ViewTransactionState {
@@ -90,6 +93,7 @@ impl ViewTransactionState {
     pub fn new() -> Self {
         Self {
             table_deltas: RefCell::new(HashMap::new()),
+            output_delta: RefCell::new(None),
         }
     }
 
@@ -110,11 +114,22 @@ impl ViewTransactionState {
     /// Clear all changes in the delta
     pub fn clear(&self) {
         self.table_deltas.borrow_mut().clear();
+        *self.output_delta.borrow_mut() = None;
     }
 
-    /// Get deltas organized by table
+    /// Get deltas organized by table (input deltas)
     pub fn get_table_deltas(&self) -> HashMap<String, Delta> {
         self.table_deltas.borrow().clone()
+    }
+
+    /// Set the output delta (the actual changes to the view's result set)
+    pub fn set_output_delta(&self, delta: Delta) {
+        *self.output_delta.borrow_mut() = Some(delta);
+    }
+
+    /// Get the output delta (the actual changes to the view's result set)
+    pub fn get_output_delta(&self) -> Option<Delta> {
+        self.output_delta.borrow().clone()
     }
 
     /// Check if the delta is empty
@@ -1330,8 +1345,12 @@ impl IncrementalView {
         let table_name = self.referenced_tables[table_idx].name.clone();
         delta_set.insert(table_name, single_row_delta);
 
-        // Process through merge_delta
-        self.merge_delta(delta_set, pager)
+        // Process through merge_delta - we discard the output delta here since
+        // this is used during population, not during transaction commit
+        match self.merge_delta(delta_set, pager)? {
+            IOResult::Done(_output_delta) => Ok(IOResult::Done(())),
+            IOResult::IO(io) => Ok(IOResult::IO(io)),
+        }
     }
 
     /// Extract rowid and values from a row
@@ -1365,18 +1384,18 @@ impl IncrementalView {
         &mut self,
         delta_set: DeltaSet,
         pager: Arc<crate::Pager>,
-    ) -> crate::Result<IOResult<()>> {
+    ) -> crate::Result<IOResult<Delta>> {
         // Early return if all deltas are empty
         if delta_set.is_empty() {
-            return Ok(IOResult::Done(()));
+            return Ok(IOResult::Done(Delta::new()));
         }
 
         // Use the circuit to process the deltas and write to btree
         let input_data = delta_set.into_map();
 
-        // The circuit now handles all btree I/O internally with the provided pager
-        let _delta = return_if_io!(self.circuit.commit(input_data, pager));
-        Ok(IOResult::Done(()))
+        // The circuit handles all btree I/O internally and returns the output delta
+        let output_delta = return_if_io!(self.circuit.commit(input_data, pager));
+        Ok(IOResult::Done(output_delta))
     }
 }
 
