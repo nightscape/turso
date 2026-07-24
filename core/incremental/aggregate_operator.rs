@@ -1510,20 +1510,22 @@ impl AggregateState {
                     result.push(Value::from_i64(count));
                 }
                 AggregateFunction::Sum(col_idx) => {
-                    // SQL semantics: SUM over zero rows returns NULL (not 0).
-                    // Without FILTER this branch is unreachable today (the
-                    // group is suppressed when count == 0). With FILTER, a
-                    // group can exist with no rows contributing to this sum,
-                    // so we must distinguish "no entry" from "entry == 0.0".
-                    match self.sums.get(col_idx) {
-                        Some(sum) => result.push(Value::from_f64(*sum)),
-                        None => result.push(Value::Null),
-                    }
+                    // SUM over zero contributing rows is NULL, not 0. A group with no rows
+                    // has count 0; with FILTER a group can hold rows while nothing feeds
+                    // this sum, and `sums` only gains an entry for a row that passes.
+                    let sum = (self.count > 0)
+                        .then(|| self.sums.get(col_idx).copied())
+                        .flatten()
+                        .map_or(Value::Null, Value::from_f64);
+                    result.push(sum);
                 }
                 AggregateFunction::SumDistinct(col_idx) => {
-                    // Return the computed SUM(DISTINCT)
-                    let sum = self.distinct_sums.get(col_idx).copied().unwrap_or(0.0);
-                    result.push(Value::from_f64(sum));
+                    let sum = if self.count == 0 {
+                        Value::Null
+                    } else {
+                        Value::from_f64(self.distinct_sums.get(col_idx).copied().unwrap_or(0.0))
+                    };
+                    result.push(sum);
                 }
                 AggregateFunction::Avg(col_idx) => {
                     if let Some((sum, count)) = self.avgs.get(col_idx) {
@@ -1754,6 +1756,13 @@ impl AggregateOperator {
             aggregate_filters
         };
 
+        // Plain DISTINCT always groups by its projection, so it never has an implicit
+        // group. The combination would seed and persist a state that nothing can emit.
+        assert!(
+            !(is_distinct_only && group_by.is_empty()),
+            "plain DISTINCT cannot have an implicit group"
+        );
+
         // Build map of column indices to their MIN/MAX info
         let mut column_min_max = HashMap::default();
         let mut storage_indices = HashMap::default();
@@ -1833,6 +1842,28 @@ impl AggregateOperator {
         })
     }
 
+    /// An aggregate with no GROUP BY is evaluated over exactly one implicit group,
+    /// which exists for the lifetime of the view — it is read, emitted, and persisted
+    /// even when no input row maps to it.
+    fn has_implicit_group(&self) -> bool {
+        self.group_by.is_empty()
+    }
+
+    /// Key of the group described by [`Self::has_implicit_group`]: no group-by columns.
+    fn implicit_group_key() -> String {
+        Self::group_key_to_string(&[])
+    }
+
+    /// Adds the implicit group to `existing_groups` at its zero state unless it is
+    /// already there, so the delta below folds into it instead of skipping it.
+    fn seed_implicit_group(&self, existing_groups: &mut HashMap<String, AggregateState>) {
+        if self.has_implicit_group() {
+            existing_groups
+                .entry(Self::implicit_group_key())
+                .or_default();
+        }
+    }
+
     pub fn has_min_max(&self) -> bool {
         !self.column_min_max.is_empty()
     }
@@ -1867,12 +1898,15 @@ impl AggregateOperator {
                 // matching insert lands, tripping the apply_delta assertion.
                 deltas.left.consolidate();
 
-                if deltas.left.changes.is_empty() {
+                if deltas.left.changes.is_empty() && !self.has_implicit_group() {
                     *state = EvalState::Done;
                     return Ok(IOResult::Done((Delta::new(), HashMap::default())));
                 }
 
                 let mut groups_to_read = BTreeMap::new();
+                if self.has_implicit_group() {
+                    groups_to_read.insert(Self::implicit_group_key(), Vec::new());
+                }
                 for (row, _weight) in &deltas.left.changes {
                     let group_key = self.extract_group_key(&row.values);
                     let group_key_str = Self::group_key_to_string(&group_key);
@@ -1926,6 +1960,8 @@ impl AggregateOperator {
         // Track distinct value weights as we process the batch
         let mut batch_distinct_weights: HashMap<String, HashMap<(usize, HashableRow), isize>> =
             HashMap::default();
+
+        self.seed_implicit_group(existing_groups);
 
         // Process each change in the delta
         for (row, weight) in delta.changes.iter() {
@@ -1999,6 +2035,14 @@ impl AggregateOperator {
             // Always store the state for persistence (even if count=0, we need to delete it)
             final_states.insert(group_key_str.clone(), (group_key.clone(), state.clone()));
 
+            // Seeded, untouched by the delta, already materialized: nothing to emit.
+            if self.has_implicit_group()
+                && !temp_keys.contains_key(group_key_str)
+                && pre_existing_groups.contains(group_key_str)
+            {
+                continue;
+            }
+
             // Check if we only have DISTINCT (no other aggregates)
             if self.is_distinct_only {
                 // For plain DISTINCT, we output each distinct VALUE (not group)
@@ -2033,8 +2077,7 @@ impl AggregateOperator {
                     output_delta.changes.push((old_row, -1));
                 }
 
-                // Only include groups with count > 0 in the output delta
-                if state.count > 0 {
+                if state.count > 0 || self.has_implicit_group() {
                     // Build output row: group_by columns + aggregate values
                     let mut output_values = group_key.clone();
                     let aggregate_values = state.to_values(&self.aggregates)?;
@@ -2310,7 +2353,11 @@ impl IncrementalOperator for AggregateOperator {
                         let element_id = Hash128::new(0, 0); // Always zeros for regular aggregates
 
                         // Determine weight: 1 if exists, -1 if deleted
-                        let weight = if agg_state.count == 0 { -1 } else { 1 };
+                        let weight = if agg_state.count == 0 && !self.has_implicit_group() {
+                            -1
+                        } else {
+                            1
+                        };
 
                         // Serialize the aggregate state (only for regular aggregates, not plain DISTINCT)
                         let state_blob = agg_state.to_blob(&self.aggregates, group_key)?;

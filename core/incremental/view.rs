@@ -3,13 +3,15 @@ use super::dbsp::{Delta, RowValues};
 use super::fdw_mirror::MirrorSync;
 use super::operator::ComputationTracker;
 use crate::numeric::Numeric;
-use crate::schema::{BTreeTable, Column, Schema, Table};
+use crate::schema::{
+    BTreeTable, Column, Schema, Table, SCHEMA_TABLE_NAME, SQLITE_SEQUENCE_TABLE_NAME,
+};
 use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::logical::LogicalPlanBuilder;
 use crate::types::{IOResult, Value};
-use crate::util::{extract_view_columns, ViewColumnSchema};
+use crate::util::{extract_view_columns, normalize_ident, ViewColumnSchema};
 use crate::vtab::VirtualTable;
 use crate::{return_if_io, LimboError, Pager, Result, Statement};
 use parking_lot::Mutex as ParkingLotMutex;
@@ -143,6 +145,8 @@ pub enum PopulateState {
         /// Collected source rows the recursive circuit is fed
         input_map: HashMap<String, Delta>,
     },
+    /// All source rows consumed; run the circuit once with no input
+    Finalize,
     /// Population complete
     Done,
 }
@@ -192,6 +196,7 @@ impl fmt::Debug for PopulateState {
                 .debug_struct("ExecutingRecursiveCircuit")
                 .field("input_tables", &input_map.len())
                 .finish(),
+            PopulateState::Finalize => write!(f, "Finalize"),
             PopulateState::Done => write!(f, "Done"),
         }
     }
@@ -240,17 +245,20 @@ impl ViewTransactionState {
         }
     }
 
-    /// Insert a row into the delta for a specific table
+    /// Insert a row into the delta for a specific table.
+    /// Callers pass the table name as the DML statement spelled it, while the
+    /// circuit consumes deltas under the schema's normalized name.
     pub fn insert(&self, table_name: &str, key: i64, values: impl Into<RowValues>) {
         let mut deltas = self.table_deltas.lock();
-        let delta = deltas.entry(table_name.to_string()).or_default();
+        let delta = deltas.entry(normalize_ident(table_name)).or_default();
         delta.insert(key, values);
     }
 
-    /// Delete a row from the delta for a specific table
+    /// Delete a row from the delta for a specific table.
+    /// See [`ViewTransactionState::insert`] for why the name is normalized.
     pub fn delete(&self, table_name: &str, key: i64, values: impl Into<RowValues>) {
         let mut deltas = self.table_deltas.lock();
-        let delta = deltas.entry(table_name.to_string()).or_default();
+        let delta = deltas.entry(normalize_ident(table_name)).or_default();
         delta.delete(key, values);
     }
 
@@ -618,8 +626,39 @@ impl IncrementalView {
         schema: &Schema,
     ) -> Result<ViewColumnSchema> {
         crate::util::validate_select_for_unsupported_features(select)?;
+        Self::reject_unmaintainable_source(select, schema)?;
         // Use the shared function to extract columns with full table context
         extract_view_columns(select, schema)
+    }
+
+    /// Rows reach these tables through DDL and the AUTOINCREMENT machinery
+    /// rather than through row maintenance, so a view over one would populate
+    /// once and then stay stale. Checking the resolved name covers the
+    /// `sqlite_master` and temp spellings too. Existing views are still loaded,
+    /// only new ones refused.
+    fn reject_unmaintainable_source(select: &ast::Select, schema: &Schema) -> Result<()> {
+        let mut referenced_tables = Vec::new();
+        let mut aliases = HashMap::default();
+        let mut qualified_names = HashMap::default();
+        let mut table_conditions = HashMap::default();
+        Self::extract_all_tables(
+            select,
+            schema,
+            &mut referenced_tables,
+            &mut aliases,
+            &mut qualified_names,
+            &mut table_conditions,
+        )?;
+        let unmaintainable = referenced_tables.iter().find(|table| {
+            table.name == SCHEMA_TABLE_NAME || table.name == SQLITE_SEQUENCE_TABLE_NAME
+        });
+        if let Some(table) = unmaintainable {
+            return Err(LimboError::ParseError(format!(
+                "view cannot reference the internal table: {}",
+                table.name
+            )));
+        }
+        Ok(())
     }
 
     pub fn from_sql(
@@ -1067,28 +1106,30 @@ impl IncrementalView {
         qualified_names: &mut HashMap<String, String>,
         cte_names: &HashSet<String>,
     ) -> Result<()> {
-        let table_name = name.name.as_str();
+        // These names key the CTE set, the table map and the per-table conditions,
+        // all of which are matched against the schema's normalized table names.
+        let table_name = normalize_ident(name.name.as_str());
 
         // Build the fully qualified name
         let qualified_name = if let Some(ref db) = name.db_name {
-            format!("{db}.{table_name}")
+            format!("{}.{table_name}", normalize_ident(db.as_str()))
         } else {
-            table_name.to_string()
+            table_name.clone()
         };
 
         // Skip CTEs - they're not real tables
-        if !cte_names.contains(table_name) {
-            let ref_table = ReferencedTable::from_schema(schema, table_name).ok_or_else(|| {
+        if !cte_names.contains(&table_name) {
+            let ref_table = ReferencedTable::from_schema(schema, &table_name).ok_or_else(|| {
                 LimboError::ParseError(format!("Table '{table_name}' not found in schema"))
             })?;
-            table_map.insert(table_name.to_string(), ref_table);
-            qualified_names.insert(table_name.to_string(), qualified_name);
+            table_map.insert(table_name.clone(), ref_table);
+            qualified_names.insert(table_name.clone(), qualified_name);
 
             // Store the alias mapping if there is an alias
             if let Some(alias_enum) = alias {
                 aliases.insert(
-                    alias_enum.name().as_str().to_string(),
-                    table_name.to_string(),
+                    normalize_ident(alias_enum.name().as_str()),
+                    table_name.clone(),
                 );
             }
         }
@@ -1273,7 +1314,7 @@ impl IncrementalView {
         if let Some(ref with) = select.with {
             // First pass: collect all CTE names (needed for recursive CTEs)
             for cte in &with.ctes {
-                cte_names.insert(cte.tbl_name.as_str().to_string());
+                cte_names.insert(normalize_ident(cte.tbl_name.as_str()));
             }
 
             // Second pass: extract tables from each CTE's SELECT statement
@@ -1618,18 +1659,18 @@ impl IncrementalView {
             ),
             ast::Expr::Qualified(table_or_alias, column) => {
                 // Check if this qualification refers to our table
-                let table_str = table_or_alias.as_str();
-                let actual_table = if let Some(actual) = aliases.get(table_str) {
+                let table_str = normalize_ident(table_or_alias.as_str());
+                let actual_table = if let Some(actual) = aliases.get(&table_str) {
                     actual.clone()
                 } else if table_str.contains('.') {
                     // Handle database.table format
                     table_str
                         .split('.')
                         .next_back()
-                        .unwrap_or(table_str)
+                        .unwrap_or(&table_str)
                         .to_string()
                 } else {
-                    table_str.to_string()
+                    table_str.clone()
                 };
 
                 if actual_table == table_name {
@@ -1642,7 +1683,7 @@ impl IncrementalView {
             }
             ast::Expr::DoublyQualified(_database, table, column) => {
                 // Check if this refers to our table
-                if table.as_str() == table_name {
+                if table.as_str().eq_ignore_ascii_case(table_name) {
                     // Remove the qualification, keep just the column
                     ast::Expr::Id(column.clone())
                 } else {
@@ -1724,8 +1765,8 @@ impl IncrementalView {
             }
             ast::Expr::Qualified(table_or_alias, _) => {
                 // Handle database.table or just table/alias
-                let table_str = table_or_alias.as_str();
-                let table_name = if let Some(actual_table) = aliases.get(table_str) {
+                let table_str = normalize_ident(table_or_alias.as_str());
+                let table_name = if let Some(actual_table) = aliases.get(&table_str) {
                     // It's an alias
                     actual_table.clone()
                 } else if table_str.contains('.') {
@@ -1733,17 +1774,17 @@ impl IncrementalView {
                     table_str
                         .split('.')
                         .next_back()
-                        .unwrap_or(table_str)
+                        .unwrap_or(&table_str)
                         .to_string()
                 } else {
                     // It's a direct table name
-                    table_str.to_string()
+                    table_str.clone()
                 };
                 tables.push(table_name);
             }
             ast::Expr::DoublyQualified(_database, table, _column) => {
                 // For database.table.column, extract the table name
-                tables.push(table.to_string());
+                tables.push(normalize_ident(table.as_str()));
             }
             ast::Expr::Id(column) => {
                 // Unqualified column - try to find which table has this column
@@ -1753,11 +1794,11 @@ impl IncrementalView {
                     // Check which table has this column
                     for table_name in all_tables {
                         if let Some(table) = schema.get_table(table_name) {
-                            if table
-                                .columns()
-                                .iter()
-                                .any(|col| col.name.as_deref() == Some(column.as_str()))
-                            {
+                            if table.columns().iter().any(|col| {
+                                col.name
+                                    .as_deref()
+                                    .is_some_and(|n| n.eq_ignore_ascii_case(column.as_str()))
+                            }) {
                                 tables.push(table_name.clone());
                                 break; // Found the table, stop looking
                             }
@@ -1868,8 +1909,8 @@ impl IncrementalView {
                     current_idx,
                 } => {
                     if current_idx >= queries.len() {
-                        self.populate_state = PopulateState::Done;
-                        return Ok(IOResult::Done(()));
+                        self.populate_state = PopulateState::Finalize;
+                        continue 'outer;
                     }
 
                     let query = queries[current_idx].clone();
@@ -2132,6 +2173,23 @@ impl IncrementalView {
                         IOResult::IO(io) => {
                             self.populate_state =
                                 PopulateState::ExecutingRecursiveCircuit { input_map };
+                            return Ok(IOResult::IO(io));
+                        }
+                    }
+                }
+
+                PopulateState::Finalize => {
+                    // Materializes operators whose output does not depend on any input
+                    // row: an ungrouped aggregate yields its one row over an empty source.
+                    match self.circuit.commit(HashMap::default(), pager.clone())? {
+                        IOResult::Done(_) => {
+                            self.populate_state = PopulateState::Done;
+                            return Ok(IOResult::Done(()));
+                        }
+                        IOResult::IO(io) => {
+                            // Re-entering resumes the in-flight commit rather than starting
+                            // a second one: the input map is only read in CommitState::Init.
+                            self.populate_state = PopulateState::Finalize;
                             return Ok(IOResult::IO(io));
                         }
                     }

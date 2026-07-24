@@ -1,3 +1,4 @@
+use crate::alloc::TryClone;
 use crate::incremental::fdw_mirror::{mirror_specs_for_view, MirrorSpec};
 use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, view::IncrementalView};
 use crate::schema::{
@@ -312,6 +313,42 @@ pub fn translate_create_materialized_view(
         IncrementalView::validate_and_extract_columns(select_stmt, s)
     })?;
     let view_columns = view_column_schema.flat_columns();
+
+    // Column references resolve only when the DBSP circuit compiles, so compile once
+    // here to reject bad columns at DDL time. Storage roots do not affect compilation.
+    resolver.with_schema(database_id, |s| -> Result<()> {
+        // A view over an identity-declaring foreign table compiles against that
+        // table's mirror, which only enters the schema when the program this
+        // function is building runs. The dry run gets the mirrors the emitted
+        // DDL will create registered in a throwaway schema first, so it compiles
+        // the same circuit the load path will.
+        let mirror_specs = {
+            let source_names = IncrementalView::referenced_table_names(select_stmt, s)?;
+            mirror_specs_for_view(&normalized_view_name, &source_names, s)?
+        };
+        if mirror_specs.is_empty() {
+            IncrementalView::from_stmt(view_name.clone(), select_stmt.clone(), s, 0, 0, 0)?;
+            return Ok(());
+        }
+        let mut dry_run_schema = s.try_clone()?;
+        for spec in &mirror_specs {
+            // An orphaned mirror of a previous view of this name is dropped and
+            // recreated by the emitted program, so the spec's shape is the one
+            // that will be live.
+            dry_run_schema.remove_table(&spec.mirror_table);
+            dry_run_schema
+                .add_btree_table(Arc::new(BTreeTable::from_sql(&spec.create_sql(), 0)?))?;
+        }
+        IncrementalView::from_stmt(
+            view_name.clone(),
+            select_stmt.clone(),
+            &dry_run_schema,
+            0,
+            0,
+            0,
+        )?;
+        Ok(())
+    })?;
 
     // Reconstruct the SQL string for storage
     let sql = create_materialized_view_to_str(&view_name.name.as_ident(), select_stmt);

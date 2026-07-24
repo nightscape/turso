@@ -22,6 +22,7 @@ mod recursive_cte_iteration_cap;
 mod recursive_cte_order_by;
 mod recursive_cte_plan_shape;
 mod recursive_cte_reopen_restore;
+mod recursive_cte_runaway;
 mod reindex;
 mod statement_metadata;
 mod statement_reset;
