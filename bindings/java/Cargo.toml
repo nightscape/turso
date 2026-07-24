@@ -21,3 +21,4 @@ path = "rs_src/lib.rs"
 turso_core = { workspace = true, features = ["io_uring"] }
 jni = "0.21.1"
 thiserror = { workspace = true }
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }

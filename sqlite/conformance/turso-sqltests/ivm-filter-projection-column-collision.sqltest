@@ -1,0 +1,138 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@requires materialized_views "requires materialized view support"
+
+# A WHERE predicate that `predicate_needs_projection` classifies as "complex"
+# (LIKE, BETWEEN, IN, CAST, ...) routes the plan through the projection-rewrite
+# path in `DbspCompiler::compile_plan`. That path rebuilds the passthrough
+# projection over the filter's input schema with `table: None`, discarding the
+# table qualifier. When the join's input schema holds two columns with the same
+# bare name, the now-unqualified reference binds to the FIRST match, so the
+# output column is silently wired to the wrong table.
+#
+# Every test below joins two tables that both have a column named `name`.
+# The control test uses a simple comparison and is unaffected.
+
+test ivm-filter-collision-like {
+    CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT, tag TEXT);
+    CREATE TABLE child (id INTEGER PRIMARY KEY, name TEXT, parent_ref INTEGER);
+    INSERT INTO parent VALUES (1,'P1','x'),(2,'P2','y');
+    INSERT INTO child VALUES (10,'C1',1),(11,'C2',2);
+
+    CREATE MATERIALIZED VIEW mv_like AS
+      SELECT p.id AS pid, p.name AS pname, c.name AS cname
+      FROM parent p JOIN child c ON c.parent_ref = p.id
+      WHERE p.tag NOT LIKE '%zzz%';
+
+    SELECT * FROM mv_like ORDER BY pid;
+}
+expect {
+    1|P1|C1
+    2|P2|C2
+}
+
+test ivm-filter-collision-between {
+    CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT, tag TEXT);
+    CREATE TABLE child (id INTEGER PRIMARY KEY, name TEXT, parent_ref INTEGER);
+    INSERT INTO parent VALUES (1,'P1','x'),(2,'P2','y');
+    INSERT INTO child VALUES (10,'C1',1),(11,'C2',2);
+
+    CREATE MATERIALIZED VIEW mv_between AS
+      SELECT p.id AS pid, p.name AS pname, c.name AS cname
+      FROM parent p JOIN child c ON c.parent_ref = p.id
+      WHERE p.id BETWEEN 0 AND 999;
+
+    SELECT * FROM mv_between ORDER BY pid;
+}
+expect {
+    1|P1|C1
+    2|P2|C2
+}
+
+test ivm-filter-collision-in-list {
+    CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT, tag TEXT);
+    CREATE TABLE child (id INTEGER PRIMARY KEY, name TEXT, parent_ref INTEGER);
+    INSERT INTO parent VALUES (1,'P1','x'),(2,'P2','y');
+    INSERT INTO child VALUES (10,'C1',1),(11,'C2',2);
+
+    CREATE MATERIALIZED VIEW mv_in AS
+      SELECT p.id AS pid, p.name AS pname, c.name AS cname
+      FROM parent p JOIN child c ON c.parent_ref = p.id
+      WHERE p.id IN (1,2,3);
+
+    SELECT * FROM mv_in ORDER BY pid;
+}
+expect {
+    1|P1|C1
+    2|P2|C2
+}
+
+test ivm-filter-collision-cast {
+    CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT, tag TEXT);
+    CREATE TABLE child (id INTEGER PRIMARY KEY, name TEXT, parent_ref INTEGER);
+    INSERT INTO parent VALUES (1,'P1','x'),(2,'P2','y');
+    INSERT INTO child VALUES (10,'C1',1),(11,'C2',2);
+
+    CREATE MATERIALIZED VIEW mv_cast AS
+      SELECT p.id AS pid, p.name AS pname, c.name AS cname
+      FROM parent p JOIN child c ON c.parent_ref = p.id
+      WHERE CAST(p.id AS INTEGER) > 0;
+
+    SELECT * FROM mv_cast ORDER BY pid;
+}
+expect {
+    1|P1|C1
+    2|P2|C2
+}
+
+test ivm-filter-collision-self-join {
+    CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, boss INTEGER, tag TEXT);
+    INSERT INTO emp VALUES (1,'Boss',NULL,'x'),(2,'Worker',1,'y');
+
+    CREATE MATERIALIZED VIEW mv_self AS
+      SELECT e.id AS eid, e.name AS ename, m.name AS mname
+      FROM emp e JOIN emp m ON e.boss = m.id
+      WHERE e.tag NOT LIKE '%zzz%';
+
+    SELECT * FROM mv_self ORDER BY eid;
+}
+expect {
+    2|Worker|Boss
+}
+
+test ivm-filter-collision-three-way {
+    CREATE TABLE t1 (k INTEGER PRIMARY KEY, name TEXT, tag TEXT);
+    CREATE TABLE t2 (k INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE t3 (k INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t1 VALUES (1,'A1','x');
+    INSERT INTO t2 VALUES (1,'B1');
+    INSERT INTO t3 VALUES (1,'C1');
+
+    CREATE MATERIALIZED VIEW mv_three AS
+      SELECT t1.k AS k, t1.name AS n1, t2.name AS n2, t3.name AS n3
+      FROM t1 JOIN t2 ON t2.k = t1.k JOIN t3 ON t3.k = t1.k
+      WHERE t1.tag NOT LIKE '%zzz%';
+
+    SELECT * FROM mv_three ORDER BY k;
+}
+expect {
+    1|A1|B1|C1
+}
+
+test ivm-filter-collision-simple-predicate-control {
+    CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT, tag TEXT);
+    CREATE TABLE child (id INTEGER PRIMARY KEY, name TEXT, parent_ref INTEGER);
+    INSERT INTO parent VALUES (1,'P1','x'),(2,'P2','y');
+    INSERT INTO child VALUES (10,'C1',1),(11,'C2',2);
+
+    CREATE MATERIALIZED VIEW mv_plain AS
+      SELECT p.id AS pid, p.name AS pname, c.name AS cname
+      FROM parent p JOIN child c ON c.parent_ref = p.id
+      WHERE p.id > 0;
+
+    SELECT * FROM mv_plain ORDER BY pid;
+}
+expect {
+    1|P1|C1
+    2|P2|C2
+}

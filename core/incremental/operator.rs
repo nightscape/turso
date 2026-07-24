@@ -5,6 +5,7 @@
 pub use crate::incremental::aggregate_operator::{
     AggregateEvalState, AggregateFunction, AggregateState,
 };
+pub use crate::incremental::antijoin_operator::{AntijoinEvalState, AntijoinOperator};
 pub use crate::incremental::filter_operator::{FilterOperator, FilterPredicate};
 pub use crate::incremental::input_operator::InputOperator;
 pub use crate::incremental::join_operator::{JoinEvalState, JoinOperator, JoinType};
@@ -15,12 +16,14 @@ use crate::incremental::dbsp::{Delta, DeltaPair};
 use crate::numeric::Numeric;
 use crate::schema::{Index, IndexColumn};
 use crate::storage::btree::BTreeCursor;
-use crate::sync::Arc;
 use crate::sync::Mutex;
-use crate::types::IOResultOr;
+use crate::types::{IOResult, IOResultOr};
+use crate::Result;
+use std::any::Any;
 use std::fmt::Debug;
+use std::sync::Arc;
 
-/// Struct to hold both table and index cursors for DBSP state operations
+/// Struct to hold both table and index cursors for DBSP state operations.
 pub struct DbspStateCursors {
     /// Cursor for the DBSP state table
     pub table_cursor: BTreeCursor,
@@ -35,6 +38,13 @@ impl DbspStateCursors {
             table_cursor,
             index_cursor,
         }
+    }
+}
+
+/// Debug omits cursor internals since BTreeCursor doesn't implement Debug.
+impl std::fmt::Debug for DbspStateCursors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbspStateCursors").finish_non_exhaustive()
     }
 }
 
@@ -75,6 +85,7 @@ pub enum EvalState {
     Init { deltas: DeltaPair },
     Aggregate(Box<AggregateEvalState>),
     Join(Box<JoinEvalState>),
+    Antijoin(Box<AntijoinEvalState>),
     Done,
 }
 
@@ -202,7 +213,7 @@ pub enum QueryOperator {
 /// Base trait for incremental operators
 // SAFETY: This needs to be audited for thread safety.
 // See: https://github.com/tursodatabase/turso/issues/1552
-pub trait IncrementalOperator: Debug + Send {
+pub trait IncrementalOperator: Debug + Send + Any {
     /// Evaluate the operator with a state, without modifying internal state
     /// This is used during query execution to compute results
     /// May need to read from storage to get current state (e.g., for aggregates)
@@ -223,6 +234,12 @@ pub trait IncrementalOperator: Debug + Send {
 
     /// Set computation tracker
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>);
+
+    /// Downcast to Any
+    fn as_any(&self) -> &dyn Any;
+
+    /// Downcast to Any (mutable)
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 #[cfg(test)]
@@ -321,7 +338,7 @@ mod tests {
                             assert!(state.count != 0);
                             // Build output row: group_by columns + aggregate values
                             let mut output_values = group_key.clone();
-                            output_values.extend(state.to_values(&agg.aggregates));
+                            output_values.extend(state.to_values(&agg.aggregates).unwrap());
 
                             let group_key_str = AggregateOperator::group_key_to_string(&group_key);
                             let rowid = agg.generate_group_rowid(&group_key_str);
@@ -387,6 +404,7 @@ mod tests {
             vec![],                          // No GROUP BY
             vec![AggregateFunction::Sum(2)], // age is at index 2
             vec!["id".to_string(), "name".to_string(), "age".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -512,6 +530,7 @@ mod tests {
                 "player".to_string(),
                 "score".to_string(),
             ],
+            vec![],
         )
         .unwrap();
 
@@ -664,6 +683,7 @@ mod tests {
                 "category".to_string(),
                 "price".to_string(),
             ],
+            vec![],
         )
         .unwrap();
         agg.set_tracker(tracker.clone());
@@ -745,6 +765,7 @@ mod tests {
                 "product".to_string(),
                 "amount".to_string(),
             ],
+            vec![],
         )
         .unwrap();
         agg.set_tracker(tracker.clone());
@@ -846,6 +867,7 @@ mod tests {
                 "user_id".to_string(),
                 "amount".to_string(),
             ],
+            vec![],
         )
         .unwrap();
 
@@ -936,6 +958,7 @@ mod tests {
                 "category".to_string(),
                 "value".to_string(),
             ],
+            vec![],
         )
         .unwrap();
 
@@ -1040,6 +1063,7 @@ mod tests {
                 "category".to_string(),
                 "value".to_string(),
             ],
+            vec![],
         )
         .unwrap();
 
@@ -1121,6 +1145,7 @@ mod tests {
             group_by,
             aggregates,
             input_columns,
+            vec![],
         )
         .unwrap();
 
@@ -1212,6 +1237,7 @@ mod tests {
             group_by,
             aggregates,
             input_columns,
+            vec![],
         )
         .unwrap();
 
@@ -1297,6 +1323,7 @@ mod tests {
             group_by,
             aggregates,
             input_columns,
+            vec![],
         )
         .unwrap();
 
@@ -1367,6 +1394,7 @@ mod tests {
             group_by,
             aggregates,
             input_columns,
+            vec![],
         )
         .unwrap();
 
@@ -1466,8 +1494,8 @@ mod tests {
         assert_eq!(state.changes.len(), 1);
         assert_eq!(state.changes[0].0.rowid, 3);
         assert_eq!(
-            state.changes[0].0.values,
-            vec![Value::from_i64(3), Value::from_i64(3)]
+            &state.changes[0].0.values[..],
+            &[Value::from_i64(3), Value::from_i64(3)]
         );
 
         // Simulate an UPDATE that changes rowid from 3 to 1
@@ -1611,6 +1639,7 @@ mod tests {
                 "category".to_string(),
                 "amount".to_string(),
             ],
+            vec![],
         )
         .unwrap();
 
@@ -1778,6 +1807,7 @@ mod tests {
                 AggregateFunction::Sum(1), // value is at index 1
             ],
             vec!["id".to_string(), "value".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -1858,6 +1888,7 @@ mod tests {
             vec![1], // type is at index 1
             vec![AggregateFunction::Count],
             vec!["id".to_string(), "type".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -1976,6 +2007,7 @@ mod tests {
                 AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -2045,6 +2077,7 @@ mod tests {
                 AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -2136,6 +2169,7 @@ mod tests {
                 AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -2227,6 +2261,7 @@ mod tests {
                 AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -2310,6 +2345,7 @@ mod tests {
                 AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -2393,6 +2429,7 @@ mod tests {
                 AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -2489,6 +2526,7 @@ mod tests {
                 "name".to_string(),
                 "price".to_string(),
             ],
+            vec![],
         )
         .unwrap();
 
@@ -2587,6 +2625,7 @@ mod tests {
                 AggregateFunction::Max(2), // price is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "price".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -2664,6 +2703,7 @@ mod tests {
                 AggregateFunction::Max(2), // score is at index 2
             ],
             vec!["id".to_string(), "name".to_string(), "score".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -2733,6 +2773,7 @@ mod tests {
                 AggregateFunction::Max(1), // name is at index 1
             ],
             vec!["id".to_string(), "name".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -2776,6 +2817,7 @@ mod tests {
                 AggregateFunction::Avg(1), // value is at index 1
             ],
             vec!["id".to_string(), "value".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -2867,6 +2909,7 @@ mod tests {
                 AggregateFunction::Min(2), // col3 is at index 2
             ],
             vec!["col1".to_string(), "col2".to_string(), "col3".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -3464,8 +3507,11 @@ mod tests {
             .unwrap();
 
         // Should produce 3 deletions and 3 insertions (one for each order)
-        assert_eq!(result2.changes.len(), 6,
-            "Should produce 6 changes (3 deletions + 3 insertions) when updating customer with 3 orders");
+        assert_eq!(
+            result2.changes.len(),
+            6,
+            "Should produce 6 changes (3 deletions + 3 insertions) when updating customer with 3 orders"
+        );
 
         let deletions: Vec<_> = result2.changes.iter().filter(|(_, w)| *w == -1).collect();
         let insertions: Vec<_> = result2.changes.iter().filter(|(_, w)| *w == 1).collect();
@@ -3702,7 +3748,11 @@ mod tests {
         let mut seen_rowids = HashSet::default();
         for (row, _) in &result.changes {
             let was_new = seen_rowids.insert(row.rowid);
-            assert!(was_new, "Duplicate rowid found: {}. This would cause rows to overwrite each other in btree storage!", row.rowid);
+            assert!(
+                was_new,
+                "Duplicate rowid found: {}. This would cause rows to overwrite each other in btree storage!",
+                row.rowid
+            );
         }
     }
 
@@ -3796,7 +3846,7 @@ mod tests {
         let result1 = merge_op
             .commit(DeltaPair::new(left_delta1, right_delta1), &mut cursors)
             .unwrap();
-        if let IOResult::Done(merged1) = result1 {
+        let (rowid_of_2, all_first_rowids) = if let IOResult::Done(merged1) = result1 {
             // Should have 4 unique values (1, 2, 3, 4)
             // But 6 total entries (3 from left + 3 from right)
             assert_eq!(merged1.len(), 6);
@@ -3809,9 +3859,16 @@ mod tests {
                 4,
                 "Should have 4 unique rowids for 4 unique values"
             );
+            let rowid_of_2 = merged1
+                .changes
+                .iter()
+                .find(|(row, _)| row.values[..] == [Value::from_i64(2)])
+                .map(|(row, _)| row.rowid)
+                .unwrap();
+            (rowid_of_2, unique_rowids)
         } else {
             panic!("Expected Done result");
-        }
+        };
 
         // Second operation: insert value 2 again from left, and value 5 from right
         let mut left_delta2 = Delta::new();
@@ -3830,14 +3887,13 @@ mod tests {
             let has_existing_rowid = merged2
                 .changes
                 .iter()
-                .any(|(row, _)| row.values == vec![Value::from_i64(2)] && row.rowid <= 4);
+                .any(|(row, _)| row.values[..] == [Value::from_i64(2)] && row.rowid == rowid_of_2);
             assert!(has_existing_rowid, "Value 2 should reuse existing rowid");
 
-            // Check that value 5 got a new rowid
-            let has_new_rowid = merged2
-                .changes
-                .iter()
-                .any(|(row, _)| row.values == vec![Value::from_i64(5)] && row.rowid > 4);
+            // Check that value 5 got a rowid distinct from every earlier one
+            let has_new_rowid = merged2.changes.iter().any(|(row, _)| {
+                row.values[..] == [Value::from_i64(5)] && !all_first_rowids.contains(&row.rowid)
+            });
             assert!(has_new_rowid, "Value 5 should get a new rowid");
         } else {
             panic!("Expected Done result");
@@ -3911,7 +3967,7 @@ mod tests {
             merged2
                 .changes
                 .iter()
-                .find(|(row, _)| row.values == vec![Value::from_i64(2001)])
+                .find(|(row, _)| row.values[..] == [Value::from_i64(2001)])
                 .map(|(row, _)| row.rowid)
                 .unwrap()
         } else {
@@ -3997,7 +4053,7 @@ mod tests {
             merged1
                 .changes
                 .iter()
-                .find(|(row, _)| row.values == vec![Value::from_i64(100)])
+                .find(|(row, _)| row.values[..] == [Value::from_i64(100)])
                 .map(|(row, _)| row.rowid)
                 .unwrap()
         } else {
@@ -4064,6 +4120,7 @@ mod tests {
                 "val2".to_string(),
                 "val3".to_string(),
             ],
+            vec![],
         )
         .unwrap();
 
@@ -4110,6 +4167,7 @@ mod tests {
                 "val2".to_string(),
                 "val3".to_string(),
             ],
+            vec![],
         )
         .unwrap();
 
@@ -4170,6 +4228,7 @@ mod tests {
             vec![0], // group by column 0 (value)
             vec![],  // Empty aggregates for plain DISTINCT
             vec!["value".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -4227,6 +4286,7 @@ mod tests {
             vec![0, 1], // group by both columns
             vec![],     // Empty aggregates for plain DISTINCT
             vec!["category".to_string(), "value".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -4314,6 +4374,7 @@ mod tests {
             vec![0],
             vec![], // Empty aggregates for plain DISTINCT
             vec!["value".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -4384,6 +4445,7 @@ mod tests {
             vec![0],
             vec![], // Empty aggregates for plain DISTINCT
             vec!["value".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -4413,6 +4475,7 @@ mod tests {
             vec![0],
             vec![], // Empty aggregates for plain DISTINCT
             vec!["value".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -4461,6 +4524,7 @@ mod tests {
             vec![0, 1], // group by category and value
             vec![],     // Empty aggregates for plain DISTINCT
             vec!["category".to_string(), "value".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -4555,6 +4619,7 @@ mod tests {
                 AggregateFunction::AvgDistinct(0),   // AVG(DISTINCT value)
             ],
             vec!["value".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -4606,6 +4671,7 @@ mod tests {
             vec![], // No GROUP BY
             vec![AggregateFunction::CountDistinct(1)],
             vec!["id".to_string(), "value".to_string()],
+            vec![],
         )
         .unwrap();
 
@@ -4653,6 +4719,7 @@ mod tests {
             vec![],
             vec![AggregateFunction::SumDistinct(1)],
             vec!["id".to_string(), "value".to_string()],
+            vec![],
         )
         .unwrap();
 
