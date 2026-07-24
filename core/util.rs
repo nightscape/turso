@@ -173,6 +173,7 @@ struct ParseSchemaRowsInner {
     dbsp_state_roots: HashMap<String, i64>,
     dbsp_state_index_roots: HashMap<String, i64>,
     materialized_view_info: HashMap<String, (String, i64)>,
+    deferred_foreign_tables: Vec<(String, String)>,
 }
 
 impl ParseSchemaRowsState {
@@ -188,6 +189,7 @@ impl ParseSchemaRowsState {
                 dbsp_state_roots: HashMap::default(),
                 dbsp_state_index_roots: HashMap::default(),
                 materialized_view_info: HashMap::default(),
+                deferred_foreign_tables: Vec::new(),
             }),
         }
     }
@@ -219,6 +221,7 @@ pub fn parse_schema_rows(
             dbsp_state_roots,
             dbsp_state_index_roots,
             materialized_view_info,
+            deferred_foreign_tables,
         } = inner;
         crate::return_if_io!(rows.run_with_row_callback_nonblock(|row| {
             let ty = row.get::<&str>(0)?;
@@ -240,6 +243,7 @@ pub fn parse_schema_rows(
                 materialized_view_info,
                 resolve_attached_db,
                 dialect,
+                deferred_foreign_tables,
             )
         }));
     }
@@ -250,12 +254,23 @@ pub fn parse_schema_rows(
         .take()
         .expect("ParseSchemaRowsState not initialized");
     let has_mv_store = inner.rows.mv_store().is_some();
+    let known_matview_names: HashSet<String> = inner
+        .materialized_view_info
+        .keys()
+        .map(|n| normalize_ident(n))
+        .collect();
     schema.populate_indices(
         syms,
         inner.from_sql_indexes,
         inner.automatic_indices,
         has_mv_store,
+        &known_matview_names,
     )?;
+    // Process deferred foreign tables before matviews — matviews may reference foreign tables
+    for (name, sql) in inner.deferred_foreign_tables {
+        schema.populate_foreign_table(&name, &sql, syms)?;
+    }
+
     schema.populate_materialized_views(
         inner.materialized_view_info,
         inner.dbsp_state_roots,
@@ -377,14 +392,10 @@ pub fn module_args_from_sql(sql: &str) -> Result<Vec<turso_ext::Value>> {
                     in_quotes = true;
                 }
             }
-            ',' => {
-                if !in_quotes {
-                    if !current_arg.trim().is_empty() {
-                        args.push(turso_ext::Value::from_text(current_arg.trim().to_string()));
-                        current_arg.clear();
-                    }
-                } else {
-                    current_arg.push(c);
+            ',' if !in_quotes => {
+                if !current_arg.trim().is_empty() {
+                    args.push(turso_ext::Value::from_text(current_arg.trim().to_string()));
+                    current_arg.clear();
                 }
             }
             _ => {
@@ -1862,6 +1873,116 @@ pub fn extract_view_columns(
     let mut tables = Vec::new();
     let mut columns = Vec::new();
     let mut column_name_counts: HashMap<String, usize> = HashMap::default();
+    // Tables whose columns must be nullable in the view's output schema:
+    // any table on the right side of a LEFT (or FULL) JOIN. Each entry is
+    // the table name OR alias (whichever was used in the FROM clause).
+    let mut nullable_table_refs: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    // Store CTE column definitions for SELECT * expansion
+    let mut cte_columns: HashMap<String, Vec<String>> = HashMap::default();
+    // Track seen table names for O(1) duplicate checking
+    let mut seen_tables: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Handle WITH clause (CTEs) - add CTE names as valid table references
+    if let Some(with) = &select_stmt.with {
+        for cte in &with.ctes {
+            let cte_name = normalize_ident(cte.tbl_name.as_str());
+            // Extract column names from CTE definition if present
+            if !cte.columns.is_empty() {
+                let col_names: Vec<String> = cte
+                    .columns
+                    .iter()
+                    .map(|ic| normalize_ident(ic.col_name.as_str()))
+                    .collect();
+                cte_columns.insert(cte_name.clone(), col_names);
+            } else {
+                // No explicit column names - extract from the CTE's SELECT statement (base case)
+                // For recursive CTEs, this is the first SELECT before UNION/UNION ALL
+                if let ast::OneSelect::Select {
+                    columns: cte_select_columns,
+                    from: cte_from,
+                    ..
+                } = &cte.select.body.select
+                {
+                    // Collect tables referenced in the CTE's FROM clause for star expansion
+                    let cte_from_tables: Vec<(String, Option<String>)> = if let Some(from) =
+                        cte_from
+                    {
+                        let mut ft = Vec::new();
+                        if let ast::SelectTable::Table(qn, alias, _) = from.select.as_ref() {
+                            let tname = normalize_ident(qn.name.as_str());
+                            let talias = alias.as_ref().map(|a| normalize_ident(a.name().as_str()));
+                            ft.push((tname, talias));
+                        }
+                        for join in &from.joins {
+                            if let ast::SelectTable::Table(qn, alias, _) = join.table.as_ref() {
+                                let tname = normalize_ident(qn.name.as_str());
+                                let talias =
+                                    alias.as_ref().map(|a| normalize_ident(a.name().as_str()));
+                                ft.push((tname, talias));
+                            }
+                        }
+                        ft
+                    } else {
+                        Vec::new()
+                    };
+
+                    let mut col_names: Vec<String> = Vec::new();
+                    for rc in cte_select_columns.iter() {
+                        match rc {
+                            ast::ResultColumn::Expr(expr, alias) => {
+                                if let Some(name) = alias
+                                    .as_ref()
+                                    .map(|a| normalize_ident(a.name().as_str()))
+                                    .or_else(|| extract_column_name_from_expr(expr))
+                                {
+                                    col_names.push(name);
+                                }
+                            }
+                            ast::ResultColumn::Star => {
+                                for (tname, _) in &cte_from_tables {
+                                    if let Some(table_obj) = schema.get_table(tname) {
+                                        for col in table_obj.columns() {
+                                            if let Some(name) = &col.name {
+                                                col_names.push(name.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            ast::ResultColumn::TableStar(tref) => {
+                                let ref_name = normalize_ident(tref.as_str());
+                                let resolved = cte_from_tables
+                                    .iter()
+                                    .find(|(tname, talias)| {
+                                        *tname == ref_name || talias.as_deref() == Some(&ref_name)
+                                    })
+                                    .map(|(tname, _)| tname.as_str());
+                                if let Some(tname) = resolved {
+                                    if let Some(table_obj) = schema.get_table(tname) {
+                                        for col in table_obj.columns() {
+                                            if let Some(name) = &col.name {
+                                                col_names.push(name.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !col_names.is_empty() {
+                        cte_columns.insert(cte_name.clone(), col_names);
+                    }
+                }
+            }
+            seen_tables.insert(cte_name.clone());
+            tables.push(ViewTable {
+                name: cte_name,
+                db_name: None,
+                alias: None,
+            });
+        }
+    }
 
     // Navigate to the first SELECT in the statement
     if let ast::OneSelect::Select {
@@ -1871,8 +1992,9 @@ pub fn extract_view_columns(
     } = &select_stmt.body.select
     {
         // First, extract all tables (from FROM clause and JOINs)
+        // Skip tables that are already defined as CTEs to avoid duplicates
         if let Some(from) = from {
-            // Add the main table from FROM clause
+            // Add the main table from FROM clause (only if not a CTE)
             match from.select.as_ref() {
                 ast::SelectTable::Table(qualified_name, alias, _) => {
                     let table_name = normalize_ident(qualified_name.name.as_str());
@@ -1880,31 +2002,54 @@ pub fn extract_view_columns(
                         .db_name
                         .as_ref()
                         .map(|db| normalize_ident(db.as_str()));
-                    tables.push(ViewTable {
-                        name: table_name,
-                        db_name,
-                        alias: alias.as_ref().map(|a| normalize_ident(a.name().as_str())),
-                    });
+                    // Skip CTEs (already added during WITH processing)
+                    if !seen_tables.contains(&table_name) {
+                        tables.push(ViewTable {
+                            name: table_name,
+                            db_name,
+                            alias: alias.as_ref().map(|a| normalize_ident(a.name().as_str())),
+                        });
+                    }
                 }
                 _ => {
                     // Handle other types like subqueries if needed
                 }
             }
 
-            // Add tables from JOINs
+            // Add tables from JOINs (only if not CTEs)
             for join in &from.joins {
+                // For LEFT/FULL JOIN, the right-side table's columns must be
+                // nullable in the view's persistent schema (matched rows from
+                // the inner side of the join carry real values, but the
+                // unmatched-l null-padded rows produced by AntijoinOperator
+                // contain NULLs for these columns).
+                let is_left_or_full = matches!(
+                    join.operator,
+                    ast::JoinOperator::TypedJoin(Some(jt))
+                        if jt.intersects(ast::JoinType::LEFT | ast::JoinType::RIGHT)
+                );
                 match join.table.as_ref() {
                     ast::SelectTable::Table(qualified_name, alias, _) => {
                         let table_name = normalize_ident(qualified_name.name.as_str());
+                        let alias_norm = alias.as_ref().map(|a| normalize_ident(a.name().as_str()));
                         let db_name = qualified_name
                             .db_name
                             .as_ref()
                             .map(|db| normalize_ident(db.as_str()));
-                        tables.push(ViewTable {
-                            name: table_name,
-                            db_name,
-                            alias: alias.as_ref().map(|a| normalize_ident(a.name().as_str())),
-                        });
+                        if is_left_or_full {
+                            // Match the lookup convention used by find_table_index:
+                            // alias takes precedence if present, otherwise name.
+                            nullable_table_refs
+                                .insert(alias_norm.clone().unwrap_or_else(|| table_name.clone()));
+                        }
+                        // Skip CTEs (already added during WITH processing)
+                        if !seen_tables.contains(&table_name) {
+                            tables.push(ViewTable {
+                                name: table_name,
+                                db_name,
+                                alias: alias_norm,
+                            });
+                        }
                     }
                     _ => {
                         // Handle other types like subqueries if needed
@@ -1912,6 +2057,23 @@ pub fn extract_view_columns(
                 }
             }
         }
+
+        // Compute nullable table indices once tables are populated.
+        let nullable_table_indices: std::collections::HashSet<usize> = tables
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| {
+                let key = t.alias.clone().unwrap_or_else(|| t.name.clone());
+                nullable_table_refs.contains(&key)
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+        // Helper to mark a column nullable if it came from a LEFT-JOIN-right table.
+        let apply_nullability = |table_idx: usize, column: &mut Column| {
+            if nullable_table_indices.contains(&table_idx) {
+                column.set_notnull(false);
+            }
+        };
 
         // Helper function to find table index by name or alias
         let find_table_index = |name: &str| -> Option<usize> {
@@ -1957,9 +2119,13 @@ pub fn extract_view_columns(
                             expr.to_string()
                         });
 
+                    let table_idx = table_index.unwrap_or(usize::MAX);
+                    let mut column =
+                        Column::new_default_text(Some(col_name), "TEXT".to_string(), None);
+                    apply_nullability(table_idx, &mut column);
                     columns.push(ViewColumn {
-                        table_index: table_index.unwrap_or(usize::MAX),
-                        column: Column::new_default_text(Some(col_name), "TEXT".to_string(), None),
+                        table_index: table_idx,
+                        column,
                     });
                 }
                 ast::ResultColumn::Star => {
@@ -1980,17 +2146,46 @@ pub fn extract_view_columns(
                                         col_name.clone()
                                     };
 
+                                let mut column = Column::new(
+                                    Some(final_name),
+                                    table_column.ty_str.clone(),
+                                    None,
+                                    None,
+                                    table_column.ty(),
+                                    table_column.collation_opt(),
+                                    ColDef::default(),
+                                );
+                                apply_nullability(table_idx, &mut column);
                                 columns.push(ViewColumn {
                                     table_index: table_idx,
-                                    column: Column::new(
-                                        Some(final_name),
-                                        table_column.ty_str.clone(),
-                                        None,
-                                        None,
-                                        table_column.ty(),
-                                        table_column.collation_opt(),
-                                        ColDef::default(),
-                                    ),
+                                    column,
+                                });
+                            }
+                        } else if let Some(cte_col_names) = cte_columns.get(&table.name) {
+                            // CTE with explicit column names.
+                            // Note: We default CTE columns to TEXT type because the actual types
+                            // would require evaluating the CTE's SELECT statement. This is safe
+                            // because SQLite uses dynamic typing, and the actual values will
+                            // have their proper types at runtime.
+                            for col_name in cte_col_names {
+                                let final_name =
+                                    if let Some(count) = column_name_counts.get_mut(col_name) {
+                                        *count += 1;
+                                        format!("{}:{}", col_name, *count - 1)
+                                    } else {
+                                        column_name_counts.insert(col_name.clone(), 1);
+                                        col_name.clone()
+                                    };
+
+                                let mut column = Column::new_default_text(
+                                    Some(final_name),
+                                    "TEXT".to_string(),
+                                    None,
+                                );
+                                apply_nullability(table_idx, &mut column);
+                                columns.push(ViewColumn {
+                                    table_index: table_idx,
+                                    column,
                                 });
                             }
                         }
@@ -2027,17 +2222,19 @@ pub fn extract_view_columns(
                                         col_name.clone()
                                     };
 
+                                let mut column = Column::new(
+                                    Some(final_name),
+                                    table_column.ty_str.clone(),
+                                    None,
+                                    None,
+                                    table_column.ty(),
+                                    table_column.collation_opt(),
+                                    ColDef::default(),
+                                );
+                                apply_nullability(table_idx, &mut column);
                                 columns.push(ViewColumn {
                                     table_index: table_idx,
-                                    column: Column::new(
-                                        Some(final_name),
-                                        table_column.ty_str.clone(),
-                                        None,
-                                        None,
-                                        table_column.ty(),
-                                        table_column.collation_opt(),
-                                        ColDef::default(),
-                                    ),
+                                    column,
                                 });
                             }
                         } else {
@@ -2091,11 +2288,11 @@ pub fn check_expr_references_column(expr: &ast::Expr, col_name_normalized: &str)
                     return Ok(WalkControl::SkipChildren);
                 }
             }
-            ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
-                if col.as_str().eq_ignore_ascii_case(col_name_normalized) {
-                    found = true;
-                    return Ok(WalkControl::SkipChildren);
-                }
+            ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col)
+                if col.as_str().eq_ignore_ascii_case(col_name_normalized) =>
+            {
+                found = true;
+                return Ok(WalkControl::SkipChildren);
             }
             _ => {}
         }
@@ -3296,10 +3493,8 @@ pub fn rewrite_check_expr_table_refs(expr: &mut ast::Expr, from: &str, to: &str)
                 ast::Expr::InSelect { rhs, .. } => {
                     rewrite_select_table_refs(rhs, from, to);
                 }
-                ast::Expr::InTable { rhs, .. } => {
-                    if rhs.name.as_str().eq_ignore_ascii_case(from) {
-                        rhs.name = ast::Name::exact(to.to_owned());
-                    }
+                ast::Expr::InTable { rhs, .. } if rhs.name.as_str().eq_ignore_ascii_case(from) => {
+                    rhs.name = ast::Name::exact(to.to_owned());
                 }
                 _ => {}
             }
@@ -4009,10 +4204,10 @@ fn expr_still_references_renamed_column(
                     }
                 }
             }
-            ast::Expr::Id(name) | ast::Expr::Name(name) => {
-                if rename_unqualified && name.as_str().eq_ignore_ascii_case(old_col) {
-                    found = true;
-                }
+            ast::Expr::Id(name) | ast::Expr::Name(name)
+                if rename_unqualified && name.as_str().eq_ignore_ascii_case(old_col) =>
+            {
+                found = true;
             }
             _ => {}
         }

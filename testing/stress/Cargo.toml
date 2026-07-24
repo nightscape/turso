@@ -36,10 +36,10 @@ turso = { workspace = true, features = ["io_memory_yield"] }
 turso_core = { workspace = true, features = ["simulator"] }
 turso_macros = { workspace = true }
 rusqlite = { workspace = true }
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [target.'cfg(antithesis)'.dependencies]
 antithesis_sdk = { workspace = true, features = ["full", "rand_v0_9"] }
-serde_json = { workspace = true }
 
 [target.'cfg(shuttle)'.dependencies]
 shuttle = { workspace = true }

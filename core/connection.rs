@@ -1892,6 +1892,46 @@ impl Connection {
         Ok(type_rows)
     }
 
+    /// Register a foreign data wrapper as a virtual table in this connection's schema.
+    ///
+    /// The table becomes queryable immediately via standard SQL, including
+    /// JOINs with local tables. The virtual table is read-only.
+    ///
+    /// # Example
+    /// ```ignore
+    /// conn.register_foreign_table("gmail_email", my_fdw)?;
+    /// // Now: SELECT * FROM gmail_email WHERE from_address = 'alice@example.com'
+    /// ```
+    pub fn register_foreign_table(
+        &self,
+        name: &str,
+        fdw: std::sync::Arc<dyn crate::foreign::ForeignDataWrapper>,
+    ) -> crate::Result<()> {
+        let vtab = crate::VirtualTable::new_foreign(name, fdw)?;
+        // Add to the database-level shared schema so all connections see it.
+        let mut db_schema = self.db.schema.lock();
+        // Schema cloning is fallible, so it cannot go through Arc::make_mut
+        // (which requires Clone); clone explicitly via TryClone instead.
+        let mut schema = db_schema.as_ref().try_clone()?;
+        schema.add_virtual_table(vtab)?;
+        *db_schema = std::sync::Arc::new(schema);
+        // Update this connection's schema snapshot.
+        *self.schema.write() = db_schema.clone();
+        Ok(())
+    }
+
+    /// Refresh a materialized view by re-running its source query.
+    ///
+    /// This is the programmatic equivalent of `REFRESH MATERIALIZED VIEW <name>`.
+    /// For streaming FDW updates, the caller triggers this when the
+    /// [`crate::foreign::StreamingForeignData`] subscription signals changes.
+    ///
+    /// Must be called on the same thread that owns the connection.
+    pub fn refresh_materialized_view(self: &Arc<Connection>, view_name: &str) -> crate::Result<()> {
+        let escaped = view_name.replace('\'', "''");
+        self.execute(format!("REFRESH MATERIALIZED VIEW {escaped}"))
+    }
+
     pub fn maybe_update_schema(&self) {
         if self.schema_reparse_in_progress() {
             return;
@@ -2758,6 +2798,7 @@ impl Connection {
             let mut dbsp_state_roots = HashMap::default();
             let mut dbsp_state_index_roots = HashMap::default();
             let mut materialized_view_info = HashMap::default();
+            let mut deferred_foreign_tables = Vec::new();
 
             let attached_resolver = |name: &str| -> Option<usize> {
                 self.attached_databases
@@ -2780,6 +2821,7 @@ impl Connection {
                     &mut materialized_view_info,
                     &attached_resolver,
                     self.db.dialect().as_ref(),
+                    &mut deferred_foreign_tables,
                 ) {
                     Ok(()) => {}
                     Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
@@ -2790,11 +2832,30 @@ impl Connection {
                 }
             }
 
-            match schema.populate_indices(&syms, from_sql_indexes, automatic_indices, false) {
+            let known_matview_names: rustc_hash::FxHashSet<String> = materialized_view_info
+                .keys()
+                .map(|n| crate::util::normalize_ident(n))
+                .collect();
+            match schema.populate_indices(
+                &syms,
+                from_sql_indexes,
+                automatic_indices,
+                false,
+                &known_matview_names,
+            ) {
                 Ok(()) => {}
                 Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
                 Err(LimboError::ExtensionError(msg)) => eprintln!("Warning: {msg}"),
                 Err(e) => return Err(e),
+            }
+            // Foreign tables before matviews — matviews may reference foreign tables
+            for (name, sql) in deferred_foreign_tables {
+                match schema.populate_foreign_table(&name, &sql, &syms) {
+                    Ok(()) => {}
+                    Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
+                    Err(LimboError::ExtensionError(msg)) => eprintln!("Warning: {msg}"),
+                    Err(e) => return Err(e),
+                }
             }
             match schema.populate_materialized_views(
                 materialized_view_info,
@@ -3306,6 +3367,17 @@ impl Connection {
         ))
     }
 
+    /// Attach a database file with the given alias name
+    #[cfg(feature = "fs")]
+    pub(crate) fn attach_database(
+        &self,
+        path: &str,
+        alias: &str,
+        state: &mut AttachDatabaseState,
+    ) -> Result<IOResult<()>> {
+        self.attach_database_with_config(path, alias, None, state)
+    }
+
     #[cfg(not(feature = "fs"))]
     pub(crate) fn attach_database_with_config(
         &self,
@@ -3317,17 +3389,6 @@ impl Connection {
         // File-backed ATTACH is unavailable without `fs`, so pre-initialization
         // page-layout overrides are also unsupported in this build.
         self.attach_database(_path, _alias, _state)
-    }
-
-    /// Attach a database file with the given alias name
-    #[cfg(feature = "fs")]
-    pub(crate) fn attach_database(
-        &self,
-        path: &str,
-        alias: &str,
-        state: &mut AttachDatabaseState,
-    ) -> Result<IOResult<()>> {
-        self.attach_database_with_config(path, alias, None, state)
     }
 
     /// Attach a database file with an optional pre-initialization reserved-space override.
@@ -4960,6 +5021,59 @@ impl Connection {
             _ => false,
         }
     }
+
+    /// Register a callback for changes to any relation (tables or materialized views).
+    /// The callback fires when changes are committed or when CDC records are written.
+    /// Returns a callback ID that can be used to unregister.
+    ///
+    /// The callback receives a RelationChangeEvent containing:
+    /// - relation_name: The name of the table or view
+    /// - columns: Column names in order, matching the values in DatabaseChange records
+    /// - changes: The actual row changes (inserts, updates, deletes)
+    pub fn set_change_callback<F>(&self, callback: F) -> crate::types::CallbackId
+    where
+        F: Fn(&crate::types::RelationChangeEvent) + Send + Sync + 'static,
+    {
+        let id = crate::types::CallbackId::new();
+        self.db
+            .change_callbacks
+            .write()
+            .push((id, None, Arc::new(callback)));
+        id
+    }
+
+    /// Register a callback filtered to specific relations.
+    /// The callback only fires for changes to the specified tables/views.
+    pub fn set_change_callback_for<F>(
+        &self,
+        relations: &[&str],
+        callback: F,
+    ) -> crate::types::CallbackId
+    where
+        F: Fn(&crate::types::RelationChangeEvent) + Send + Sync + 'static,
+    {
+        let id = crate::types::CallbackId::new();
+        let filter: std::collections::HashSet<String> =
+            relations.iter().map(|s| s.to_string()).collect();
+        self.db
+            .change_callbacks
+            .write()
+            .push((id, Some(filter), Arc::new(callback)));
+        id
+    }
+
+    /// Remove a specific callback by ID
+    pub fn clear_change_callback(&self, id: crate::types::CallbackId) {
+        self.db
+            .change_callbacks
+            .write()
+            .retain(|(callback_id, _, _)| *callback_id != id);
+    }
+
+    /// Clear all change callbacks (for cleanup/testing)
+    pub fn clear_all_change_callbacks(&self) {
+        self.db.change_callbacks.write().clear();
+    }
 }
 
 pub type Row = vdbe::Row;
@@ -4973,6 +5087,7 @@ pub struct SymbolTable {
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
     pub vtab_modules: HashMap<String, Arc<crate::ext::VTabImpl>>,
     pub index_methods: HashMap<String, Arc<dyn IndexMethod>>,
+    pub foreign_drivers: HashMap<String, Arc<dyn crate::foreign::ForeignDriverFactory>>,
 }
 
 impl std::fmt::Debug for SymbolTable {
@@ -5014,6 +5129,15 @@ impl SymbolTable {
             vtabs: HashMap::default(),
             vtab_modules: HashMap::default(),
             index_methods: HashMap::default(),
+            foreign_drivers: {
+                let mut drivers: HashMap<String, Arc<dyn crate::foreign::ForeignDriverFactory>> =
+                    HashMap::default();
+                drivers.insert(
+                    "csv".to_string(),
+                    Arc::new(crate::csv_fdw::CsvDriverFactory),
+                );
+                drivers
+            },
         }
     }
     pub fn resolve_function(

@@ -1,0 +1,148 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@skip-file-if sqlite "materialized views are a turso-specific feature"
+@requires materialized_views "requires materialized view support"
+
+test matview-order-by-multi-col {
+    -- Multi-column ORDER BY: primary by col 1 ASC, then col 2 DESC.
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+    INSERT INTO t VALUES (1, 1, 10), (2, 1, 30), (3, 1, 20),
+                         (4, 2, 5),  (5, 2, 15);
+
+    CREATE MATERIALIZED VIEW mv AS SELECT a, b FROM t ORDER BY 1 ASC, 2 DESC;
+
+    SELECT a, b FROM mv;
+}
+expect {
+    1|30
+    1|20
+    1|10
+    2|15
+    2|5
+}
+
+test matview-order-by-nulls-default-asc {
+    -- ASC default: NULLS FIRST.
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 2), (2, NULL), (3, 1), (4, NULL);
+
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t ORDER BY 1 ASC;
+
+    SELECT x FROM mv;
+}
+expect {
+
+
+    1
+    2
+}
+
+test matview-order-by-nulls-default-desc {
+    -- DESC default: NULLS LAST.
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 2), (2, NULL), (3, 1), (4, NULL);
+
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t ORDER BY 1 DESC;
+
+    SELECT x FROM mv;
+}
+expect {
+    2
+    1
+
+
+}
+
+test matview-order-by-update-non-sort-col {
+    -- UPDATE that doesn't change the sort column: row stays in place,
+    -- but its value updates.
+    CREATE TABLE t (id INTEGER PRIMARY KEY, sortk INTEGER, payload TEXT);
+    INSERT INTO t VALUES (1, 1, 'one'), (2, 2, 'two'), (3, 3, 'three');
+
+    CREATE MATERIALIZED VIEW mv AS SELECT sortk, payload FROM t ORDER BY 1;
+
+    UPDATE t SET payload = 'TWO!' WHERE id = 2;
+
+    SELECT sortk, payload FROM mv;
+}
+expect {
+    1|one
+    2|TWO!
+    3|three
+}
+
+test matview-order-by-update-sort-col {
+    -- UPDATE that changes the sort column: row "moves" to its new position.
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
+
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t ORDER BY 1;
+
+    UPDATE t SET x = 5 WHERE id = 2;
+
+    SELECT x FROM mv;
+}
+expect {
+    1
+    3
+    5
+}
+
+test matview-order-by-delete {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t ORDER BY 1;
+
+    DELETE FROM t WHERE id = 2;
+
+    SELECT x FROM mv;
+}
+expect {
+    10
+    30
+}
+
+test matview-order-by-in-tx {
+    -- Reads inside an uncommitted transaction MUST see uncommitted inserts
+    -- in correct sort order. This catches H3 (storage vs logical value-order
+    -- hash mismatch) if regressed.
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 5), (2, 1);
+
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t ORDER BY 1;
+
+    BEGIN;
+    INSERT INTO t VALUES (3, 3);
+    SELECT x FROM mv;
+    COMMIT;
+    SELECT x FROM mv;
+}
+expect {
+    1
+    3
+    5
+    1
+    3
+    5
+}
+
+test matview-order-by-in-tx-update-moves-row {
+    -- In-tx UPDATE that changes sort column: the row should appear at its
+    -- new position, not the old one. Both sides of the merge must agree on
+    -- value-tuple ordering (storage<->logical permutation).
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
+
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t ORDER BY 1;
+
+    BEGIN;
+    UPDATE t SET x = 100 WHERE id = 1;
+    SELECT x FROM mv;
+    COMMIT;
+}
+expect {
+    2
+    3
+    100
+}

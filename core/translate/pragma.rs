@@ -1919,6 +1919,9 @@ fn is_database_empty(schema: &Schema, pager: &Arc<Pager>) -> crate::Result<bool>
             Table::BTree(tbl) => &tbl.name,
             Table::Virtual(tbl) => &tbl.name,
             Table::FromClauseSubquery(tbl) => &tbl.name,
+            crate::schema::Table::RecursiveCte(_) => {
+                unreachable!("RecursiveCte should not be stored in schema")
+            }
         };
 
         if table_name != "sqlite_schema" {

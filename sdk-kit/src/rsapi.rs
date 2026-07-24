@@ -67,6 +67,8 @@ impl Drop for SyncBusyGuard {
 }
 
 pub use turso_core::types::FromValue;
+pub use turso_core::types::{DatabaseChange, DatabaseChangeType, RelationChangeEvent};
+pub use turso_core::CallbackId;
 pub use turso_ext::{
     AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarFunction,
     StepFunction, Value as ExtensionValue, ValueDestructor,
@@ -1058,9 +1060,36 @@ impl TursoConnection {
     }
 
     pub fn load_extension(&self, path: &str) -> Result<(), TursoError> {
-        turso_core::resolve_ext_path(path)
-            .and_then(|path| self.connection.load_extension(path))
-            .map_err(TursoError::from)
+        // `Connection::load_extension` (and the underlying dynamic-loading
+        // machinery) is `cfg(not(target_family = "wasm"))` in turso_core —
+        // wasm has no dlopen. Mirror that gate here so sdk-kit compiles on
+        // wasm32 and fails loudly at runtime instead of failing to build.
+        #[cfg(not(target_family = "wasm"))]
+        {
+            turso_core::resolve_ext_path(path)
+                .and_then(|path| self.connection.load_extension(path))
+                .map_err(TursoError::from)
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = path;
+            Err(TursoError::Misuse(
+                "load_extension is not supported on wasm targets".to_string(),
+            ))
+        }
+    }
+
+    /// Register a foreign data wrapper as a virtual table in this connection's schema.
+    ///
+    /// See [`turso_core::Connection::register_foreign_table`] for details.
+    pub fn register_foreign_table(
+        &self,
+        name: &str,
+        fdw: std::sync::Arc<dyn turso_core::foreign::ForeignDataWrapper>,
+    ) -> Result<(), TursoError> {
+        self.connection
+            .register_foreign_table(name, fdw)
+            .map_err(|e| TursoError::Error(e.to_string()))
     }
 
     /// prepares single SQL statement
@@ -1204,6 +1233,44 @@ impl TursoConnection {
             pager.io.wait_for_completion(c)?;
         }
         Ok(())
+    }
+
+    /// Register a callback for changes to any relation (tables or materialized views).
+    /// The callback fires when changes are committed or when CDC records are written.
+    /// Returns a callback ID that can be used to unregister.
+    ///
+    /// The callback receives a RelationChangeEvent containing:
+    /// - relation_name: The name of the table or view
+    /// - columns: Column names in order
+    /// - changes: The actual row changes (inserts, updates, deletes)
+    pub fn set_change_callback<F>(&self, callback: F) -> turso_core::CallbackId
+    where
+        F: Fn(&turso_core::types::RelationChangeEvent) + Send + Sync + 'static,
+    {
+        self.connection.set_change_callback(callback)
+    }
+
+    /// Register a callback filtered to specific relations.
+    /// The callback only fires for changes to the specified tables/views.
+    pub fn set_change_callback_for<F>(
+        &self,
+        relations: &[&str],
+        callback: F,
+    ) -> turso_core::CallbackId
+    where
+        F: Fn(&turso_core::types::RelationChangeEvent) + Send + Sync + 'static,
+    {
+        self.connection.set_change_callback_for(relations, callback)
+    }
+
+    /// Remove a specific change callback by ID
+    pub fn clear_change_callback(&self, id: turso_core::CallbackId) {
+        self.connection.clear_change_callback(id);
+    }
+
+    /// Clear all change callbacks
+    pub fn clear_all_change_callbacks(&self) {
+        self.connection.clear_all_change_callbacks();
     }
 
     /// helper method to get C raw container to the TursoConnection instance

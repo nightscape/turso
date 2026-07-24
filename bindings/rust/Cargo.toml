@@ -35,8 +35,6 @@ turso_core = { workspace = true }
 turso_sdk_kit = { workspace = true }
 turso_sync_sdk_kit = { workspace = true }
 thiserror = { workspace = true }
-tracing-subscriber.workspace = true
-tracing.workspace = true
 mimalloc = { workspace = true, optional = true }
 
 hyper = { version = "1.8.1", features = ["http1"], optional = true }
@@ -48,6 +46,7 @@ hyper-util = { version = "0.1.19", features = [
 ], optional = true }
 http-body-util = { version = "0.1.3", optional = true }
 bytes = { version = "1.11.1", optional = true }
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [[example]]
 name = "sync_example"
@@ -60,7 +59,7 @@ name = "concurrent_writes"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 rand.workspace = true
-rand_chacha = { workspace = true }
 anyhow.workspace = true
 reqwest = { version = "0.13.2", features = ["json"] }
 serde_json.workspace = true
+tracing-subscriber.workspace = true

@@ -5,6 +5,7 @@ use crate::numeric::Numeric;
 use crate::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 /// A 128-bit hash value implemented as a UUID
 /// We use UUID because it's a standard 128-bit type we already depend on
@@ -28,11 +29,15 @@ impl Hash128 {
 
     /// Get the low 64 bits as i64 (for when we need a rowid)
     pub fn as_i64(&self) -> i64 {
+        self.as_u64() as i64
+    }
+
+    /// Get the low 64 bits as u64 (for use as a hash key)
+    pub fn as_u64(&self) -> u64 {
         let bytes = self.uuid.as_bytes();
-        let low = u64::from_be_bytes([
+        u64::from_be_bytes([
             bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-        ]);
-        low as i64
+        ])
     }
 
     /// Compute a 128-bit hash of the given values
@@ -137,17 +142,23 @@ impl std::fmt::Display for Hash128 {
 // It is theoretically possible to use the rowkey in the ZSet and then use a hash of key ->
 // Vec(changes) in the Delta set. But deviating from the paper here is just asking for trouble, as
 // I am sure it would break somewhere else.
+/// Shared, immutable row payload. Cloning is a refcount bump, not a deep copy
+/// of every Value — deltas are cloned at every operator boundary, fan-out
+/// point, and I/O-yield state transition.
+pub type RowValues = Arc<[Value]>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HashableRow {
     pub rowid: i64,
-    pub values: Vec<Value>,
+    pub values: RowValues,
     // Pre-computed hash: DBSP rows are immutable and frequently hashed during joins,
     // making caching worthwhile despite the memory overhead
     cached_hash: Hash128,
 }
 
 impl HashableRow {
-    pub fn new(rowid: i64, values: Vec<Value>) -> Self {
+    pub fn new(rowid: i64, values: impl Into<RowValues>) -> Self {
+        let values = values.into();
         let cached_hash = Self::compute_hash(rowid, &values);
         Self {
             rowid,
@@ -213,12 +224,12 @@ impl Delta {
         }
     }
 
-    pub fn insert(&mut self, row_key: i64, values: Vec<Value>) {
+    pub fn insert(&mut self, row_key: i64, values: impl Into<RowValues>) {
         let row = HashableRow::new(row_key, values);
         self.changes.push((row, 1));
     }
 
-    pub fn delete(&mut self, row_key: i64, values: Vec<Value>) {
+    pub fn delete(&mut self, row_key: i64, values: impl Into<RowValues>) {
         let row = HashableRow::new(row_key, values);
         self.changes.push((row, -1));
     }
@@ -522,8 +533,8 @@ mod tests {
         let final_row = &delta.changes[0];
         assert_eq!(final_row.0.rowid, 1);
         assert_eq!(
-            final_row.0.values,
-            vec![Value::from_i64(1), Value::from_i64(200)]
+            &final_row.0.values[..],
+            &[Value::from_i64(1), Value::from_i64(200)]
         );
         assert_eq!(final_row.1, 1);
     }

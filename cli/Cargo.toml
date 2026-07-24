@@ -54,7 +54,6 @@ toml = { version = "0.8.20", features = ["preserve_order"] }
 schemars = { version = "0.8.22", features = ["preserve_order"] }
 serde = { workspace = true, features = ["derive"] }
 validator = { version = "0.20.0", features = ["derive"] }
-toml_edit = { version = "0.22.24", features = ["serde"] }
 serde_json = "1.0"
 termimad = "0.30"
 include_dir = "0.7"
@@ -64,6 +63,7 @@ prost = "0.14.1"
 roaring = "0.11.2"
 bytes = "1.11.1"
 itertools.workspace = true
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [features]
 default = ["io_uring", "mimalloc", "experimental_win_iocp"]

@@ -14,7 +14,9 @@ use crate::drop_index::DropIndexStatement;
 use crate::drop_table::{DropTableStatement, drop_table_for_schema, drop_table_for_table};
 use crate::drop_trigger::{DropTriggerStatement, drop_trigger_for_schema};
 use crate::generator::SqlGeneratorKind;
-use crate::insert::{InsertStatement, insert_for_table};
+use crate::insert::{
+    InsertStatement, insert_for_table, insert_or_replace_for_table, upsert_for_table,
+};
 use crate::profile::StatementProfile;
 use crate::schema::{Schema, TableRef};
 use crate::select::{SelectStatement, select_for_table};
@@ -27,7 +29,10 @@ use crate::utility::{
     AnalyzeStatement, ReindexStatement, VacuumStatement, analyze_for_schema, reindex_for_schema,
     vacuum,
 };
-use crate::view::{CreateViewStatement, DropViewStatement, create_view, drop_view_for_schema};
+use crate::view::{
+    CreateViewStatement, DropViewStatement, create_materialized_view, create_view,
+    drop_materialized_view_for_schema, drop_view_for_schema,
+};
 
 /// Context needed for statement generation.
 #[derive(Debug, Clone)]
@@ -46,6 +51,8 @@ pub enum SqlStatement {
     // DML
     Select(SelectStatement),
     Insert(InsertStatement),
+    InsertOrReplace(InsertStatement),
+    Upsert(InsertStatement),
     Update(UpdateStatement),
     Delete(DeleteStatement),
 
@@ -63,6 +70,10 @@ pub enum SqlStatement {
     CreateView(CreateViewStatement),
     DropView(DropViewStatement),
 
+    // DDL - Materialized Views
+    CreateMaterializedView(CreateViewStatement),
+    DropMaterializedView(DropViewStatement),
+
     // DDL - Triggers
     CreateTrigger(CreateTriggerStatement),
     DropTrigger(DropTriggerStatement),
@@ -78,6 +89,9 @@ pub enum SqlStatement {
     Vacuum(VacuumStatement),
     Analyze(AnalyzeStatement),
     Reindex(ReindexStatement),
+
+    // Simulator control
+    ReopenDatabase,
 }
 
 impl fmt::Display for SqlStatement {
@@ -85,6 +99,8 @@ impl fmt::Display for SqlStatement {
         match self {
             SqlStatement::Select(s) => write!(f, "{s}"),
             SqlStatement::Insert(s) => write!(f, "{s}"),
+            SqlStatement::InsertOrReplace(s) => write!(f, "{s}"),
+            SqlStatement::Upsert(s) => write!(f, "{s}"),
             SqlStatement::Update(s) => write!(f, "{s}"),
             SqlStatement::Delete(s) => write!(f, "{s}"),
             SqlStatement::CreateTable(s) => write!(f, "{s}"),
@@ -95,6 +111,8 @@ impl fmt::Display for SqlStatement {
             SqlStatement::DropIndex(s) => write!(f, "{s}"),
             SqlStatement::CreateView(s) => write!(f, "{s}"),
             SqlStatement::DropView(s) => write!(f, "{s}"),
+            SqlStatement::CreateMaterializedView(s) => write!(f, "{s}"),
+            SqlStatement::DropMaterializedView(s) => write!(f, "{s}"),
             SqlStatement::CreateTrigger(s) => write!(f, "{s}"),
             SqlStatement::DropTrigger(s) => write!(f, "{s}"),
             SqlStatement::Begin(s) => write!(f, "{s}"),
@@ -105,6 +123,7 @@ impl fmt::Display for SqlStatement {
             SqlStatement::Vacuum(s) => write!(f, "{s}"),
             SqlStatement::Analyze(s) => write!(f, "{s}"),
             SqlStatement::Reindex(s) => write!(f, "{s}"),
+            SqlStatement::ReopenDatabase => write!(f, "-- REOPEN DATABASE"),
         }
     }
 }
@@ -135,6 +154,8 @@ impl StatementKind {
                 | StatementKind::DropIndex
                 | StatementKind::CreateView
                 | StatementKind::DropView
+                | StatementKind::CreateMaterializedView
+                | StatementKind::DropMaterializedView
                 | StatementKind::CreateTrigger
                 | StatementKind::DropTrigger
         )
@@ -146,6 +167,8 @@ impl StatementKind {
             self,
             StatementKind::Select
                 | StatementKind::Insert
+                | StatementKind::InsertOrReplace
+                | StatementKind::Upsert
                 | StatementKind::Update
                 | StatementKind::Delete
         )
@@ -176,6 +199,11 @@ impl SqlGeneratorKind for StatementKind {
             | StatementKind::Insert
             | StatementKind::Update
             | StatementKind::Delete => !schema.tables.is_empty(),
+            // Upserts require tables with primary keys
+            StatementKind::InsertOrReplace | StatementKind::Upsert => schema
+                .tables
+                .iter()
+                .any(|t| t.columns.iter().any(|c| c.primary_key)),
 
             // DDL - Table operations
             StatementKind::CreateTable => true,
@@ -190,6 +218,10 @@ impl SqlGeneratorKind for StatementKind {
             StatementKind::CreateView => !schema.tables.is_empty(),
             StatementKind::DropView => true, // Can always generate DROP VIEW IF EXISTS
 
+            // DDL - Materialized View operations
+            StatementKind::CreateMaterializedView => !schema.tables.is_empty(),
+            StatementKind::DropMaterializedView => true,
+
             // DDL - Trigger operations
             StatementKind::CreateTrigger => !schema.tables.is_empty(),
             StatementKind::DropTrigger => true, // Can always generate DROP TRIGGER IF EXISTS
@@ -203,6 +235,9 @@ impl SqlGeneratorKind for StatementKind {
 
             // Utility - always available
             StatementKind::Vacuum | StatementKind::Analyze | StatementKind::Reindex => true,
+
+            // Simulator control - always available
+            StatementKind::ReopenDatabase => true,
         }
     }
 
@@ -211,6 +246,8 @@ impl SqlGeneratorKind for StatementKind {
             // DML requires tables
             StatementKind::Select
             | StatementKind::Insert
+            | StatementKind::InsertOrReplace
+            | StatementKind::Upsert
             | StatementKind::Update
             | StatementKind::Delete => true,
 
@@ -227,6 +264,10 @@ impl SqlGeneratorKind for StatementKind {
             StatementKind::CreateView => false,
             StatementKind::DropView => false,
 
+            // DDL - Materialized View operations
+            StatementKind::CreateMaterializedView => true,
+            StatementKind::DropMaterializedView => true,
+
             // DDL - Trigger operations
             StatementKind::CreateTrigger => false,
             StatementKind::DropTrigger => false,
@@ -240,6 +281,9 @@ impl SqlGeneratorKind for StatementKind {
 
             // Utility - always available
             StatementKind::Vacuum | StatementKind::Analyze | StatementKind::Reindex => false,
+
+            // Simulator control
+            StatementKind::ReopenDatabase => true,
         }
     }
 
@@ -266,6 +310,32 @@ impl SqlGeneratorKind for StatementKind {
                     .prop_map(SqlStatement::Insert)
                     .boxed()
             }),
+            StatementKind::InsertOrReplace => {
+                let pk_tables: Vec<TableRef> = tables
+                    .iter()
+                    .filter(|t| t.columns.iter().any(|c| c.primary_key))
+                    .cloned()
+                    .collect();
+                let pk_tables = std::rc::Rc::new(pk_tables);
+                table_dml(pk_tables, schema, profile, |t, s, p| {
+                    insert_or_replace_for_table(t, s, p)
+                        .prop_map(SqlStatement::InsertOrReplace)
+                        .boxed()
+                })
+            }
+            StatementKind::Upsert => {
+                let pk_tables: Vec<TableRef> = tables
+                    .iter()
+                    .filter(|t| t.columns.iter().any(|c| c.primary_key))
+                    .cloned()
+                    .collect();
+                let pk_tables = std::rc::Rc::new(pk_tables);
+                table_dml(pk_tables, schema, profile, |t, s, p| {
+                    upsert_for_table(t, s, p)
+                        .prop_map(SqlStatement::Upsert)
+                        .boxed()
+                })
+            }
             StatementKind::Update => table_dml(tables, schema, profile, |t, s, p| {
                 update_for_table(t, s, p)
                     .prop_map(SqlStatement::Update)
@@ -318,6 +388,14 @@ impl SqlGeneratorKind for StatementKind {
                 .prop_map(SqlStatement::DropView)
                 .boxed(),
 
+            // DDL - Materialized Views
+            StatementKind::CreateMaterializedView => create_materialized_view(schema)
+                .prop_map(SqlStatement::CreateMaterializedView)
+                .boxed(),
+            StatementKind::DropMaterializedView => drop_materialized_view_for_schema(schema)
+                .prop_map(SqlStatement::DropMaterializedView)
+                .boxed(),
+
             // DDL - Triggers
             StatementKind::CreateTrigger => create_trigger_for_schema(schema, profile)
                 .prop_map(SqlStatement::CreateTrigger)
@@ -348,6 +426,8 @@ impl SqlGeneratorKind for StatementKind {
             StatementKind::Reindex => reindex_for_schema(schema)
                 .prop_map(SqlStatement::Reindex)
                 .boxed(),
+
+            StatementKind::ReopenDatabase => Just(SqlStatement::ReopenDatabase).boxed(),
         }
     }
 }
@@ -373,13 +453,34 @@ where
 /// Includes SELECT, INSERT, UPDATE, DELETE with expression support.
 pub fn dml_for_table(table: &TableRef, schema: &Schema) -> BoxedStrategy<SqlStatement> {
     let profile = StatementProfile::default();
-    prop_oneof![
-        select_for_table(table, schema, &profile).prop_map(SqlStatement::Select),
-        insert_for_table(table, schema, &profile).prop_map(SqlStatement::Insert),
-        update_for_table(table, schema, &profile).prop_map(SqlStatement::Update),
-        delete_for_table(table, schema, &profile).prop_map(SqlStatement::Delete),
-    ]
-    .boxed()
+    let has_pk = table.columns.iter().any(|c| c.primary_key);
+    let mut strategies: Vec<BoxedStrategy<SqlStatement>> = vec![
+        select_for_table(table, schema, &profile)
+            .prop_map(SqlStatement::Select)
+            .boxed(),
+        insert_for_table(table, schema, &profile)
+            .prop_map(SqlStatement::Insert)
+            .boxed(),
+        update_for_table(table, schema, &profile)
+            .prop_map(SqlStatement::Update)
+            .boxed(),
+        delete_for_table(table, schema, &profile)
+            .prop_map(SqlStatement::Delete)
+            .boxed(),
+    ];
+    if has_pk {
+        strategies.push(
+            insert_or_replace_for_table(table, schema, &profile)
+                .prop_map(SqlStatement::InsertOrReplace)
+                .boxed(),
+        );
+        strategies.push(
+            upsert_for_table(table, schema, &profile)
+                .prop_map(SqlStatement::Upsert)
+                .boxed(),
+        );
+    }
+    proptest::strategy::Union::new(strategies).boxed()
 }
 
 /// Generate any SQL statement for a table, using schema context for safe DDL generation.

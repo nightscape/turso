@@ -132,6 +132,79 @@ Always follow these steps
 | `schema.rs` | Introspects schema from both databases |
 | `memory/` | In-memory IO for deterministic simulation |
 
+## Materialized View Fuzzing
+
+The `--matview` flag enables fuzzing of Turso's IVM (Incremental View Maintenance) by comparing materialized views against SQLite's regular views.
+
+### How It Works
+
+The core trick: both databases get the same view, but Turso gets a **materialized** one (maintained incrementally via DBSP) while SQLite gets a **regular** one (recomputed on every query). Then `SELECT * FROM view_name` on both should return identical rows — any divergence is a real IVM bug.
+
+**Split execution**: When a `CREATE MATERIALIZED VIEW v AS SELECT ...` is generated:
+- Turso receives: `CREATE MATERIALIZED VIEW v AS SELECT ...`
+- SQLite receives: `CREATE VIEW v AS SELECT ...`
+
+For `DROP VIEW`, both databases receive the same SQL (no `MATERIALIZED` keyword needed).
+
+### Running
+
+```bash
+# Matview fuzzing requires the proptest generator
+cargo run --bin differential_fuzzer -- --matview -g sql-gen-prop --seed 12345 -n 200 --verbose
+
+# Soak test
+cargo run --bin differential_fuzzer -- loop 20 --matview -g sql-gen-prop
+
+# Check what matview SQL was generated
+grep -i "MATERIALIZED" simulator-output/test.sql
+grep "^-- SQLITE:" simulator-output/test.sql
+```
+
+The `--matview` flag:
+- Enables `DatabaseOpts::with_views(true)` on the Turso database
+- Sets `create_materialized_view_weight: 3` and `drop_materialized_view_weight: 1` in the proptest profile
+- Only works with `-g sql-gen-prop` (the sql_gen backend doesn't generate matview DDL)
+
+### Schema Divergence Handling
+
+A matview in Turso creates a **table** in `sqlite_master` (type='table'), while a regular view in SQLite creates a **view** (type='view'). Since the schema introspector only queries `type='table'`, the matview table appears in Turso's schema but not SQLite's.
+
+The runner tracks matview names in a `HashSet<String>` and filters them from Turso's table set before schema comparison.
+
+### Generated View Queries
+
+The generator produces 4 kinds of view SELECT:
+- **Star**: `SELECT * FROM t`
+- **Filtered columns**: `SELECT col1, col2 FROM t WHERE col IS NOT NULL`
+- **Aggregate**: `SELECT col, COUNT(*) AS cnt FROM t GROUP BY col`
+- **JOIN**: `SELECT t1.col, t2.col FROM t1 JOIN t2 ON t1.pk = t2.fk` (requires 2+ tables)
+
+JOIN views are the most interesting for finding IVM bugs involving multiple base tables.
+
+### Output Format
+
+Matview DDL appears in `simulator-output/test.sql` with paired comments:
+```sql
+CREATE MATERIALIZED VIEW v AS SELECT ...;
+-- SQLITE: CREATE VIEW v AS SELECT ...;
+```
+
+### Key Files for Matview Fuzzing
+
+| File | What it does |
+|------|-------------|
+| `sql_gen_prop/view.rs` | `create_materialized_view()`, `drop_materialized_view_for_schema()`, 4 SELECT kinds |
+| `sql_gen_prop/schema.rs` | `materialized_views` field, `materialized_view_names()` accessor |
+| `sql_gen_prop/statement.rs` | `CreateMaterializedView` / `DropMaterializedView` enum variants |
+| `fuzzer/generate.rs` | `is_matview_ddl` + `sqlite_sql` on `GeneratedStatement`, matview-aware schema conversion |
+| `fuzzer/runner.rs` | Split execution logic, matview name tracking, schema comparison filtering |
+
+### Limitations / Future Work
+
+- DML (INSERT/UPDATE/DELETE) on base tables automatically exercises IVM through the existing oracle — whenever a SELECT hits a matview, both databases return their version and the oracle compares
+- Explicit `SELECT * FROM matview_name` statements are not yet generated (the matview is not added to the schema's queryable sources). This would increase coverage
+- Only the proptest backend supports matview generation; the sql_gen backend ignores the `--matview` flag
+
 ## Tracing
 
 Set `RUST_LOG` for more detailed output:

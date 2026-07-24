@@ -2633,15 +2633,30 @@ pub fn insn_to_row(
             0,
             format!("db={db}"),
         ),
-        Insn::InitCdcVersion { cdc_table_name, version, cdc_mode } => (
-            "InitCdcVersion",
+        Insn::NotifyCdcChange {
+            table_name_reg,
+            change_type,
+            rowid_reg,
+            before_record_reg,
+            after_record_reg,
+        } => (
+            "NotifyCdcChange",
+            *table_name_reg as i64,
+            *change_type as i64,
+            *rowid_reg as i64,
+            Value::build_text(format!("before={before_record_reg} after={after_record_reg}")),
             0,
-            0,
-            0,
-            Value::build_text(format!("{cdc_table_name}={version}")),
-            0,
-            format!("ensure turso_cdc_version({cdc_table_name}, {version}); set cdc={cdc_mode}"),
+            String::new(),
         ),
+        Insn::InitCdcVersion { cdc_table_name, version, cdc_mode } => (
+    "InitCdcVersion",
+    0,
+    0,
+    0,
+    Value::build_text(format!("{cdc_table_name}={version}")),
+    0,
+    format!("ensure turso_cdc_version({cdc_table_name}, {version}); set cdc={cdc_mode}"),
+    ),
     }
 }
 

@@ -625,6 +625,120 @@ fn test_cte_with_union(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[turso_macros::test(
+    mvcc,
+    init_sql = "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT);"
+)]
+fn test_cte_with_set_operations(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO test (id, name) VALUES (1, 'Alice');")?;
+    conn.execute("INSERT INTO test (id, name) VALUES (2, 'Bob');")?;
+
+    // Test 1: CTE with UNION ALL - CTE used in first SELECT
+    let mut stmt = conn.prepare(
+        "WITH t AS (SELECT id, name FROM test WHERE id = 1) SELECT * FROM t UNION ALL SELECT 99, 'Extra'",
+    )?;
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step()? {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                rows.push(row.get_values().cloned().collect::<Vec<_>>());
+            }
+            StepResult::Done => break,
+            StepResult::IO => stmt._io().step()?,
+            _ => panic!("Unexpected step result"),
+        }
+    }
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], Value::from_i64(1));
+    assert_eq!(rows[1][0], Value::from_i64(99));
+
+    // Test 2: CTE with UNION (not UNION ALL)
+    let mut stmt = conn.prepare("WITH t AS (SELECT 1 as x) SELECT * FROM t UNION SELECT 2 as x")?;
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step()? {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                rows.push(row.get_values().cloned().collect::<Vec<_>>());
+            }
+            StepResult::Done => break,
+            StepResult::IO => stmt._io().step()?,
+            _ => panic!("Unexpected step result"),
+        }
+    }
+    assert_eq!(rows.len(), 2);
+    let values: Vec<i64> = rows
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Numeric(Numeric::Integer(i)) => *i,
+            _ => panic!("Expected integer"),
+        })
+        .collect();
+    assert!(values.contains(&1));
+    assert!(values.contains(&2));
+
+    // Test 3: Multiple CTEs with UNION ALL - both CTEs used in different branches
+    let mut stmt = conn.prepare(
+        "WITH t1 AS (SELECT id FROM test WHERE id = 1), t2 AS (SELECT id FROM test WHERE id = 2) \
+         SELECT * FROM t1 UNION ALL SELECT * FROM t2",
+    )?;
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step()? {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                rows.push(row.get_values().cloned().collect::<Vec<_>>());
+            }
+            StepResult::Done => break,
+            StepResult::IO => stmt._io().step()?,
+            _ => panic!("Unexpected step result"),
+        }
+    }
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], Value::from_i64(1));
+    assert_eq!(rows[1][0], Value::from_i64(2));
+
+    // Test 4: CTE with INTERSECT
+    let mut stmt =
+        conn.prepare("WITH t AS (SELECT id FROM test) SELECT * FROM t INTERSECT SELECT 1")?;
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step()? {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                rows.push(row.get_values().cloned().collect::<Vec<_>>());
+            }
+            StepResult::Done => break,
+            StepResult::IO => stmt._io().step()?,
+            _ => panic!("Unexpected step result"),
+        }
+    }
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::from_i64(1));
+
+    // Test 5: CTE with EXCEPT
+    let mut stmt =
+        conn.prepare("WITH t AS (SELECT id FROM test) SELECT * FROM t EXCEPT SELECT 1")?;
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step()? {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                rows.push(row.get_values().cloned().collect::<Vec<_>>());
+            }
+            StepResult::Done => break,
+            StepResult::IO => stmt._io().step()?,
+            _ => panic!("Unexpected step result"),
+        }
+    }
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], Value::from_i64(2));
+
+    Ok(())
+}
+
 #[turso_macros::test(mvcc, init_sql = "create table t (x, y);")]
 fn test_avg_agg(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();

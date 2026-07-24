@@ -85,16 +85,12 @@ tantivy = { version = "0.26.0", optional = true }
 aristo = "0.4"
 turso_ext = { workspace = true, features = ["core_only"] }
 cfg_block = "0.1.1"
-fallible-iterator = { workspace = true }
 allocator-api2 = { workspace = true }
 hex = { workspace = true }
 icu_collator = "2.2.0"
 icu_locale = "2.2.0"
 thiserror = { workspace = true }
 regex = { workspace = true }
-regex-syntax = { workspace = true, default-features = false, features = [
-    "unicode",
-] }
 chrono = { workspace = true, default-features = false, features = ["clock"] }
 rand = { workspace = true }
 libm = "0.2"
@@ -117,7 +113,6 @@ tempfile = { workspace = true }
 pack1 = { version = "1.0.0", features = ["bytemuck"] }
 bytemuck = "1.23.1"
 aes-gcm = { version = "0.10.3" }
-aes = { version = "0.8.4" }
 turso_parser = { workspace = true }
 twox-hash = "2.1.1"
 intrusive-collections = "0.9.7"
@@ -134,7 +129,7 @@ fastbloom = { version = "0.14.1", default-features = false }
 crc32c = "0.6.8"
 bigdecimal = "0.4"
 num-bigint = "0.4"
-num-traits = "0.2"
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
 stacker = { version = "0.1", optional = true }
 
 [target.'cfg(not(any(target_family = "wasm", all(target_os = "windows", target_arch = "aarch64"))))'.dependencies]
@@ -267,4 +262,7 @@ harness = false
 
 [[bench]]
 name = "record_recycling"
+harness = false
+[[bench]]
+name = "matview_benchmark"
 harness = false

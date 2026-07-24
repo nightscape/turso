@@ -72,6 +72,17 @@ pub enum QueryResult {
     Error(String),
 }
 
+impl PartialEq for QueryResult {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (QueryResult::Rows(a), QueryResult::Rows(b)) => a == b,
+            (QueryResult::Ok, QueryResult::Ok) => true,
+            (QueryResult::Error(a), QueryResult::Error(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
 impl QueryResult {
     pub fn is_error(&self) -> bool {
         matches!(self, QueryResult::Error(_))
@@ -440,6 +451,10 @@ mod tests {
             mutates_data: false,
             has_unordered_limit: true,
             unordered_limit_reason: Some("limit_order_by_scalar_subquery".to_string()),
+            is_matview_ddl: false,
+            sqlite_sql: None,
+            matview_output_columns: None,
+            is_reopen: false,
         };
         let turso = QueryResult::Rows(vec![Row(vec![SqlValue::Integer(1)])]);
         let sqlite = QueryResult::Rows(vec![Row(vec![SqlValue::Integer(2)])]);
@@ -508,6 +523,10 @@ mod tests {
             mutates_data: true,
             has_unordered_limit: false,
             unordered_limit_reason: None,
+            is_matview_ddl: false,
+            sqlite_sql: None,
+            matview_output_columns: None,
+            is_reopen: false,
         };
 
         let result = check_differential(&turso_conn, &sqlite_conn, &schema, &stmt);

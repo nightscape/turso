@@ -791,6 +791,7 @@ impl MultiprocessWhopper {
                         opts: &self.opts,
                         enable_mvcc: self.enable_mvcc,
                         tables_vec: self.sim_state.tables_vec(),
+                        views_vec: Vec::new(),
                     };
                     let Some(op) = workload.generate(&ctx, &mut self.rng) else {
                         continue;

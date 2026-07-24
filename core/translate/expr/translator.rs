@@ -2666,6 +2666,10 @@ pub fn translate_expr(
                     });
                     Ok(target_register)
                 }
+                Table::RecursiveCte(recursive_cte) => {
+                    program.emit_column_or_rowid(recursive_cte.cursor_id, *column, target_register);
+                    Ok(target_register)
+                }
             }
         }
         ast::Expr::RowId {

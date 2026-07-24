@@ -565,6 +565,8 @@ struct MakeFromBtreeAccumulators {
     dbsp_state_index_roots: HashMap<String, i64>,
     /// Store materialized view info (SQL and root page) for later creation
     materialized_view_info: HashMap<String, (String, i64)>,
+    /// Foreign tables deferred until servers are loaded
+    deferred_foreign_tables: Vec<(String, String)>,
 }
 
 /// Phase tracking for async schema loading
@@ -782,7 +784,8 @@ pub struct Schema {
     /// Statistics collected via ANALYZE for regular B-tree tables and indexes.
     pub analyze_stats: AnalyzeStats,
 
-    /// Mapping from table names to the materialized views that depend on them
+    /// Mapping from table/view names to the materialized views that depend on them.
+    /// This includes both base tables and other materialized views (for cascading updates).
     pub table_to_materialized_views: HashMap<String, Vec<String>>,
 
     /// Track views that exist but have incompatible versions
@@ -805,6 +808,11 @@ pub struct Schema {
     pub generated_columns_enabled: bool,
     /// Named sequences (CREATE SEQUENCE)
     pub sequences: HashMap<String, Arc<Sequence>>,
+
+    /// Foreign servers (SQL/MED), loaded from sqlite_schema type='server'
+    pub foreign_servers: HashMap<String, Arc<crate::foreign::ForeignServer>>,
+    /// Tracks which server each foreign table belongs to: table_name → server_name
+    pub foreign_table_servers: HashMap<String, String>,
 }
 
 impl Default for Schema {
@@ -947,6 +955,8 @@ impl Schema {
             type_registry,
             generated_columns_enabled: false,
             sequences: HashMap::default(),
+            foreign_servers: HashMap::default(),
+            foreign_table_servers: HashMap::default(),
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
@@ -1211,6 +1221,8 @@ impl Schema {
             self.incremental_views.remove(&name);
 
             // Remove from table_to_materialized_views dependencies
+            // This handles both base table deps and view-to-view deps
+            self.table_to_materialized_views.remove(&name);
             for views in self.table_to_materialized_views.values_mut() {
                 views.retain(|v| v != &name);
             }
@@ -1244,6 +1256,70 @@ impl Schema {
             .get(&table_name)
             .cloned()
             .unwrap_or_else(|| vec![])
+    }
+
+    /// Get all materialized views that need updating when a table changes,
+    /// including transitively dependent views, in topological order.
+    /// Parent views come before their dependents.
+    pub fn get_cascading_views_sorted(&self, table_name: &str) -> Vec<String> {
+        use std::collections::VecDeque;
+
+        let mut all_views = Vec::new();
+        let mut visited = HashSet::default();
+
+        // Start with directly dependent views
+        let direct = self.get_dependent_materialized_views(table_name);
+        let mut queue: VecDeque<String> = direct.into_iter().collect();
+
+        while let Some(view_name) = queue.pop_front() {
+            if visited.contains(&view_name) {
+                continue;
+            }
+            visited.insert(view_name.clone());
+            all_views.push(view_name.clone());
+
+            // Find views that depend on this view
+            let dependents = self.get_dependent_materialized_views(&view_name);
+            for dep in dependents {
+                if !visited.contains(&dep) {
+                    queue.push_back(dep);
+                }
+            }
+        }
+
+        all_views
+    }
+
+    /// After a matview is (re)created, re-establish DBSP dependency edges from
+    /// this view to any existing downstream matviews that reference it as a source.
+    /// This handles the case where an upstream matview is DROP+CREATE'd while
+    /// downstream matviews persist from a previous session.
+    fn reconnect_downstream_matview_edges(&mut self, view_name: &str) {
+        let normalized = normalize_ident(view_name);
+        let existing_views: Vec<(String, Vec<String>)> = self
+            .incremental_views
+            .iter()
+            .filter(|(name, _)| **name != normalized)
+            .map(|(name, iv)| {
+                let refs = iv.lock().get_referenced_table_names();
+                (name.clone(), refs)
+            })
+            .collect();
+
+        for (downstream_name, referenced_tables) in existing_views {
+            if referenced_tables
+                .iter()
+                .any(|t| normalize_ident(t) == normalized)
+            {
+                let deps = self
+                    .table_to_materialized_views
+                    .entry(normalized.clone())
+                    .or_default();
+                if !deps.contains(&downstream_name) {
+                    deps.push(downstream_name);
+                }
+            }
+        }
     }
 
     /// Add a regular (non-materialized) view
@@ -1374,6 +1450,95 @@ impl Schema {
         self.check_object_name_conflict(&table.name)?;
         let name = normalize_ident(&table.name);
         self.tables.insert(name, Table::Virtual(table).into());
+        Ok(())
+    }
+
+    pub fn add_foreign_server(&mut self, server: crate::foreign::ForeignServer) -> Result<()> {
+        let name = normalize_ident(&server.name);
+        if self.foreign_servers.contains_key(&name) {
+            bail_parse_error!("server {} already exists", server.name);
+        }
+        self.foreign_servers.insert(name, Arc::new(server));
+        Ok(())
+    }
+
+    pub fn get_foreign_server(&self, name: &str) -> Option<Arc<crate::foreign::ForeignServer>> {
+        self.foreign_servers.get(&normalize_ident(name)).cloned()
+    }
+
+    pub fn remove_foreign_server(&mut self, name: &str) {
+        self.foreign_servers.remove(&normalize_ident(name));
+    }
+
+    pub fn foreign_tables_using_server(&self, server_name: &str) -> Vec<String> {
+        let normalized = normalize_ident(server_name);
+        self.foreign_table_servers
+            .iter()
+            .filter(|(_, srv)| **srv == normalized)
+            .map(|(tbl, _)| tbl.clone())
+            .collect()
+    }
+
+    /// Reconstruct a foreign table from its CREATE FOREIGN TABLE SQL on schema reload.
+    pub fn populate_foreign_table(
+        &mut self,
+        name: &str,
+        sql: &str,
+        syms: &SymbolTable,
+    ) -> Result<()> {
+        // If already loaded (e.g. from syms.vtabs during initial CREATE), skip
+        if syms.vtabs.contains_key(name) {
+            let vtab = syms.vtabs.get(name).unwrap().clone();
+            self.add_virtual_table(vtab)?;
+            return Ok(());
+        }
+
+        use turso_parser::ast::{Cmd, Stmt};
+        use turso_parser::parser::Parser;
+        let mut parser = Parser::new(sql.as_bytes());
+        let cmd = parser.next_cmd().map_err(|e| {
+            crate::LimboError::InternalError(format!("Failed to parse foreign table SQL: {e}"))
+        })?;
+        let Some(Cmd::Stmt(Stmt::CreateForeignTable(ft))) = cmd else {
+            return Err(crate::LimboError::InternalError(format!(
+                "Invalid foreign table SQL: {sql}"
+            )));
+        };
+
+        let server_name = ft.server_name.as_str();
+        let server = self.get_foreign_server(server_name).ok_or_else(|| {
+            crate::LimboError::ParseError(format!("no such server: {server_name}"))
+        })?;
+
+        let factory = syms.foreign_drivers.get(&server.driver).ok_or_else(|| {
+            crate::LimboError::ParseError(format!("no such foreign driver: {}", server.driver))
+        })?;
+
+        let columns: Vec<crate::foreign::ForeignColumnDef> = ft
+            .columns
+            .iter()
+            .map(|cd| crate::foreign::ForeignColumnDef {
+                name: cd.col_name.as_str().to_string(),
+                type_name: cd
+                    .col_type
+                    .as_ref()
+                    .map(|t| t.name.clone())
+                    .unwrap_or_else(|| "TEXT".to_string()),
+            })
+            .collect();
+
+        let table_options: std::collections::HashMap<String, String> = ft
+            .options
+            .iter()
+            .map(|o| (o.key.as_str().to_string(), o.value.clone()))
+            .collect();
+
+        let fdw = factory.create_fdw(&server.options, &table_options, &columns)?;
+        let vtab = crate::VirtualTable::new_foreign(name, fdw)?;
+        let server_name_owned = server_name.to_string();
+        self.add_virtual_table(vtab)?;
+        self.foreign_table_servers
+            .insert(normalize_ident(name), normalize_ident(&server_name_owned));
         Ok(())
     }
 
@@ -1571,6 +1736,7 @@ impl Schema {
                         dbsp_state_roots: HashMap::default(),
                         dbsp_state_index_roots: HashMap::default(),
                         materialized_view_info: HashMap::default(),
+                        deferred_foreign_tables: Vec::new(),
                     });
 
                     state.phase = MakeFromBtreePhase::Rewinding;
@@ -1657,6 +1823,7 @@ impl Schema {
                         &mut acc.materialized_view_info,
                         &|_| None,
                         dialect,
+                        &mut acc.deferred_foreign_tables,
                     )?;
 
                     state.phase = MakeFromBtreePhase::Advancing;
@@ -1682,12 +1849,23 @@ impl Schema {
                             .accumulators
                             .take()
                             .expect("accumulators must be initialized in Init phase");
+                        let known_matview_names: HashSet<String> = acc
+                            .materialized_view_info
+                            .keys()
+                            .map(|n| normalize_ident(n))
+                            .collect();
                         self.populate_indices(
                             syms,
                             acc.from_sql_indexes,
                             acc.automatic_indices,
                             mv_cursor.is_some(),
+                            &known_matview_names,
                         )?;
+                        // Foreign tables before matviews — matviews may reference foreign tables
+                        for (name, sql) in acc.deferred_foreign_tables {
+                            self.populate_foreign_table(&name, &sql, syms)?;
+                        }
+
                         self.populate_materialized_views(
                             acc.materialized_view_info,
                             acc.dbsp_state_roots,
@@ -1768,18 +1946,28 @@ impl Schema {
         from_sql_indexes: Vec<UnparsedFromSqlIndex>,
         automatic_indices: HashMap<String, Vec<(String, i64)>>,
         mvcc_enabled: bool,
+        known_matview_names: &HashSet<String>,
     ) -> Result<()> {
         for unparsed_sql_from_index in from_sql_indexes {
-            let table = self
-                .get_btree_table(&unparsed_sql_from_index.table_name)
-                .ok_or_else(|| {
-                    LimboError::Corrupt(format!(
-                        "sqlite_schema contains index for missing table '{}': rootpage={} sql={}",
-                        unparsed_sql_from_index.table_name,
-                        unparsed_sql_from_index.root_page,
-                        unparsed_sql_from_index.sql
-                    ))
-                })?;
+            let table_name = &unparsed_sql_from_index.table_name;
+            let Some(table) = self.get_btree_table(table_name) else {
+                let normalized = self.normalize_table_lookup_name(table_name);
+                let hint = if known_matview_names.contains(&normalized)
+                    || self.incremental_views.contains_key(&normalized)
+                {
+                    format!(
+                        " — '{table_name}' is a materialized view, not a regular table; \
+                         indexes cannot be created on materialized views"
+                    )
+                } else {
+                    String::new()
+                };
+                return Err(LimboError::ParseError(format!(
+                    "Index references unknown table '{table_name}'{hint}. \
+                     The schema row in sqlite_master is stale or corrupt. SQL: {}",
+                    unparsed_sql_from_index.sql,
+                )));
+            };
             let index = Index::from_sql(
                 syms,
                 &unparsed_sql_from_index.sql,
@@ -1797,12 +1985,19 @@ impl Schema {
             // The SQL statement parser enforces that the column definitions come first, and compounds are defined after that,
             // e.g. CREATE TABLE t (a, b, UNIQUE(a, b)), and you can't do something like CREATE TABLE t (a, b, UNIQUE(a, b), c);
             // Hence, we can process the singles first (unique_set.columns.len() == 1), and then the compounds (unique_set.columns.len() > 1).
-            let table = self.get_btree_table(&automatic_index.0).ok_or_else(|| {
-                LimboError::Corrupt(format!(
-                    "sqlite_schema contains automatic index for missing table '{}': indexes={:?}",
-                    automatic_index.0, automatic_index.1
-                ))
-            })?;
+            let Some(table) = self.get_btree_table(&automatic_index.0) else {
+                let normalized = self.normalize_table_lookup_name(&automatic_index.0);
+                let hint = if self.incremental_views.contains_key(&normalized) {
+                    " — it is a materialized view, not a regular table"
+                } else {
+                    ""
+                };
+                return Err(LimboError::ParseError(format!(
+                    "Automatic index references unknown table '{}'{hint}. \
+                     The schema row in sqlite_master is stale or corrupt.",
+                    automatic_index.0,
+                )));
+            };
             let mut automatic_indexes = automatic_index.1;
             automatic_indexes.reverse(); // reverse so we can pop() without shifting array elements, while still processing in left-to-right order
 
@@ -1907,88 +2102,154 @@ impl Schema {
     }
 
     /// Populate materialized views parsed from the schema.
+    /// Process matviews in dependency order via multi-pass resolution.
+    /// On each pass, matviews whose dependencies are already registered succeed;
+    /// those referencing not-yet-registered matviews are deferred to the next pass.
+    /// If a full pass makes zero progress, there is a circular or unresolvable dependency.
     pub fn populate_materialized_views(
         &mut self,
         materialized_view_info: HashMap<String, (String, i64)>,
         dbsp_state_roots: HashMap<String, i64>,
         dbsp_state_index_roots: HashMap<String, i64>,
     ) -> Result<()> {
-        for (view_name, (sql, main_root)) in materialized_view_info {
-            // Look up the DBSP state root for this view
-            // If missing, it means version mismatch - skip this view
-            // Check if we have a compatible DBSP state root
-            let dbsp_state_root = if let Some(&root) = dbsp_state_roots.get(&view_name) {
-                root
-            } else {
-                tracing::warn!(
-                    "Materialized view '{}' has incompatible version or missing DBSP state table",
-                    view_name
-                );
-                // Track this as an incompatible view
-                self.incompatible_views.insert(view_name.clone());
-                // Use a dummy root page - the view won't be usable anyway
-                0
-            };
+        let mut pending: Vec<(String, String, i64)> = materialized_view_info
+            .into_iter()
+            .map(|(name, (sql, root))| (name, sql, root))
+            .collect();
 
-            // Look up the DBSP state index root (may not exist for older schemas)
-            let dbsp_state_index_root =
-                dbsp_state_index_roots.get(&view_name).copied().unwrap_or(0);
-
-            // Register the DBSP state index so integrity check can account for its pages.
-            if dbsp_state_index_root > 0 && dbsp_state_root > 0 {
-                let mut index = create_dbsp_state_index(dbsp_state_index_root);
-                let dbsp_table_name =
-                    format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{view_name}");
-                index.name = format!("sqlite_autoindex_{dbsp_table_name}_1");
-                index.table_name = dbsp_table_name;
-                if let Err(e) = self.add_index(std::sync::Arc::new(index)) {
-                    if !e.to_string().contains("already exists") {
-                        return Err(e);
+        let mut last_count = pending.len() + 1;
+        while !pending.is_empty() && pending.len() < last_count {
+            last_count = pending.len();
+            let mut deferred = Vec::new();
+            for (view_name, sql, main_root) in pending {
+                match self.populate_one_materialized_view(
+                    &view_name,
+                    &sql,
+                    main_root,
+                    &dbsp_state_roots,
+                    &dbsp_state_index_roots,
+                ) {
+                    Ok(()) => {
+                        self.reconnect_downstream_matview_edges(&view_name);
                     }
+                    Err(e) if e.to_string().contains("not found in schema") => {
+                        deferred.push((view_name, sql, main_root));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            pending = deferred;
+        }
+
+        if !pending.is_empty() {
+            // Distinguish permanently broken views from circular dependencies.
+            // A view is permanently broken if its SQL doesn't reference any other
+            // pending view — no amount of reordering will fix it (e.g., it references
+            // a dropped column or table).
+            let pending_names: HashSet<String> =
+                pending.iter().map(|(n, _, _)| n.clone()).collect();
+            let mut stale = Vec::new();
+            let mut circular = Vec::new();
+            for (view_name, sql, main_root) in pending {
+                let references_pending_view = pending_names
+                    .iter()
+                    .any(|other| *other != view_name && sql.contains(other.as_str()));
+                if references_pending_view {
+                    circular.push((view_name, sql, main_root));
+                } else {
+                    stale.push(view_name);
                 }
             }
 
-            // Create the IncrementalView with all root pages
-            let incremental_view = IncrementalView::from_sql(
-                &sql,
-                self,
-                main_root,
-                dbsp_state_root,
-                dbsp_state_index_root,
-            )?;
-            let referenced_tables = incremental_view.get_referenced_table_names();
-
-            // Create a BTreeTable for the materialized view
-            let cols = incremental_view.column_schema.flat_columns();
-            let logical_to_physical_map =
-                BTreeTable::build_logical_to_physical_map(&cols, &[], true);
-            let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
-                name: view_name.clone(),
-                root_page: main_root,
-                columns: cols,
-                primary_key_columns: vec![],
-                has_rowid: true,
-                is_strict: false,
-                has_autoincrement: false,
-                foreign_keys: vec![],
-                check_constraints: vec![],
-                rowid_alias_conflict_clause: None,
-                unique_sets: vec![],
-                has_virtual_columns: false,
-                logical_to_physical_map,
-                column_dependencies: Default::default(),
-            })));
-
-            // Only add to schema if compatible
-            if !self.incompatible_views.contains(&view_name) {
-                self.add_materialized_view(incremental_view, table, sql);
+            for view_name in &stale {
+                tracing::warn!(
+                    "Dropping stale materialized view '{}': references non-existent table or column",
+                    view_name
+                );
+                self.incompatible_views.insert(view_name.to_string());
             }
 
-            // Register dependencies regardless of compatibility
-            for table_name in referenced_tables {
-                self.add_materialized_view_dependency(&table_name, &view_name);
+            if !circular.is_empty() {
+                let names: Vec<&str> = circular.iter().map(|(n, _, _)| n.as_str()).collect();
+                return Err(crate::LimboError::InternalError(format!(
+                    "Cannot resolve materialized view dependencies (possible circular dependency): {}",
+                    names.join(", ")
+                )));
             }
         }
+
+        Ok(())
+    }
+
+    fn populate_one_materialized_view(
+        &mut self,
+        view_name: &str,
+        sql: &str,
+        main_root: i64,
+        dbsp_state_roots: &HashMap<String, i64>,
+        dbsp_state_index_roots: &HashMap<String, i64>,
+    ) -> Result<()> {
+        let dbsp_state_root = if let Some(&root) = dbsp_state_roots.get(view_name) {
+            root
+        } else {
+            tracing::warn!(
+                "Materialized view '{}' has incompatible version or missing DBSP state table",
+                view_name
+            );
+            self.incompatible_views.insert(view_name.to_string());
+            0
+        };
+
+        let dbsp_state_index_root = dbsp_state_index_roots.get(view_name).copied().unwrap_or(0);
+
+        if dbsp_state_index_root > 0 && dbsp_state_root > 0 {
+            let mut index = create_dbsp_state_index(dbsp_state_index_root);
+            let dbsp_table_name = format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{view_name}");
+            index.name = format!("sqlite_autoindex_{dbsp_table_name}_1");
+            index.table_name = dbsp_table_name;
+            if let Err(e) = self.add_index(std::sync::Arc::new(index)) {
+                if !e.to_string().contains("already exists") {
+                    return Err(e);
+                }
+            }
+        }
+
+        let incremental_view = IncrementalView::from_sql(
+            sql,
+            self,
+            main_root,
+            dbsp_state_root,
+            dbsp_state_index_root,
+        )?;
+        let referenced_tables = incremental_view.get_referenced_table_names();
+
+        let cols = incremental_view.column_schema.flat_columns();
+        let logical_to_physical_map = BTreeTable::build_logical_to_physical_map(&cols, &[], true);
+        let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
+            name: view_name.to_string(),
+            root_page: main_root,
+            columns: cols,
+            primary_key_columns: Vec::new(),
+            has_rowid: true,
+            is_strict: false,
+            has_autoincrement: false,
+            foreign_keys: vec![],
+            check_constraints: vec![],
+            rowid_alias_conflict_clause: None,
+            unique_sets: vec![],
+            has_virtual_columns: false,
+            logical_to_physical_map,
+            column_dependencies: Default::default(),
+        })));
+
+        if !self.incompatible_views.contains(view_name) {
+            self.add_materialized_view(incremental_view, table, sql.to_string());
+        }
+
+        for table_name in referenced_tables {
+            self.add_materialized_view_dependency(&table_name, view_name);
+        }
+
         Ok(())
     }
 
@@ -2091,8 +2352,34 @@ impl Schema {
         // so the trigger never fires against a real db.
         resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
         dialect: &dyn crate::dialect::Dialect,
+        deferred_foreign_tables: &mut Vec<(String, String)>,
     ) -> Result<()> {
         match ty {
+            "server" => {
+                let sql = maybe_sql.expect("sql should be present for server");
+                use turso_parser::ast::{Cmd, Stmt};
+                use turso_parser::parser::Parser;
+                let mut parser = Parser::new(sql.as_bytes());
+                if let Ok(Some(Cmd::Stmt(Stmt::CreateServer(cs)))) = parser.next_cmd() {
+                    let driver = cs
+                        .options
+                        .iter()
+                        .find(|o| o.key.as_str().eq_ignore_ascii_case("driver"))
+                        .map(|o| o.value.clone())
+                        .unwrap_or_default();
+                    let options = cs
+                        .options
+                        .iter()
+                        .map(|o| (o.key.as_str().to_string(), o.value.clone()))
+                        .collect();
+                    let server = crate::foreign::ForeignServer {
+                        name: cs.server_name.as_str().to_string(),
+                        driver,
+                        options,
+                    };
+                    self.add_foreign_server(server)?;
+                }
+            }
             "table" => {
                 let sql = maybe_sql.expect("sql should be present for table");
                 // In the SQLite file format a `type='table'` row describes a
@@ -2101,8 +2388,14 @@ impl Schema {
                 // uses negative logical ids, which are still B-tree tables).
                 // Classify on the root page before touching the SQL text so
                 // only the B-tree arm needs to parse the row's stored SQL.
+                // Foreign tables also carry rootpage 0, so they are matched
+                // here and deferred until their server row has been read.
                 if root_page == 0 {
                     match Parser::new(sql.as_bytes()).next_cmd()? {
+                        Some(Cmd::Stmt(Stmt::CreateForeignTable(_))) => {
+                            deferred_foreign_tables.push((name.to_string(), sql.to_string()));
+                            return Ok(());
+                        }
                         Some(Cmd::Stmt(Stmt::CreateVirtualTable(_))) => {}
                         other => {
                             return Err(LimboError::Corrupt(format!(
@@ -2734,6 +3027,9 @@ impl TryClone for Table {
             Table::FromClauseSubquery(from_clause_subquery) => {
                 Table::FromClauseSubquery(Arc::new(from_clause_subquery.as_ref().try_clone()?))
             }
+            Table::RecursiveCte(_) => {
+                unreachable!("RecursiveCte should not be stored in schema")
+            }
         })
     }
 }
@@ -2831,6 +3127,8 @@ impl TryClone for Schema {
             type_registry: self.type_registry.try_clone()?,
             generated_columns_enabled: self.generated_columns_enabled,
             sequences: self.sequences.try_clone()?,
+            foreign_servers: self.foreign_servers.try_clone()?,
+            foreign_table_servers: self.foreign_table_servers.try_clone()?,
         })
     }
 }
@@ -2859,6 +3157,9 @@ impl ColumnLayout {
             }),
             Table::FromClauseSubquery(subquery) => Ok(Self::Identity {
                 column_count: subquery.columns.len(),
+            }),
+            Table::RecursiveCte(cte) => Ok(Self::Identity {
+                column_count: cte.columns.len(),
             }),
         }
     }
@@ -2967,6 +3268,8 @@ pub enum Table {
     BTree(Arc<BTreeTable>),
     Virtual(Arc<VirtualTable>),
     FromClauseSubquery(Arc<FromClauseSubquery>),
+    /// A recursive CTE table, backed by an ephemeral queue cursor.
+    RecursiveCte(RecursiveCteTable),
 }
 
 impl Table {
@@ -2979,6 +3282,9 @@ impl Table {
             Table::FromClauseSubquery(_) => Err(crate::LimboError::InternalError(
                 "FROM clause subqueries do not have a root page".to_string(),
             )),
+            Table::RecursiveCte(_) => Err(crate::LimboError::InternalError(
+                "Recursive CTE tables do not have a root page".to_string(),
+            )),
         }
     }
 
@@ -2987,6 +3293,7 @@ impl Table {
             Self::BTree(table) => &table.name,
             Self::Virtual(table) => &table.name,
             Self::FromClauseSubquery(from_clause_subquery) => &from_clause_subquery.name,
+            Self::RecursiveCte(recursive_cte) => &recursive_cte.name,
         }
     }
 
@@ -2997,6 +3304,7 @@ impl Table {
             Self::FromClauseSubquery(from_clause_subquery) => {
                 from_clause_subquery.columns.get(index)
             }
+            Self::RecursiveCte(recursive_cte) => recursive_cte.columns.get(index),
         }
     }
 
@@ -3018,6 +3326,11 @@ impl Table {
                         .as_ref()
                         .is_some_and(|n| n.eq_ignore_ascii_case(name))
                 }),
+            Self::RecursiveCte(recursive_cte) => recursive_cte
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, col)| col.name.as_ref().map(|n| n.as_str()) == Some(name)),
         }
     }
 
@@ -3026,6 +3339,7 @@ impl Table {
             Self::BTree(table) => &table.columns,
             Self::Virtual(table) => &table.columns,
             Self::FromClauseSubquery(from_clause_subquery) => &from_clause_subquery.columns,
+            Self::RecursiveCte(recursive_cte) => &recursive_cte.columns,
         }
     }
 
@@ -3034,6 +3348,7 @@ impl Table {
             Self::BTree(table) => table.is_strict,
             Self::Virtual(_) => false,
             Self::FromClauseSubquery(_) => false,
+            Self::RecursiveCte(_) => false,
         }
     }
 
@@ -3042,6 +3357,7 @@ impl Table {
             Self::BTree(table) => Some(table.clone()),
             Self::Virtual(_) => None,
             Self::FromClauseSubquery(_) => None,
+            Self::RecursiveCte(_) => None,
         }
     }
 
@@ -3059,6 +3375,7 @@ impl Table {
             Self::BTree(table) => Some(table),
             Self::Virtual(_) => None,
             Self::FromClauseSubquery(_) => None,
+            Self::RecursiveCte(_) => None,
         }
     }
 
@@ -4002,6 +4319,17 @@ impl FromClauseSubquery {
     pub fn supports_direct_index_materialization(&self) -> bool {
         matches!(self.plan.as_ref(), Plan::Select(_)) && !self.requires_table_materialization()
     }
+}
+/// A recursive CTE table used during recursive CTE execution.
+/// This represents the CTE as a pseudo-table backed by an ephemeral queue cursor.
+#[derive(Clone, Debug)]
+pub struct RecursiveCteTable {
+    /// The name of the CTE.
+    pub name: String,
+    /// The columns of the CTE.
+    pub columns: Vec<Column>,
+    /// The cursor ID for the queue being read from during the recursive step.
+    pub cursor_id: usize,
 }
 
 fn collect_column_refs(expr: &Expr) -> HashSet<String> {
@@ -6793,6 +7121,7 @@ mod tests {
             &mut HashMap::default(),
             &|_| None,
             &crate::dialect::SqliteDialect,
+            &mut Vec::new(),
         );
         assert!(result
             .unwrap_err()
@@ -6818,6 +7147,7 @@ mod tests {
             &mut HashMap::default(),
             &|_| None,
             &crate::dialect::SqliteDialect,
+            &mut Vec::new(),
         );
         assert!(result
             .unwrap_err()
@@ -6846,6 +7176,7 @@ mod tests {
             &mut HashMap::default(),
             &|_| None,
             &crate::dialect::SqliteDialect,
+            &mut Vec::new(),
         );
         assert!(result.is_err());
         assert!(schema.get_table("v1").is_none());
@@ -6869,6 +7200,7 @@ mod tests {
             &mut HashMap::default(),
             &|_| None,
             &crate::dialect::SqliteDialect,
+            &mut Vec::new(),
         );
         assert!(result.is_err());
         assert!(schema.get_table("v1").is_none());
@@ -6895,6 +7227,7 @@ mod tests {
                 &mut HashMap::default(),
                 &|_| None,
                 &crate::dialect::SqliteDialect,
+                &mut Vec::new(),
             )
             .unwrap();
         let table = schema.get_btree_table("t1").unwrap();
@@ -7190,3 +7523,5 @@ mod tests {
         );
     }
 }
+// test
+// agent1 was here

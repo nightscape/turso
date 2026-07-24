@@ -7,11 +7,15 @@
 
 use crate::incremental::aggregate_operator::AggregateOperator;
 use crate::incremental::dbsp::{Delta, DeltaPair};
-use crate::incremental::expr_compiler::CompiledExpression;
-use crate::incremental::operator::{
-    create_dbsp_state_index, DbspStateCursors, EvalState, FilterOperator, FilterPredicate,
-    IncrementalOperator, InputOperator, JoinOperator, JoinType, ProjectOperator,
+use crate::incremental::expr_compiler::{
+    CompiledExpression, ExpressionExecutor, TrivialExpression,
 };
+use crate::incremental::literal_operator::LiteralOperator;
+use crate::incremental::operator::{
+    create_dbsp_state_index, AntijoinOperator, DbspStateCursors, EvalState, FilterOperator,
+    FilterPredicate, IncrementalOperator, InputOperator, JoinOperator, JoinType, ProjectOperator,
+};
+use crate::incremental::recursive_operator::{RecursiveOperator, RecursiveState};
 use crate::schema::Type;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::SqliteDialect;
@@ -20,12 +24,21 @@ use crate::numeric::Numeric;
 use crate::sync::{atomic::Ordering, Arc};
 use crate::translate::logical::{
     BinaryOperator, Column, ColumnInfo, JoinType as LogicalJoinType, LogicalExpr, LogicalPlan,
-    LogicalSchema, SchemaRef,
+    LogicalSchema, RecursiveCTE, SchemaRef, DEFAULT_RECURSIVE_MAX_ITERATIONS,
 };
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Value};
 use crate::Pager;
+
+use crate::util::IOExt;
 use crate::{return_and_restore_if_io, return_if_io, LimboError, Result};
 use rustc_hash::FxHashMap as HashMap;
+
+/// Which side of a join a filter expression references.
+enum FilterSide {
+    LeftOnly,
+    RightOnly,
+    Cross,
+}
 use std::fmt::{self, Display, Formatter};
 
 // The state table has 5 columns: operator_id, zset_id, element_id, value, weight
@@ -37,7 +50,13 @@ pub enum WriteRowView {
     #[default]
     GetRecord,
     Delete,
+    /// Seek completed, delete operation in progress
+    Deleting,
     Insert {
+        final_weight: isize,
+    },
+    /// Seek completed, insert operation in progress
+    Inserting {
         final_weight: isize,
     },
     Done,
@@ -68,9 +87,13 @@ impl WriteRowView {
                 WriteRowView::GetRecord => {
                     let res = return_if_io!(cursor.seek(key.clone(), SeekOp::GE { eq_only: true }));
                     if !matches!(res, SeekResult::Found) {
-                        *self = WriteRowView::Insert {
-                            final_weight: weight,
-                        };
+                        if weight <= 0 {
+                            *self = WriteRowView::Done;
+                        } else {
+                            *self = WriteRowView::Insert {
+                                final_weight: weight,
+                            };
+                        }
                     } else {
                         let existing_record = return_if_io!(cursor.record());
                         let r = existing_record.ok_or_else(|| {
@@ -87,13 +110,13 @@ impl WriteRowView {
                                 _ => {
                                     return Err(LimboError::InternalError(format!(
                                         "Invalid weight value in storage for key {key:?}"
-                                    )))
+                                    )));
                                 }
                             },
                             None => {
                                 return Err(LimboError::InternalError(format!(
                                     "No weight value found in storage for key {key:?}"
-                                )))
+                                )));
                             }
                         };
 
@@ -106,20 +129,31 @@ impl WriteRowView {
                     }
                 }
                 WriteRowView::Delete => {
-                    // Mark as Done before delete to avoid retry on I/O
-                    *self = WriteRowView::Done;
+                    // Transition to Deleting state before the delete operation
+                    // so we can resume if I/O occurs during delete/balance
+                    *self = WriteRowView::Deleting;
+                }
+                WriteRowView::Deleting => {
                     return_if_io!(cursor.delete());
+                    *self = WriteRowView::Done;
                 }
                 WriteRowView::Insert { final_weight } => {
                     return_if_io!(cursor.seek(key.clone(), SeekOp::GE { eq_only: true }));
 
+                    // Transition to Inserting state after seek completes
+                    // so we can resume the insert if I/O occurs during insert/balance
+                    *self = WriteRowView::Inserting {
+                        final_weight: *final_weight,
+                    };
+                }
+                WriteRowView::Inserting { final_weight } => {
                     // Extract the row ID from the key
                     let key_i64 = match key {
                         SeekKey::TableRowId(id) => id,
                         _ => {
                             return Err(LimboError::InternalError(
                                 "Expected TableRowId for storage".to_string(),
-                            ))
+                            ));
                         }
                     };
 
@@ -131,11 +165,186 @@ impl WriteRowView {
                         ImmutableRecord::from_values(&record_values, record_values.len())?;
                     let btree_key = BTreeKey::new_table_rowid(key_i64, Some(&immutable_record));
 
-                    // Mark as Done before insert to avoid retry on I/O
-                    *self = WriteRowView::Done;
                     return_if_io!(cursor.insert(&btree_key));
+                    *self = WriteRowView::Done;
                 }
                 WriteRowView::Done => {
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
+    }
+}
+
+/// State machine for writing rows to index-organized materialized views
+/// (used when ORDER BY is present). The key is a composite record:
+/// `[sort_col_vals..., rowid, remaining_col_vals..., weight]`.
+///
+/// Each I/O operation is split into two states with `sought: bool` to make
+/// re-entry safe — when the seek state transitions BEFORE the I/O operation,
+/// re-entry picks up at the mutation state.
+#[derive(Debug)]
+pub enum WriteRowViewIndex {
+    /// Seek for an existing row by composite key (eq_only=true).
+    GetRecord {
+        sought: bool,
+    },
+    /// Existing row found, weight will be decremented or removed.
+    Deleting {
+        sought: bool,
+    },
+    /// New or updated row will be inserted.
+    Inserting {
+        sought: bool,
+        final_weight: isize,
+        /// Full record to insert: [sort_vals..., rowid, data_cols..., weight]
+        full_record: ImmutableRecord,
+    },
+    Done,
+}
+
+impl Default for WriteRowViewIndex {
+    fn default() -> Self {
+        Self::GetRecord { sought: false }
+    }
+}
+
+impl WriteRowViewIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Write a row with weight management for index-organized storage.
+    ///
+    /// # Arguments
+    /// * `cursor` - BTree cursor with index_info set for the sort columns
+    /// * `composite_seek_key` - ImmutableRecord of [sort_vals..., rowid] for seeking
+    /// * `full_record` - ImmutableRecord of [sort_vals..., rowid, data_cols..., weight] for insert
+    /// * `weight` - The weight delta to apply
+    pub fn write_row(
+        &mut self,
+        cursor: &mut BTreeCursor,
+        composite_seek_key: &ImmutableRecord,
+        full_record: &ImmutableRecord,
+        weight: isize,
+    ) -> Result<IOResult<()>> {
+        let seek_key = SeekKey::IndexKey(composite_seek_key.as_record_ref());
+        loop {
+            match self {
+                WriteRowViewIndex::GetRecord { sought } => {
+                    if !*sought {
+                        *self = WriteRowViewIndex::GetRecord { sought: true };
+                    }
+                    let res =
+                        return_if_io!(cursor.seek(seek_key.clone(), SeekOp::GE { eq_only: true }));
+                    match res {
+                        SeekResult::Found => {
+                            let existing_record = return_if_io!(cursor.record());
+                            let r = existing_record.ok_or_else(|| {
+                                LimboError::InternalError(
+                                    "Found composite key in storage but could not read record"
+                                        .to_string(),
+                                )
+                            })?;
+                            let last = r.iter()?.last();
+                            let existing_weight = match last {
+                                Some(val) => match val?.to_owned()? {
+                                    Value::Numeric(Numeric::Integer(w)) => w as isize,
+                                    _ => {
+                                        return Err(LimboError::InternalError(
+                                            "Invalid weight value in storage for index key"
+                                                .to_string(),
+                                        ));
+                                    }
+                                },
+                                None => {
+                                    return Err(LimboError::InternalError(
+                                        "No weight value found in storage for index key"
+                                            .to_string(),
+                                    ));
+                                }
+                            };
+
+                            let final_weight = existing_weight + weight;
+                            if final_weight <= 0 {
+                                *self = WriteRowViewIndex::Deleting { sought: false };
+                            } else {
+                                // Build full record with final weight
+                                let mut vals = full_record.get_values_owned()?;
+                                // Replace the last value (weight) with final_weight
+                                let last_idx = vals.len() - 1;
+                                vals[last_idx] = Value::from_i64(final_weight as i64);
+                                let new_full_record =
+                                    ImmutableRecord::from_values(&vals, vals.len())?;
+                                *self = WriteRowViewIndex::Inserting {
+                                    sought: false,
+                                    final_weight,
+                                    full_record: new_full_record,
+                                };
+                            }
+                        }
+                        SeekResult::TryAdvance => {
+                            // At a leaf boundary — advance and re-check.
+                            // Pattern matches cursor.rs SeekState::Advancing.
+                            return_if_io!(cursor.next());
+                            let rowid = return_if_io!(cursor.rowid());
+                            if rowid.is_none() {
+                                // Past end — key not found
+                                if weight <= 0 {
+                                    *self = WriteRowViewIndex::Done;
+                                } else {
+                                    let record_for_insert = full_record.clone();
+                                    *self = WriteRowViewIndex::Inserting {
+                                        sought: false,
+                                        final_weight: weight,
+                                        full_record: record_for_insert,
+                                    };
+                                }
+                            } else {
+                                // Advanced to a new entry — re-evaluate at GetRecord
+                                *self = WriteRowViewIndex::GetRecord { sought: false };
+                            }
+                        }
+                        SeekResult::NotFound => {
+                            if weight <= 0 {
+                                *self = WriteRowViewIndex::Done;
+                            } else {
+                                *self = WriteRowViewIndex::Inserting {
+                                    sought: false,
+                                    final_weight: weight,
+                                    full_record: full_record.clone(),
+                                };
+                            }
+                        }
+                    }
+                }
+                WriteRowViewIndex::Deleting { sought } => {
+                    if !*sought {
+                        *self = WriteRowViewIndex::Deleting { sought: true };
+                    }
+                    return_if_io!(cursor.delete());
+                    *self = WriteRowViewIndex::Done;
+                }
+                WriteRowViewIndex::Inserting {
+                    sought,
+                    final_weight,
+                    full_record,
+                } => {
+                    let record_to_insert = full_record.clone();
+                    let weight_to_store = *final_weight;
+                    let already_sought = *sought;
+                    if !already_sought {
+                        *self = WriteRowViewIndex::Inserting {
+                            sought: true,
+                            final_weight: weight_to_store,
+                            full_record: record_to_insert.clone(),
+                        };
+                    }
+                    let btree_key = BTreeKey::new_index_key(record_to_insert.as_record_ref());
+                    return_if_io!(cursor.insert(&btree_key));
+                    *self = WriteRowViewIndex::Done;
+                }
+                WriteRowViewIndex::Done => {
                     return Ok(IOResult::Done(()));
                 }
             }
@@ -162,10 +371,18 @@ pub enum CommitState {
         delta: Delta,
         /// Current index in delta.changes being processed
         current_index: usize,
-        /// State for writing individual rows
+        /// State for writing individual rows (table btree)
         write_row_state: WriteRowView,
+        /// State for writing individual rows (index btree, used when ORDER BY is present)
+        write_row_index_state: WriteRowViewIndex,
         /// Cursor for view data btree - created fresh for each row
         view_cursor: Box<BTreeCursor>,
+        /// Whether this view uses index-organized storage (ORDER BY)
+        is_index_organized: bool,
+        /// Number of columns in the output (including weight)
+        num_columns: usize,
+        /// ORDER BY info copied from circuit for building composite keys
+        view_order_by: super::view::MatviewOrderBy,
     },
 }
 
@@ -205,7 +422,7 @@ pub enum ExecuteState {
     /// Initial state - starting circuit execution
     Init {
         /// Input deltas to process
-        input_data: DeltaSet,
+        input_data: InputDeltas,
     },
 
     /// Processing multiple inputs (for recursive node processing)
@@ -216,12 +433,32 @@ pub enum ExecuteState {
         current_index: usize,
         /// Collected deltas from processed inputs
         input_deltas: Vec<Delta>,
+        /// Cursors persisted across I/O yields so operator state stays consistent
+        temp_cursors: Option<Box<DbspStateCursors>>,
     },
 
     /// Processing a specific node in the circuit
     ProcessingNode {
         /// Node's evaluation state (includes the delta in its Init state)
         eval_state: Box<EvalState>,
+    },
+
+    /// Processing a recursive fixed-point iteration
+    ProcessingRecursive {
+        /// ID of the recursive operator node
+        node_id: i64,
+        /// Base case node ID
+        base_case_id: i64,
+        /// Recursive step node ID
+        recursive_step_id: i64,
+        /// Name of the recursive CTE (used for delay key in input_data)
+        delay_name: String,
+        /// State for the current sub-execution
+        sub_state: Box<ExecuteState>,
+        /// Input data (for sub-executions)
+        input_data: InputDeltas,
+        /// Cursors persisted across I/O yields so operator state stays consistent
+        temp_cursors: Option<Box<DbspStateCursors>>,
     },
 }
 
@@ -277,6 +514,64 @@ impl DeltaSet {
     }
 }
 
+/// Overlay view of input deltas used during execution.
+/// Keeps base deltas shared and allows a small per-iteration override set.
+#[derive(Debug, Clone)]
+pub struct InputDeltas {
+    base: Arc<DeltaSet>,
+    overlay: DeltaSet,
+}
+
+impl InputDeltas {
+    pub fn from_base(base: Arc<DeltaSet>) -> Self {
+        Self {
+            base,
+            overlay: DeltaSet::new(),
+        }
+    }
+
+    pub fn from_delta_set(delta_set: DeltaSet) -> Self {
+        Self::from_base(Arc::new(delta_set))
+    }
+
+    pub fn from_map(deltas: HashMap<String, Delta>) -> Self {
+        Self::from_delta_set(DeltaSet::from_map(deltas))
+    }
+
+    /// Get delta for a table, overlay first, then base.
+    pub fn get(&self, table_name: &str) -> Delta {
+        self.overlay
+            .deltas
+            .get(table_name)
+            .cloned()
+            .unwrap_or_else(|| self.base.get(table_name))
+    }
+
+    /// Insert/replace an overlay delta.
+    pub fn insert(&mut self, table_name: String, delta: Delta) {
+        self.overlay.insert(table_name, delta);
+    }
+
+    /// Retain only overlay entries that match predicate.
+    pub fn retain_overlay<F>(&mut self, f: F)
+    where
+        F: FnMut(&String, &mut Delta) -> bool,
+    {
+        self.overlay.deltas.retain(f);
+    }
+
+    /// Drop the shared base deltas (used after the first recursive iteration).
+    pub fn clear_base(&mut self) {
+        self.base = Arc::new(DeltaSet::new());
+    }
+}
+
+impl Default for InputDeltas {
+    fn default() -> Self {
+        Self::from_base(Arc::new(DeltaSet::new()))
+    }
+}
+
 /// Represents a DBSP operator in the compiled circuit
 #[derive(Debug, Clone, PartialEq)]
 pub enum DbspOperator {
@@ -301,10 +596,29 @@ pub enum DbspOperator {
     },
     /// Input operator - source of data
     Input { name: String, schema: SchemaRef },
+    /// Literal operator - produces constant rows (for EmptyRelation and VALUES)
+    Literal { schema: SchemaRef },
     /// Merge operator for combining streams (used in recursive CTEs and UNION)
     Merge { schema: SchemaRef },
+    /// Antijoin operator (LEFT JOIN's null-padded unmatched half).
+    /// Wired in parallel with a JoinOperator(Inner) and UNION-ALL'd via Merge.
+    Antijoin {
+        schema: SchemaRef,
+        right_column_count: usize,
+    },
     /// Distinct operator - removes duplicates
     Distinct { schema: SchemaRef },
+    /// Recursive operator - container for fixed-point computation
+    Recursive {
+        /// Name of the recursive CTE
+        name: String,
+        /// Maximum iterations allowed
+        max_iterations: usize,
+        /// Whether to use UNION ALL semantics
+        union_all: bool,
+        /// Schema of the output
+        schema: SchemaRef,
+    },
 }
 
 /// Represents an expression in DBSP
@@ -404,6 +718,29 @@ pub struct DbspCircuit {
     pub(super) internal_state_root: i64,
     /// Root page for the DBSP state table's primary key index
     pub(super) internal_state_index_root: i64,
+
+    /// ORDER BY columns (empty if no ORDER BY)
+    pub order_by: super::view::MatviewOrderBy,
+    /// LIMIT clause (None if no LIMIT)
+    pub limit: Option<i64>,
+
+    /// Per-circuit-run memo of node outputs.
+    ///
+    /// In a diamond DAG (e.g. dual `LEFT OUTER JOIN`, where the first LJ's
+    /// merge feeds both the second LJ's inner-join and antijoin
+    /// sub-operators), `execute_node` would otherwise visit the shared
+    /// upstream subtree once per consumer. For stateful operators
+    /// (`JoinOperator`, `AntijoinOperator`, `AggregateOperator`)
+    /// `commit` mutates btree state, so the second visit observes the
+    /// first visit's writes and returns a *different* delta — leaving
+    /// downstream consumers with inconsistent left/right inputs.
+    /// Memoising the first delta and reusing it for every later consumer
+    /// in the same `run_circuit` pass makes shared subtrees behave like
+    /// a true DAG instead of a tree.
+    ///
+    /// Cleared at the start of each `commit()` / `execute()` so it never
+    /// leaks across circuit runs.
+    exec_node_cache: HashMap<i64, Delta>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -419,6 +756,8 @@ impl DbspCircuit {
         main_data_root: i64,
         internal_state_root: i64,
         internal_state_index_root: i64,
+        order_by: super::view::MatviewOrderBy,
+        limit: Option<i64>,
     ) -> Self {
         // Start with an empty schema - will be updated when root is set
         let empty_schema = Arc::new(LogicalSchema::new(vec![]));
@@ -431,6 +770,88 @@ impl DbspCircuit {
             main_data_root,
             internal_state_root,
             internal_state_index_root,
+            order_by,
+            limit,
+            exec_node_cache: HashMap::default(),
+        }
+    }
+
+    /// Convenience constructor for tests and internal use where ORDER BY is not needed.
+    pub fn new_table_only(
+        main_data_root: i64,
+        internal_state_root: i64,
+        internal_state_index_root: i64,
+    ) -> Self {
+        Self::new(
+            main_data_root,
+            internal_state_root,
+            internal_state_index_root,
+            super::view::MatviewOrderBy::default(),
+            None,
+        )
+    }
+
+    /// Check if this circuit is running in one-shot mode (no btree storage).
+    /// In one-shot mode, all root pages are 0, meaning there's no persistent
+    /// storage for intermediate state. This affects how we handle base data
+    /// during recursive CTE execution.
+    fn is_one_shot(&self) -> bool {
+        self.internal_state_root == 0 && self.internal_state_index_root == 0
+    }
+
+    /// Save all RecursiveOperator snapshots so execute_with_uncommitted
+    /// can run without corrupting the circuit's persistent state.
+    pub fn save_recursive_snapshots(
+        &self,
+    ) -> Vec<(i64, super::recursive_operator::RecursiveOperatorSnapshot)> {
+        self.nodes
+            .iter()
+            .filter_map(|(&id, node)| {
+                if let DbspOperator::Recursive { .. } = &node.operator {
+                    node.executable
+                        .as_any()
+                        .downcast_ref::<RecursiveOperator>()
+                        .map(|op| (id, op.save_snapshot()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Restore RecursiveOperator snapshots after read-only execution.
+    pub fn restore_recursive_snapshots(
+        &mut self,
+        snapshots: Vec<(i64, super::recursive_operator::RecursiveOperatorSnapshot)>,
+    ) {
+        for (id, snapshot) in snapshots {
+            if let Some(node) = self.nodes.get_mut(&id) {
+                if let Some(op) = node
+                    .executable
+                    .as_any_mut()
+                    .downcast_mut::<RecursiveOperator>()
+                {
+                    op.restore_snapshot(snapshot);
+                }
+            }
+        }
+    }
+
+    /// Reset all recursive operators so their state will be rebuilt from the
+    /// btree on the next `execute()` or `commit()` call.  Used after ROLLBACK
+    /// to bring the in-memory DBSP state back in sync with the (rolled-back)
+    /// matview btree.
+    pub fn reset_recursive_operators_for_rollback(&mut self) {
+        for node in self.nodes.values_mut() {
+            if let DbspOperator::Recursive { .. } = &node.operator {
+                if let Some(op) = node
+                    .executable
+                    .as_any_mut()
+                    .downcast_mut::<RecursiveOperator>()
+                {
+                    op.reset_for_new_transaction();
+                }
+            }
         }
     }
 
@@ -484,6 +905,15 @@ impl DbspCircuit {
         }
     }
 
+    fn new_state_cursors(&self, pager: Arc<Pager>) -> Result<DbspStateCursors> {
+        let table_cursor =
+            BTreeCursor::new_table(pager.clone(), self.internal_state_root, OPERATOR_COLUMNS);
+        let index_def = create_dbsp_state_index(self.internal_state_index_root);
+        let index_cursor =
+            BTreeCursor::new_index(pager, self.internal_state_index_root, &index_def, 3)?;
+        Ok(DbspStateCursors::new(table_cursor, index_cursor))
+    }
+
     /// Execute the circuit with incremental input data (deltas).
     ///
     /// # Arguments
@@ -496,23 +926,171 @@ impl DbspCircuit {
         execute_state: &mut ExecuteState,
     ) -> Result<IOResult<Delta>> {
         if let Some(root_id) = self.root {
+            self.restore_recursive_operators_if_needed(&pager)?;
             // Create temporary cursors for execute (non-commit) operations
-            let table_cursor =
-                BTreeCursor::new_table(pager.clone(), self.internal_state_root, OPERATOR_COLUMNS);
-            let index_def = create_dbsp_state_index(self.internal_state_index_root);
-            let index_cursor = BTreeCursor::new_index(
-                pager.clone(),
-                self.internal_state_index_root,
-                &index_def,
-                3,
-            )?;
-            let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+            let mut cursors = self.new_state_cursors(pager.clone())?;
+            // Fresh per-circuit-run memo (see DbspCircuit::exec_node_cache).
+            // For non-commit `eval`, double-execution would still produce
+            // duplicate work; for commit it would corrupt operator state.
+            // Either way, every public entry point starts with an empty memo.
+            if matches!(execute_state, ExecuteState::Init { .. }) {
+                self.exec_node_cache.clear();
+            }
             self.execute_node(root_id, pager, execute_state, false, &mut cursors)
         } else {
             Err(LimboError::ParseError(
                 "Circuit has no root node".to_string(),
             ))
         }
+    }
+
+    /// Restore RecursiveOperator state from the matview btree when the view
+    /// was loaded from disk. Without this, incremental updates after DB reopen
+    /// assign fresh rowids that collide with existing btree entries.
+    fn restore_recursive_operators_if_needed(&mut self, pager: &Arc<Pager>) -> Result<()> {
+        if self.main_data_root == 0 {
+            return Ok(());
+        }
+
+        let needs_restore: Vec<i64> = self
+            .nodes
+            .iter()
+            .filter_map(|(&id, node)| {
+                if let DbspOperator::Recursive { .. } = &node.operator {
+                    let op = node
+                        .executable
+                        .as_any()
+                        .downcast_ref::<RecursiveOperator>()?;
+                    if op.needs_state_restore() {
+                        return Some(id);
+                    }
+                }
+                None
+            })
+            .collect();
+
+        if needs_restore.is_empty() {
+            return Ok(());
+        }
+
+        let num_columns = self.output_schema.columns.len() + 1;
+        let rows = Self::read_btree_rows(pager, self.main_data_root, num_columns, &self.order_by)?;
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        for node_id in needs_restore {
+            if let Some(node) = self.nodes.get_mut(&node_id) {
+                if let Some(op) = node
+                    .executable
+                    .as_any_mut()
+                    .downcast_mut::<RecursiveOperator>()
+                {
+                    op.restore_state_from_btree_data(&rows);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Read all (rowid, values) pairs from a btree.
+    ///
+    /// For ORDER BY (index-organized) views, the on-disk record layout is
+    /// `[sort_v_1, ..., sort_v_N, rowid, non_sort_data_cols..., weight]`, so
+    /// the cursor must be opened as an index cursor and the rowid extracted
+    /// manually from `record.values[num_sort_cols]`. For table-organized
+    /// views, the layout is `[data_cols..., weight]` and the rowid is the
+    /// btree key.
+    fn read_btree_rows(
+        pager: &Arc<Pager>,
+        root_page: i64,
+        num_columns: usize,
+        order_by: &super::view::MatviewOrderBy,
+    ) -> Result<Vec<(i64, Vec<Value>)>> {
+        let mut rows = Vec::new();
+        let mut btree_cursor = if order_by.is_empty() {
+            BTreeCursor::new_table(pager.clone(), root_page, num_columns)
+        } else {
+            BTreeCursor::new_index_with_index_info(
+                pager.clone(),
+                root_page,
+                order_by.to_index_info(),
+                num_columns,
+            )
+        };
+
+        pager.io.block(|| btree_cursor.rewind())?;
+
+        let num_sort_cols = order_by.len();
+        let is_index_organized = !order_by.is_empty();
+
+        loop {
+            if btree_cursor.is_empty() {
+                break;
+            }
+
+            let record = loop {
+                match btree_cursor.record()? {
+                    IOResult::Done(r) => break r,
+                    IOResult::IO(io) => io.wait(&*pager.io)?,
+                }
+            }
+            .expect("cursor not empty")
+            .to_owned();
+
+            let column_count = record.column_count();
+            // Last column is the weight, skip it
+            let num_data_columns = column_count - 1;
+
+            if is_index_organized {
+                // Index layout: [sort_v_1..N, rowid, non_sort_data..., weight].
+                // Extract rowid from position `num_sort_cols`; reconstruct
+                // logical-order data values.
+                let mut all_vals = Vec::with_capacity(column_count);
+                let mut iter = record.iter()?;
+                for _ in 0..column_count {
+                    all_vals.push(iter.next().expect("checked bounds")?.to_owned()?);
+                }
+                // weight is last
+                all_vals.pop();
+                // rowid is at position num_sort_cols
+                let rowid_val = all_vals.remove(num_sort_cols);
+                let rowid = match rowid_val {
+                    Value::Numeric(Numeric::Integer(r)) => r,
+                    _ => {
+                        return Err(LimboError::InternalError(format!(
+                            "expected integer rowid in matview index record at position {num_sort_cols}, found {rowid_val:?}"
+                        )));
+                    }
+                };
+                // all_vals now holds storage-order data values (sort cols first,
+                // then non-sort cols in input order). For restore_state_from_btree_data
+                // the values just need to round-trip through the recursive operator;
+                // logical column order isn't strictly required here. But to keep the
+                // contract uniform we permute back to logical order using the
+                // sort-column index map.
+                let logical = order_by.permute_storage_to_logical(&all_vals);
+                rows.push((rowid, logical));
+            } else {
+                let rowid = pager
+                    .io
+                    .block(|| btree_cursor.rowid())?
+                    .expect("cursor not empty");
+                let mut values = Vec::with_capacity(num_data_columns);
+                let mut values_iter = record.iter()?;
+                for _ in 0..num_data_columns {
+                    let value = values_iter.next().expect("checked bounds")?;
+                    values.push(value.to_owned()?);
+                }
+                rows.push((rowid, values));
+            }
+
+            pager.io.block(|| btree_cursor.next())?;
+        }
+
+        Ok(rows)
     }
 
     /// Commit deltas to the circuit, updating internal operator state and persisting to btree.
@@ -531,6 +1109,8 @@ impl DbspCircuit {
             return Ok(IOResult::Done(Delta::new()));
         }
 
+        self.restore_recursive_operators_if_needed(&pager)?;
+
         // Get btree root pages
         let main_data_root = self.main_data_root;
 
@@ -538,7 +1118,7 @@ impl DbspCircuit {
         let num_columns = self.output_schema.columns.len() + 1;
 
         // Convert input_data to DeltaSet once, outside the loop
-        let input_delta_set = DeltaSet::from_map(input_data);
+        let input_delta_set = Arc::new(DeltaSet::from_map(input_data));
 
         loop {
             // Take ownership of the state for processing, to avoid borrow checker issues (we have
@@ -548,27 +1128,14 @@ impl DbspCircuit {
             match &mut state {
                 CommitState::Init => {
                     // Create state cursors when entering CommitOperators state
-                    let state_table_cursor = BTreeCursor::new_table(
-                        pager.clone(),
-                        self.internal_state_root,
-                        OPERATOR_COLUMNS,
-                    );
-                    let index_def = create_dbsp_state_index(self.internal_state_index_root);
-                    let state_index_cursor = BTreeCursor::new_index(
-                        pager.clone(),
-                        self.internal_state_index_root,
-                        &index_def,
-                        3, // Index on first 3 columns
-                    )?;
+                    let state_cursors = Box::new(self.new_state_cursors(pager.clone())?);
 
-                    let state_cursors = Box::new(DbspStateCursors::new(
-                        state_table_cursor,
-                        state_index_cursor,
-                    ));
+                    // Fresh per-commit memo (see DbspCircuit::exec_node_cache).
+                    self.exec_node_cache.clear();
 
                     self.commit_state = CommitState::CommitOperators {
                         execute_state: Box::new(ExecuteState::Init {
-                            input_data: input_delta_set.clone(),
+                            input_data: InputDeltas::from_base(input_delta_set.clone()),
                         }),
                         state_cursors,
                     };
@@ -583,25 +1150,80 @@ impl DbspCircuit {
                         self.run_circuit(execute_state, &pager, state_cursors, true,)
                     );
 
-                    // Create view cursor when entering UpdateView state
-                    let view_cursor = Box::new(BTreeCursor::new_table(
-                        pager.clone(),
-                        main_data_root,
-                        num_columns,
-                    ));
+                    // Consolidate the delta before writing to the BTree.
+                    // The DBSP three-way join (δL⋈δR + δL⋈R_prev + L_prev⋈δR)
+                    // can produce multiple entries for the same rowid from
+                    // different join phases. Summing their weights eliminates
+                    // redundant insert/retract pairs (net weight = 0).
+                    let mut delta = delta;
+                    delta.consolidate();
+
+                    // Sort: deletes (weight < 0) before inserts (weight > 0),
+                    // breaking ties by rowid. Two callers depend on this:
+                    //
+                    //   1. WriteRowView. Same-rowid UPDATEs produce a delete of
+                    //      the old row and an insert of the new row at the same
+                    //      rowid. Insert-first would bump the existing weight to
+                    //      2; the delete then re-inserts with OLD values at
+                    //      weight 1, reverting the update.
+                    //
+                    //   2. CDC consumers. Recursive UNION ALL matviews emit the
+                    //      retraction of an old projected row and the insertion
+                    //      of the new one with DIFFERENT rowids (the recursive
+                    //      operator pops the existing rowid for the delete and
+                    //      assigns a fresh `next_rowid` for the insert). Sorting
+                    //      by rowid first leaks Insert-then-Delete to the change
+                    //      callback whenever the fresh rowid happens to be lower
+                    //      than the popped one — which order-aware coalescers
+                    //      (DELETE→INSERT folds to UPDATE; INSERT→DELETE folds to
+                    //      no-op) silently misinterpret as a transient row,
+                    //      dropping the user's edit. Weight-first ordering puts
+                    //      every retraction before every insertion in the batch.
+                    delta.changes.sort_by(|(a_row, a_w), (b_row, b_w)| {
+                        a_w.cmp(b_w).then(a_row.rowid.cmp(&b_row.rowid))
+                    });
+
+                    let is_index_organized = !self.order_by.is_empty();
+
+                    // Create view cursor when entering UpdateView state.
+                    // ORDER BY views use an index btree (composite-keyed by
+                    // sort cols + rowid); plain matviews use a table btree
+                    // keyed by rowid.
+                    let view_cursor: Box<BTreeCursor> = if is_index_organized {
+                        Box::new(BTreeCursor::new_index_with_index_info(
+                            pager.clone(),
+                            main_data_root,
+                            self.order_by.to_index_info(),
+                            num_columns,
+                        ))
+                    } else {
+                        Box::new(BTreeCursor::new_table(
+                            pager.clone(),
+                            main_data_root,
+                            num_columns,
+                        ))
+                    };
 
                     self.commit_state = CommitState::UpdateView {
                         delta,
                         current_index: 0,
                         write_row_state: WriteRowView::new(),
+                        write_row_index_state: WriteRowViewIndex::new(),
                         view_cursor,
+                        is_index_organized,
+                        num_columns,
+                        view_order_by: self.order_by.clone(),
                     };
                 }
                 CommitState::UpdateView {
                     delta,
                     current_index,
                     write_row_state,
+                    write_row_index_state,
                     view_cursor,
+                    is_index_organized,
+                    num_columns,
+                    view_order_by,
                 } => {
                     if *current_index >= delta.changes.len() {
                         self.commit_state = CommitState::Init;
@@ -609,54 +1231,143 @@ impl DbspCircuit {
                         return Ok(IOResult::Done(delta));
                     } else {
                         let (row, weight) = delta.changes[*current_index].clone();
+                        let nc = *num_columns;
+                        let is_index = *is_index_organized;
 
-                        // If we're starting a new row (GetRecord state), we need a fresh cursor
+                        // If we're starting a new row, we need a fresh cursor
                         // due to btree cursor state machine limitations
-                        if matches!(write_row_state, WriteRowView::GetRecord) {
-                            *view_cursor = Box::new(BTreeCursor::new_table(
-                                pager.clone(),
-                                main_data_root,
-                                num_columns,
-                            ));
+                        let needs_fresh = if is_index {
+                            matches!(write_row_index_state, WriteRowViewIndex::GetRecord { .. })
+                        } else {
+                            matches!(write_row_state, WriteRowView::GetRecord)
+                        };
+                        if needs_fresh {
+                            *view_cursor = if is_index {
+                                Box::new(BTreeCursor::new_index_with_index_info(
+                                    pager.clone(),
+                                    main_data_root,
+                                    view_order_by.to_index_info(),
+                                    nc,
+                                ))
+                            } else {
+                                Box::new(BTreeCursor::new_table(pager.clone(), main_data_root, nc))
+                            };
                         }
 
-                        // Build the view row format: row values + weight
-                        let key = SeekKey::TableRowId(row.rowid);
-                        let row_values = row.values.clone();
-                        let build_fn = move |final_weight: isize| -> Vec<Value> {
-                            let mut values = row_values.clone();
-                            values.push(Value::from_i64(final_weight as i64));
-                            values
-                        };
+                        if is_index {
+                            let (composite_seek_key, full_record) = Self::build_composite_keys(
+                                &row.values,
+                                row.rowid,
+                                nc,
+                                &view_order_by.columns,
+                                weight,
+                            )?;
+                            return_and_restore_if_io!(
+                                &mut self.commit_state,
+                                state,
+                                write_row_index_state.write_row(
+                                    view_cursor,
+                                    &composite_seek_key,
+                                    &full_record,
+                                    weight,
+                                )
+                            );
+                        } else {
+                            // Build the view row format: row values + weight
+                            let key = SeekKey::TableRowId(row.rowid);
+                            let row_values = row.values.clone();
+                            let build_fn = move |final_weight: isize| -> Vec<Value> {
+                                let mut values = row_values.to_vec();
+                                values.push(Value::from_i64(final_weight as i64));
+                                values
+                            };
 
-                        return_and_restore_if_io!(
-                            &mut self.commit_state,
-                            state,
-                            write_row_state.write_row(view_cursor, key, build_fn, weight)
-                        );
+                            return_and_restore_if_io!(
+                                &mut self.commit_state,
+                                state,
+                                write_row_state.write_row(view_cursor, key, build_fn, weight)
+                            );
+                        }
 
                         // Move to next row
                         let delta = std::mem::take(delta);
-                        // Take ownership of view_cursor - we'll create a new one for next row if needed
-                        let view_cursor = std::mem::replace(
-                            view_cursor,
-                            Box::new(BTreeCursor::new_table(
+                        // Take ownership of view_cursor - we'll create a new one for next row if needed.
+                        // The replacement must match the btree page format.
+                        let placeholder: Box<BTreeCursor> = if is_index {
+                            Box::new(BTreeCursor::new_index_with_index_info(
                                 pager.clone(),
                                 main_data_root,
-                                num_columns,
-                            )),
-                        );
+                                view_order_by.to_index_info(),
+                                nc,
+                            ))
+                        } else {
+                            Box::new(BTreeCursor::new_table(pager.clone(), main_data_root, nc))
+                        };
+                        let view_cursor = std::mem::replace(view_cursor, placeholder);
 
                         self.commit_state = CommitState::UpdateView {
                             delta,
                             current_index: *current_index + 1,
                             write_row_state: WriteRowView::new(),
+                            write_row_index_state: WriteRowViewIndex::new(),
                             view_cursor,
+                            is_index_organized: is_index,
+                            num_columns: nc,
+                            view_order_by: view_order_by.clone(),
                         };
                     }
                 }
             }
         }
+    }
+
+    /// Build composite keys for index-organized matview writes.
+    ///
+    /// Returns (seek_key_record, full_record) where:
+    /// - seek_key_record: [sort_val1, ..., sort_valN, rowid] — used for seeking
+    /// - full_record: [sort_val1, ..., sort_valN, rowid, remaining_cols..., weight] — used for insert
+    fn build_composite_keys(
+        row_values: &[Value],
+        rowid: i64,
+        num_output_columns: usize,
+        order_by_columns: &[(
+            usize,
+            turso_parser::ast::SortOrder,
+            Option<turso_parser::ast::NullsOrder>,
+        )],
+        weight: isize,
+    ) -> Result<(ImmutableRecord, ImmutableRecord)> {
+        let num_sort_cols = order_by_columns.len();
+        let num_data_cols = num_output_columns - 1; // minus the weight column
+        let mut seek_vals = Vec::with_capacity(num_sort_cols + 1);
+        let mut full_vals = Vec::with_capacity(num_output_columns);
+
+        // Add sort column values
+        for &(col_idx, _, _) in order_by_columns {
+            let val = row_values.get(col_idx).cloned().unwrap_or(Value::Null);
+            seek_vals.push(val.clone());
+            full_vals.push(val);
+        }
+
+        // Add rowid
+        seek_vals.push(Value::from_i64(rowid));
+        full_vals.push(Value::from_i64(rowid));
+
+        // Add remaining non-sort data columns
+        let sort_indices: std::collections::HashSet<usize> =
+            order_by_columns.iter().map(|&(i, _, _)| i).collect();
+        for (i, val) in row_values.iter().enumerate() {
+            if i < num_data_cols && !sort_indices.contains(&i) {
+                full_vals.push(val.clone());
+            }
+        }
+
+        // Add weight
+        full_vals.push(Value::from_i64(weight as i64));
+
+        let seek_record = ImmutableRecord::from_values(&seek_vals, seek_vals.len())?;
+        let full_record = ImmutableRecord::from_values(&full_vals, full_vals.len())?;
+        Ok((seek_record, full_record))
     }
 
     /// Execute a specific node in the circuit
@@ -679,7 +1390,7 @@ impl DbspCircuit {
                         .get(&node_id)
                         .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?;
 
-                    // Check if this is an Input node
+                    // Check for special node types
                     match &node.operator {
                         DbspOperator::Input { name, .. } => {
                             // Input nodes get their delta directly from input_data
@@ -688,6 +1399,42 @@ impl DbspCircuit {
                                 eval_state: Box::new(EvalState::Init {
                                     deltas: delta.into(),
                                 }),
+                            };
+                        }
+                        DbspOperator::Literal { .. } => {
+                            // Literal nodes generate their own data, no external input needed
+                            *execute_state = ExecuteState::ProcessingNode {
+                                eval_state: Box::new(EvalState::Init {
+                                    deltas: DeltaPair::default(),
+                                }),
+                            };
+                        }
+                        DbspOperator::Recursive { name, .. } => {
+                            // Recursive nodes need special fixed-point execution
+                            // inputs = [base_case_id, recursive_step_id, delay_id]
+                            let inputs = node.inputs.clone();
+                            if inputs.len() != 3 {
+                                return Err(LimboError::ParseError(format!(
+                                    "Recursive node '{}' must have exactly 3 inputs, found {}",
+                                    name,
+                                    inputs.len()
+                                )));
+                            }
+                            let base_case_id = inputs[0];
+                            let recursive_step_id = inputs[1];
+                            // delay_input_id is inputs[2] but we don't need it - we use delay_name
+
+                            let input_data = std::mem::take(input_data);
+                            *execute_state = ExecuteState::ProcessingRecursive {
+                                node_id,
+                                base_case_id,
+                                recursive_step_id,
+                                delay_name: name.clone(),
+                                sub_state: Box::new(ExecuteState::Init {
+                                    input_data: input_data.clone(),
+                                }),
+                                input_data,
+                                temp_cursors: None,
                             };
                         }
                         _ => {
@@ -711,6 +1458,7 @@ impl DbspCircuit {
                                 input_states,
                                 current_index: 0,
                                 input_deltas: Vec::new(),
+                                temp_cursors: None,
                             };
                         }
                     }
@@ -719,6 +1467,7 @@ impl DbspCircuit {
                     input_states,
                     current_index,
                     input_deltas,
+                    temp_cursors,
                 } => {
                     if *current_index >= input_states.len() {
                         // All inputs processed
@@ -734,31 +1483,37 @@ impl DbspCircuit {
                         // Get the (node_id, state) pair for the current index
                         let (input_node_id, input_state) = &mut input_states[*current_index];
 
-                        // Create temporary cursors for the recursive call
-                        let temp_table_cursor = BTreeCursor::new_table(
-                            pager.clone(),
-                            self.internal_state_root,
-                            OPERATOR_COLUMNS,
-                        );
-                        let index_def = create_dbsp_state_index(self.internal_state_index_root);
-                        let temp_index_cursor = BTreeCursor::new_index(
-                            pager.clone(),
-                            self.internal_state_index_root,
-                            &index_def,
-                            3,
-                        )?;
-                        let mut temp_cursors =
-                            DbspStateCursors::new(temp_table_cursor, temp_index_cursor);
+                        // Diamond-DAG memo: if a sibling consumer already
+                        // evaluated this subtree in this run, reuse the delta
+                        // instead of re-running stateful operators (which would
+                        // observe their own first-run side effects on btree
+                        // state and emit a *different* delta).
+                        if let Some(cached) = self.exec_node_cache.get(input_node_id) {
+                            input_deltas.push(cached.clone());
+                            *current_index += 1;
+                            *temp_cursors = None;
+                            continue;
+                        }
+
+                        // Reuse persisted cursors across I/O yields so operator
+                        // state (e.g. WriteRow::InsertIndex { sought: true })
+                        // stays consistent with the cursor's page stack position.
+                        if temp_cursors.is_none() {
+                            *temp_cursors = Some(Box::new(self.new_state_cursors(pager.clone())?));
+                        }
+                        let tc = temp_cursors.as_mut().unwrap();
 
                         let delta = return_if_io!(self.execute_node(
                             *input_node_id,
                             pager.clone(),
                             input_state,
                             commit_operators,
-                            &mut temp_cursors
+                            tc
                         ));
                         input_deltas.push(delta);
                         *current_index += 1;
+                        // Reset cursors for next input's subtree
+                        *temp_cursors = None;
                     }
                 }
                 ExecuteState::ProcessingNode { eval_state } => {
@@ -770,7 +1525,193 @@ impl DbspCircuit {
 
                     let output_delta =
                         return_if_io!(node.process_node(eval_state, commit_operators, cursors));
+                    // Memoise so sibling consumers in the same circuit run
+                    // see the *same* delta — see DbspCircuit::exec_node_cache.
+                    self.exec_node_cache.insert(node_id, output_delta.clone());
                     return Ok(IOResult::Done(output_delta));
+                }
+                ExecuteState::ProcessingRecursive {
+                    node_id,
+                    base_case_id,
+                    recursive_step_id,
+                    delay_name,
+                    sub_state,
+                    input_data,
+                    temp_cursors,
+                } => {
+                    let delay_key = format!("__delay_{delay_name}");
+                    let nid = *node_id;
+
+                    let state = {
+                        let node = self
+                            .nodes
+                            .get(&nid)
+                            .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?;
+                        let recursive_op = node
+                            .executable
+                            .as_any()
+                            .downcast_ref::<RecursiveOperator>()
+                            .ok_or_else(|| {
+                                LimboError::ParseError("Expected RecursiveOperator".to_string())
+                            })?;
+                        recursive_op.state().clone()
+                    };
+
+                    // If the operator was previously Done, reset to Init for re-execution.
+                    // This is intentional for incremental updates: when source tables change,
+                    // we re-run fixed-point iteration with the new deltas. The key insight is
+                    // that RecursiveOperator preserves seen_counts/seen_rows hash maps across
+                    // runs, so filter_new_rows() only emits deltas for values whose multiplicity
+                    // changed (e.g., new inserts or deletions). This prevents re-computing the
+                    // entire transitive closure and ensures we only propagate the incremental
+                    // changes through the recursion. Note: accumulated_output is reset by
+                    // initialize_with_base(), so finalize() having taken it is fine.
+                    let state = if matches!(state, RecursiveState::Done) {
+                        RecursiveState::Init
+                    } else {
+                        state
+                    };
+
+                    match state {
+                        RecursiveState::Init => {
+                            if temp_cursors.is_none() {
+                                *temp_cursors =
+                                    Some(Box::new(self.new_state_cursors(pager.clone())?));
+                            }
+                            let tc = temp_cursors.as_mut().unwrap();
+
+                            // Each recursive iteration is a *separate pass*
+                            // through the body, so the diamond-DAG memo must
+                            // not leak deltas from one iteration into another.
+                            // Clear before the base case (first pass) and again
+                            // before each recursive step.
+                            self.exec_node_cache.clear();
+
+                            // Execute the base case
+                            let base_delta = return_if_io!(self.execute_node(
+                                *base_case_id,
+                                pager.clone(),
+                                sub_state,
+                                commit_operators,
+                                tc
+                            ));
+                            *temp_cursors = None;
+
+                            // Get the operator and initialize it
+                            let node = self.nodes.get_mut(&nid).ok_or_else(|| {
+                                LimboError::ParseError("Node not found".to_string())
+                            })?;
+                            let recursive_op = node
+                                .executable
+                                .as_any_mut()
+                                .downcast_mut::<RecursiveOperator>()
+                                .ok_or_else(|| {
+                                    LimboError::ParseError("Expected RecursiveOperator".to_string())
+                                })?;
+
+                            let delay_delta = recursive_op.initialize_with_base(base_delta)?;
+                            recursive_op.start_iteration();
+
+                            // Set the delay value in input_data for the recursive step
+                            input_data.insert(delay_key, delay_delta);
+
+                            // Move to recursive step
+                            **sub_state = ExecuteState::Init {
+                                input_data: input_data.clone(),
+                            };
+                        }
+                        RecursiveState::BaseComplete => {
+                            let node = self.nodes.get_mut(&nid).ok_or_else(|| {
+                                LimboError::ParseError("Node not found".to_string())
+                            })?;
+                            let recursive_op = node
+                                .executable
+                                .as_any_mut()
+                                .downcast_mut::<RecursiveOperator>()
+                                .ok_or_else(|| {
+                                    LimboError::ParseError("Expected RecursiveOperator".to_string())
+                                })?;
+                            recursive_op.start_iteration();
+                            **sub_state = ExecuteState::Init {
+                                input_data: input_data.clone(),
+                            };
+                        }
+                        RecursiveState::Iterating { iteration } => {
+                            if temp_cursors.is_none() {
+                                *temp_cursors =
+                                    Some(Box::new(self.new_state_cursors(pager.clone())?));
+                            }
+                            let tc = temp_cursors.as_mut().unwrap();
+
+                            // Fresh memo per recursive iteration — see the
+                            // matching clear in `RecursiveState::Init`.
+                            self.exec_node_cache.clear();
+
+                            let step_delta = return_if_io!(self.execute_node(
+                                *recursive_step_id,
+                                pager.clone(),
+                                sub_state,
+                                commit_operators,
+                                tc
+                            ));
+                            *temp_cursors = None;
+
+                            // Get the operator and process iteration result
+                            let node = self.nodes.get_mut(&nid).ok_or_else(|| {
+                                LimboError::ParseError("Node not found".to_string())
+                            })?;
+                            let recursive_op = node
+                                .executable
+                                .as_any_mut()
+                                .downcast_mut::<RecursiveOperator>()
+                                .ok_or_else(|| {
+                                    LimboError::ParseError("Expected RecursiveOperator".to_string())
+                                })?;
+
+                            let step_result = recursive_op.process_iteration_result(step_delta)?;
+
+                            if step_result.done {
+                                return Ok(IOResult::Done(recursive_op.finalize()));
+                            }
+
+                            // Update delay value for next iteration
+                            // The delay should contain the NEW values from this iteration
+                            input_data.insert(delay_key.clone(), step_result.delta_for_delay);
+                            // After the first iteration, clear base data from input_data.
+                            // In the commit path, subsequent iterations read from btree stored
+                            // state. Clearing base data avoids keeping unnecessary state.
+                            //
+                            // EXCEPTIONS — base data must be preserved when:
+                            // (a) One-shot mode: no btree storage, JoinOperator needs base data.
+                            // (b) Execute (non-commit) path: used by MaterializedViewCursor for
+                            //     uncommitted transaction reads. The btree doesn't contain
+                            //     uncommitted data, so the JOIN needs the full delta for every
+                            //     iteration. Per DBSP theory (Budiu et al., VLDB 2023 §5.3),
+                            //     the input stream σ must be available to ALL fixed-point
+                            //     iterations, not just the first.
+                            if iteration == 1 && !self.is_one_shot() && commit_operators {
+                                input_data.clear_base();
+                            }
+
+                            // Move to next iteration
+                            **sub_state = ExecuteState::Init {
+                                input_data: input_data.clone(),
+                            };
+                        }
+                        RecursiveState::Done => {
+                            let node = self.nodes.get_mut(&nid).ok_or_else(|| {
+                                LimboError::ParseError("Node not found".to_string())
+                            })?;
+                            let recursive_op = node
+                                .executable
+                                .as_any_mut()
+                                .downcast_mut::<RecursiveOperator>()
+                                .ok_or_else(|| {
+                                    LimboError::ParseError("Expected RecursiveOperator".to_string())
+                                })?;
+                            return Ok(IOResult::Done(recursive_op.finalize()));
+                        }
+                    }
                 }
             }
         }
@@ -818,6 +1759,13 @@ impl DbspCircuit {
                 DbspOperator::Input { name, .. } => {
                     writeln!(f, "{indent}Input[{node_id}]: {name}")?;
                 }
+                DbspOperator::Literal { schema } => {
+                    writeln!(
+                        f,
+                        "{indent}Literal[{node_id}]: {} columns",
+                        schema.columns.len()
+                    )?;
+                }
                 DbspOperator::Merge { schema } => {
                     writeln!(
                         f,
@@ -825,10 +1773,37 @@ impl DbspCircuit {
                         schema.columns.len()
                     )?;
                 }
+                DbspOperator::Antijoin {
+                    schema,
+                    right_column_count,
+                } => {
+                    writeln!(
+                        f,
+                        "{indent}Antijoin[{node_id}]: LEFT JOIN antijoin half (R cols: {}, schema: {})",
+                        right_column_count,
+                        schema.columns.len()
+                    )?;
+                }
                 DbspOperator::Distinct { schema } => {
                     writeln!(
                         f,
                         "{indent}Distinct[{node_id}]: (schema: {} columns)",
+                        schema.columns.len()
+                    )?;
+                }
+                DbspOperator::Recursive {
+                    name,
+                    max_iterations,
+                    union_all,
+                    schema,
+                } => {
+                    let union_mode_str = if *union_all { "UNION ALL" } else { "UNION" };
+                    writeln!(
+                        f,
+                        "{indent}Recursive[{node_id}]: {} (max_iter={}, mode={}, {} columns)",
+                        name,
+                        max_iterations,
+                        union_mode_str,
                         schema.columns.len()
                     )?;
                 }
@@ -845,6 +1820,9 @@ impl DbspCircuit {
 /// Compiler from LogicalPlan to DBSP Circuit
 pub struct DbspCompiler {
     circuit: DbspCircuit,
+    /// Maps recursive CTE names to their delay input node IDs
+    /// Used during compilation to resolve RecursiveCTERef nodes
+    recursive_cte_refs: HashMap<String, i64>,
 }
 
 impl DbspCompiler {
@@ -853,18 +1831,165 @@ impl DbspCompiler {
         main_data_root: i64,
         internal_state_root: i64,
         internal_state_index_root: i64,
+        order_by: super::view::MatviewOrderBy,
+        limit: Option<i64>,
     ) -> Self {
         Self {
             circuit: DbspCircuit::new(
                 main_data_root,
                 internal_state_root,
                 internal_state_index_root,
+                order_by,
+                limit,
             ),
+            recursive_cte_refs: HashMap::default(),
         }
     }
 
     /// Resolve join condition columns to determine which side each column belongs to.
     ///
+    /// Split a LogicalExpr into AND-conjuncts.
+    fn split_conjuncts(expr: &LogicalExpr) -> Vec<LogicalExpr> {
+        match expr {
+            LogicalExpr::BinaryExpr {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                let mut result = Self::split_conjuncts(left);
+                result.extend(Self::split_conjuncts(right));
+                result
+            }
+            other => vec![other.clone()],
+        }
+    }
+
+    /// Collect all Column references from a LogicalExpr.
+    fn collect_column_refs(expr: &LogicalExpr) -> Vec<&Column> {
+        match expr {
+            LogicalExpr::Column(col) => vec![col],
+            LogicalExpr::BinaryExpr { left, right, .. } => {
+                let mut refs = Self::collect_column_refs(left);
+                refs.extend(Self::collect_column_refs(right));
+                refs
+            }
+            LogicalExpr::UnaryExpr { expr, .. } => Self::collect_column_refs(expr),
+            LogicalExpr::IsNull { expr, .. } => Self::collect_column_refs(expr),
+            LogicalExpr::Like { expr, pattern, .. } => {
+                let mut refs = Self::collect_column_refs(expr);
+                refs.extend(Self::collect_column_refs(pattern));
+                refs
+            }
+            LogicalExpr::Between {
+                expr, low, high, ..
+            } => {
+                let mut refs = Self::collect_column_refs(expr);
+                refs.extend(Self::collect_column_refs(low));
+                refs.extend(Self::collect_column_refs(high));
+                refs
+            }
+            LogicalExpr::InList { expr, list, .. } => {
+                let mut refs = Self::collect_column_refs(expr);
+                for item in list {
+                    refs.extend(Self::collect_column_refs(item));
+                }
+                refs
+            }
+            LogicalExpr::ScalarFunction { args, .. } => {
+                let mut refs = Vec::new();
+                for arg in args {
+                    refs.extend(Self::collect_column_refs(arg));
+                }
+                refs
+            }
+            LogicalExpr::Cast { expr, .. } | LogicalExpr::Alias { expr, .. } => {
+                Self::collect_column_refs(expr)
+            }
+            LogicalExpr::Case {
+                expr,
+                when_then,
+                else_expr,
+            } => {
+                let mut refs = Vec::new();
+                if let Some(e) = expr {
+                    refs.extend(Self::collect_column_refs(e));
+                }
+                for (w, t) in when_then {
+                    refs.extend(Self::collect_column_refs(w));
+                    refs.extend(Self::collect_column_refs(t));
+                }
+                if let Some(e) = else_expr {
+                    refs.extend(Self::collect_column_refs(e));
+                }
+                refs
+            }
+            LogicalExpr::AggregateFunction { args, .. } => {
+                let mut refs = Vec::new();
+                for arg in args {
+                    refs.extend(Self::collect_column_refs(arg));
+                }
+                refs
+            }
+            LogicalExpr::Literal(_)
+            | LogicalExpr::InSubquery { .. }
+            | LogicalExpr::Exists { .. }
+            | LogicalExpr::ScalarSubquery(_) => vec![],
+        }
+    }
+
+    /// Classify which side of a join a filter expression references.
+    fn classify_filter_side(
+        expr: &LogicalExpr,
+        left_schema: &LogicalSchema,
+        right_schema: &LogicalSchema,
+    ) -> FilterSide {
+        let cols = Self::collect_column_refs(expr);
+        let mut refs_left = false;
+        let mut refs_right = false;
+
+        for col in &cols {
+            let in_left = left_schema
+                .find_column(&col.name, col.table.as_deref())
+                .is_some();
+            let in_right = right_schema
+                .find_column(&col.name, col.table.as_deref())
+                .is_some();
+            if in_left {
+                refs_left = true;
+            }
+            if in_right {
+                refs_right = true;
+            }
+        }
+
+        match (refs_left, refs_right) {
+            (true, false) => FilterSide::LeftOnly,
+            (false, true) => FilterSide::RightOnly,
+            _ => FilterSide::Cross,
+        }
+    }
+
+    /// Add a filter node on top of an existing node.
+    fn add_filter_node(
+        &mut self,
+        input_id: i64,
+        predicate: &LogicalExpr,
+        schema: &LogicalSchema,
+    ) -> Result<i64> {
+        let dbsp_predicate = Self::compile_expr(predicate)?;
+        let filter_predicate = Self::compile_filter_predicate(predicate, schema)?;
+        let executable: Box<dyn IncrementalOperator> =
+            Box::new(FilterOperator::new(filter_predicate));
+        let node_id = self.circuit.add_node(
+            DbspOperator::Filter {
+                predicate: dbsp_predicate,
+            },
+            vec![input_id],
+            executable,
+        );
+        Ok(node_id)
+    }
+
     /// Returns (left_column, left_index, right_column, right_index) where:
     /// - left_column/right_column are the Column references
     /// - left_index/right_index are the column indices in their respective schemas
@@ -929,8 +2054,10 @@ impl DbspCompiler {
 
     /// Compile a logical plan to a DBSP circuit
     pub fn compile(mut self, plan: &LogicalPlan) -> Result<DbspCircuit> {
-        let root_id = self.compile_plan(plan)?;
-        let output_schema = plan.schema().clone();
+        // First, inline any CTEs in the plan
+        let inlined_plan = plan.inline_ctes()?;
+        let root_id = self.compile_plan(&inlined_plan)?;
+        let output_schema = inlined_plan.schema().clone();
         self.circuit.set_root(root_id, output_schema);
         Ok(self.circuit)
     }
@@ -944,12 +2071,16 @@ impl DbspCompiler {
 
                 // Get input column names for the ProjectOperator
                 let input_schema = proj.input.schema();
-                let input_column_names: Vec<String> = input_schema.columns.iter()
+                let input_column_names: Vec<String> = input_schema
+                    .columns
+                    .iter()
                     .map(|col| col.name.clone())
                     .collect();
 
                 // Convert logical expressions to DBSP expressions
-                let dbsp_exprs = proj.exprs.iter()
+                let dbsp_exprs = proj
+                    .exprs
+                    .iter()
                     .map(Self::compile_expr)
                     .collect::<Result<Vec<_>>>()?;
 
@@ -963,13 +2094,21 @@ impl DbspCompiler {
                 }
 
                 // Get output column names from the projection schema
-                let output_column_names: Vec<String> = proj.schema.columns.iter()
+                let output_column_names: Vec<String> = proj
+                    .schema
+                    .columns
+                    .iter()
                     .map(|col| col.name.clone())
                     .collect();
 
                 // Create the ProjectOperator
                 let executable: Box<dyn IncrementalOperator> =
-                    Box::new(ProjectOperator::from_compiled(compiled_exprs, aliases, input_column_names, output_column_names)?);
+                    Box::new(ProjectOperator::from_compiled(
+                        compiled_exprs,
+                        aliases,
+                        input_column_names,
+                        output_column_names,
+                    )?);
 
                 // Create projection node
                 let node_id = self.circuit.add_node(
@@ -995,40 +2134,47 @@ impl DbspCompiler {
                     // 1. Create projection that adds the computed expression as a new column
 
                     // First, get all existing columns
-                    let mut projection_exprs = Vec::new();
                     let mut dbsp_exprs = Vec::new();
-
                     for col in &input_schema.columns {
-                        projection_exprs.push(LogicalExpr::Column(Column {
-                            name: col.name.clone(),
-                            table: None,
-                        }));
                         dbsp_exprs.push(DbspExpr::Column(col.name.clone()));
                     }
 
                     // Now add the expression as a computed column
                     let temp_column_name = "__temp_filter_expr";
                     let computed_expr = Self::extract_expression_from_predicate(&filter.predicate)?;
-                    projection_exprs.push(computed_expr);
 
-                    // Compile the projection expressions
+                    // Compile the projection expressions.
+                    //
+                    // The passthrough part is a pure 1:1 copy of
+                    // `input_schema.columns`, so bind it POSITIONALLY. Rebuilding
+                    // it as unqualified `LogicalExpr::Column`s and re-resolving
+                    // those by name is lossy: when this filter's input is a join
+                    // whose two sides carry columns with the same bare name (a
+                    // self-join, or a recursive CTE mirroring its base table),
+                    // every such reference resolves to the FIRST match, silently
+                    // wiring the output column to the wrong side.
+                    let input_len = input_schema.columns.len();
                     let mut compiled_exprs = Vec::new();
                     let mut aliases = Vec::new();
                     let mut output_names = Vec::new();
-                    for (i, expr) in projection_exprs.iter().enumerate() {
-                        let (compiled, _alias) = Self::compile_expression(expr, input_schema)?;
-                        compiled_exprs.push(compiled);
-                        if i < input_schema.columns.len() {
-                            aliases.push(None);
-                            output_names.push(input_schema.columns[i].name.clone());
-                        } else {
-                            aliases.push(Some(temp_column_name.to_string()));
-                            output_names.push(temp_column_name.to_string());
-                        }
+                    for (i, col) in input_schema.columns.iter().enumerate() {
+                        compiled_exprs.push(CompiledExpression {
+                            executor: ExpressionExecutor::Trivial(TrivialExpression::Column(i)),
+                            input_count: input_len,
+                        });
+                        aliases.push(None);
+                        output_names.push(col.name.clone());
                     }
+                    let (compiled_computed, _alias) =
+                        Self::compile_expression(&computed_expr, input_schema)?;
+                    compiled_exprs.push(compiled_computed);
+                    aliases.push(Some(temp_column_name.to_string()));
+                    output_names.push(temp_column_name.to_string());
 
                     // Get input column names for ProjectOperator
-                    let input_column_names: Vec<String> = input_schema.columns.iter()
+                    let input_column_names: Vec<String> = input_schema
+                        .columns
+                        .iter()
                         .map(|col| col.name.clone())
                         .collect();
 
@@ -1038,7 +2184,7 @@ impl DbspCompiler {
                             compiled_exprs.clone(),
                             aliases.clone(),
                             input_column_names,
-                            output_names.clone()
+                            output_names.clone(),
                         )?);
 
                     // Create updated schema for the projection output
@@ -1048,7 +2194,7 @@ impl DbspCompiler {
                         table: None,
                         database: None,
                         table_alias: None,
-                        ty: Type::Integer,  // Computed expressions default to Integer
+                        ty: Type::Integer, // Computed expressions default to Integer
                     });
                     let proj_schema = SchemaRef::new(LogicalSchema {
                         columns: proj_schema_columns,
@@ -1066,15 +2212,19 @@ impl DbspCompiler {
 
                     // Now create a filter that replaces the complex expression with the temp column
                     // but keeps all other conditions intact
-                    let replaced_predicate = Self::replace_complex_with_temp(&filter.predicate, temp_column_name)?;
-                    let filter_predicate = Self::compile_filter_predicate(&replaced_predicate, &proj_schema)?;
+                    let replaced_predicate =
+                        Self::replace_complex_with_temp(&filter.predicate, temp_column_name)?;
+                    let filter_predicate =
+                        Self::compile_filter_predicate(&replaced_predicate, &proj_schema)?;
 
                     let filter_executable: Box<dyn IncrementalOperator> =
                         Box::new(FilterOperator::new(filter_predicate));
 
                     // Create filter node
                     let filter_id = self.circuit.add_node(
-                        DbspOperator::Filter { predicate: Self::compile_expr(&replaced_predicate)? },
+                        DbspOperator::Filter {
+                            predicate: Self::compile_expr(&replaced_predicate)?,
+                        },
                         vec![proj_id],
                         filter_executable,
                     );
@@ -1101,13 +2251,13 @@ impl DbspCompiler {
                             final_exprs,
                             final_aliases,
                             filter_output_names,
-                            final_names.clone()
+                            final_names.clone(),
                         )?);
 
                     let final_id = self.circuit.add_node(
                         DbspOperator::Projection {
                             exprs: final_dbsp_exprs,
-                            schema: input_schema.clone(),  // Back to original schema
+                            schema: input_schema.clone(), // Back to original schema
                         },
                         vec![filter_id],
                         final_proj_executable,
@@ -1120,7 +2270,8 @@ impl DbspCompiler {
                     let dbsp_predicate = Self::compile_expr(&filter.predicate)?;
 
                     // Convert to FilterPredicate
-                    let filter_predicate = Self::compile_filter_predicate(&filter.predicate, input_schema)?;
+                    let filter_predicate =
+                        Self::compile_filter_predicate(&filter.predicate, input_schema)?;
 
                     // Create executable operator
                     let executable: Box<dyn IncrementalOperator> =
@@ -1128,7 +2279,9 @@ impl DbspCompiler {
 
                     // Create filter node
                     let node_id = self.circuit.add_node(
-                        DbspOperator::Filter { predicate: dbsp_predicate },
+                        DbspOperator::Filter {
+                            predicate: dbsp_predicate,
+                        },
                         vec![input_id],
                         executable,
                     );
@@ -1141,7 +2294,9 @@ impl DbspCompiler {
 
                 // Get input column names
                 let input_schema = agg.input.schema();
-                let input_column_names: Vec<String> = input_schema.columns.iter()
+                let input_column_names: Vec<String> = input_schema
+                    .columns
+                    .iter()
                     .map(|col| col.name.clone())
                     .collect();
 
@@ -1152,10 +2307,14 @@ impl DbspCompiler {
                     // For now, only support simple column references in GROUP BY
                     if let LogicalExpr::Column(col) = expr {
                         // Find the column index in the input schema using qualified lookup
-                        let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
-                            .ok_or_else(|| LimboError::ParseError(
-                                format!("GROUP BY column '{}' not found in input", col.name)
-                            ))?;
+                        let (col_idx, _) = input_schema
+                            .find_column(&col.name, col.table.as_deref())
+                            .ok_or_else(|| {
+                                LimboError::ParseError(format!(
+                                    "GROUP BY column '{}' not found in input",
+                                    col.name
+                                ))
+                            })?;
                         group_by_indices.push(col_idx);
                         dbsp_group_exprs.push(DbspExpr::Column(col.name.clone()));
                     } else {
@@ -1165,26 +2324,78 @@ impl DbspCompiler {
                     }
                 }
 
-                // Compile aggregate expressions (both DISTINCT and regular)
+                // Compile aggregate expressions (both DISTINCT and regular).
+                // `aggregate_filters` is a parallel vec, one entry per
+                // aggregate, recording the optional FILTER predicate.
                 let mut aggregate_functions = Vec::new();
+                let mut aggregate_filters: Vec<Option<FilterPredicate>> = Vec::new();
                 for expr in &agg.aggr_expr {
-                    if let LogicalExpr::AggregateFunction { fun, args, distinct } = expr {
+                    if let LogicalExpr::AggregateFunction {
+                        fun,
+                        args,
+                        distinct,
+                        filter,
+                    } = expr
+                    {
                         use crate::function::AggFunc;
                         use crate::incremental::aggregate_operator::AggregateFunction;
+
+                        // v1 limitation: reject FILTER on aggregates whose
+                        // state machinery cannot honour the per-aggregate
+                        // predicate. Two distinct cases:
+                        //
+                        //   (a) Count/Min/Max — `count` tracks group existence
+                        //       and Min/Max are recomputed from the persisted
+                        //       index, neither of which sees `filter_passes`.
+                        //   (b) Count/Sum/Avg DISTINCT — distinct transitions
+                        //       are computed from raw row values in
+                        //       `detect_distinct_transitions`, before the
+                        //       filter is consulted, so a row that fails the
+                        //       filter would still flip distinct counts.
+                        //
+                        // GroupConcat[Distinct] and JsonGroupArray[Distinct]
+                        // *do* honour `filter_passes` in apply_delta (see
+                        // aggregate_operator.rs:1442-1469), so FILTER works
+                        // for those even with DISTINCT. The C1 duplicate-
+                        // column check below still catches divergent-filter
+                        // collisions on the same column.
+                        if filter.is_some() {
+                            let always_unsupported = matches!(
+                                fun,
+                                AggFunc::Count | AggFunc::Count0 | AggFunc::Min | AggFunc::Max
+                            );
+                            let distinct_set_aggregate = *distinct
+                                && !matches!(
+                                    fun,
+                                    AggFunc::JsonGroupArray
+                                        | AggFunc::JsonbGroupArray
+                                        | AggFunc::GroupConcat
+                                        | AggFunc::StringAgg
+                                );
+                            if always_unsupported || distinct_set_aggregate {
+                                return Err(LimboError::ParseError(format!(
+                                    "FILTER not supported with {fun:?}{} in incremental views (v1 limitation)",
+                                    if *distinct { " DISTINCT" } else { "" }
+                                )));
+                            }
+                        }
 
                         match fun {
                             AggFunc::Count | AggFunc::Count0 => {
                                 if *distinct {
                                     // COUNT(DISTINCT col)
                                     if args.is_empty() {
-                                        return Err(LimboError::ParseError("COUNT(DISTINCT) requires an argument".to_string()));
+                                        return Err(LimboError::ParseError(
+                                            "COUNT(DISTINCT) requires an argument".to_string(),
+                                        ));
                                     }
                                     if let LogicalExpr::Column(col) = &args[0] {
                                         let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
                                             .ok_or_else(|| LimboError::ParseError(
                                                 format!("COUNT(DISTINCT) column '{}' not found in input", col.name)
                                             ))?;
-                                        aggregate_functions.push(AggregateFunction::CountDistinct(col_idx));
+                                        aggregate_functions
+                                            .push(AggregateFunction::CountDistinct(col_idx));
                                     } else {
                                         return Err(LimboError::ParseError(
                                             "Only column references are supported in aggregate functions for incremental views".to_string()
@@ -1196,16 +2407,23 @@ impl DbspCompiler {
                             }
                             AggFunc::Sum => {
                                 if args.is_empty() {
-                                    return Err(LimboError::ParseError("SUM requires an argument".to_string()));
+                                    return Err(LimboError::ParseError(
+                                        "SUM requires an argument".to_string(),
+                                    ));
                                 }
                                 // Extract column index from the argument
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
-                                        .ok_or_else(|| LimboError::ParseError(
-                                            format!("SUM column '{}' not found in input", col.name)
-                                        ))?;
+                                    let (col_idx, _) = input_schema
+                                        .find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| {
+                                            LimboError::ParseError(format!(
+                                                "SUM column '{}' not found in input",
+                                                col.name
+                                            ))
+                                        })?;
                                     if *distinct {
-                                        aggregate_functions.push(AggregateFunction::SumDistinct(col_idx));
+                                        aggregate_functions
+                                            .push(AggregateFunction::SumDistinct(col_idx));
                                     } else {
                                         aggregate_functions.push(AggregateFunction::Sum(col_idx));
                                     }
@@ -1217,15 +2435,22 @@ impl DbspCompiler {
                             }
                             AggFunc::Avg => {
                                 if args.is_empty() {
-                                    return Err(LimboError::ParseError("AVG requires an argument".to_string()));
+                                    return Err(LimboError::ParseError(
+                                        "AVG requires an argument".to_string(),
+                                    ));
                                 }
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
-                                        .ok_or_else(|| LimboError::ParseError(
-                                            format!("AVG column '{}' not found in input", col.name)
-                                        ))?;
+                                    let (col_idx, _) = input_schema
+                                        .find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| {
+                                            LimboError::ParseError(format!(
+                                                "AVG column '{}' not found in input",
+                                                col.name
+                                            ))
+                                        })?;
                                     if *distinct {
-                                        aggregate_functions.push(AggregateFunction::AvgDistinct(col_idx));
+                                        aggregate_functions
+                                            .push(AggregateFunction::AvgDistinct(col_idx));
                                     } else {
                                         aggregate_functions.push(AggregateFunction::Avg(col_idx));
                                     }
@@ -1237,13 +2462,19 @@ impl DbspCompiler {
                             }
                             AggFunc::Min => {
                                 if args.is_empty() {
-                                    return Err(LimboError::ParseError("MIN requires an argument".to_string()));
+                                    return Err(LimboError::ParseError(
+                                        "MIN requires an argument".to_string(),
+                                    ));
                                 }
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
-                                        .ok_or_else(|| LimboError::ParseError(
-                                            format!("MIN column '{}' not found in input", col.name)
-                                        ))?;
+                                    let (col_idx, _) = input_schema
+                                        .find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| {
+                                            LimboError::ParseError(format!(
+                                                "MIN column '{}' not found in input",
+                                                col.name
+                                            ))
+                                        })?;
                                     aggregate_functions.push(AggregateFunction::Min(col_idx));
                                 } else {
                                     return Err(LimboError::ParseError(
@@ -1253,13 +2484,19 @@ impl DbspCompiler {
                             }
                             AggFunc::Max => {
                                 if args.is_empty() {
-                                    return Err(LimboError::ParseError("MAX requires an argument".to_string()));
+                                    return Err(LimboError::ParseError(
+                                        "MAX requires an argument".to_string(),
+                                    ));
                                 }
                                 if let LogicalExpr::Column(col) = &args[0] {
-                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
-                                        .ok_or_else(|| LimboError::ParseError(
-                                            format!("MAX column '{}' not found in input", col.name)
-                                        ))?;
+                                    let (col_idx, _) = input_schema
+                                        .find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| {
+                                            LimboError::ParseError(format!(
+                                                "MAX column '{}' not found in input",
+                                                col.name
+                                            ))
+                                        })?;
                                     aggregate_functions.push(AggregateFunction::Max(col_idx));
                                 } else {
                                     return Err(LimboError::ParseError(
@@ -1267,16 +2504,160 @@ impl DbspCompiler {
                                     ));
                                 }
                             }
-                            _ => {
+                            AggFunc::GroupConcat | AggFunc::StringAgg => {
+                                if args.is_empty() {
+                                    return Err(LimboError::ParseError(
+                                        "group_concat requires an argument".to_string(),
+                                    ));
+                                }
+                                let col_idx = if let LogicalExpr::Column(col) = &args[0] {
+                                    let (idx, _) = input_schema
+                                        .find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| {
+                                            LimboError::ParseError(format!(
+                                                "group_concat column '{}' not found in input",
+                                                col.name
+                                            ))
+                                        })?;
+                                    idx
+                                } else {
+                                    return Err(LimboError::ParseError(
+                                        "Only column references are supported in aggregate functions for incremental views".to_string()
+                                    ));
+                                };
+                                let separator = match args.get(1) {
+                                    None => ",".to_string(),
+                                    Some(LogicalExpr::Literal(crate::Value::Text(t))) => {
+                                        t.as_str().to_string()
+                                    }
+                                    Some(LogicalExpr::Literal(crate::Value::Null)) => {
+                                        return Err(LimboError::ParseError(
+                                            "group_concat separator must be a non-NULL string literal in incremental views".to_string()
+                                        ));
+                                    }
+                                    Some(_) => {
+                                        return Err(LimboError::ParseError(
+                                            "group_concat separator must be a string literal in incremental views".to_string()
+                                        ));
+                                    }
+                                };
+                                aggregate_functions.push(if *distinct {
+                                    AggregateFunction::GroupConcatDistinct {
+                                        col: col_idx,
+                                        separator,
+                                    }
+                                } else {
+                                    AggregateFunction::GroupConcat {
+                                        col: col_idx,
+                                        separator,
+                                    }
+                                });
+                            }
+                            #[cfg(feature = "json")]
+                            AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
+                                if args.is_empty() {
+                                    return Err(LimboError::ParseError(
+                                        "json_group_array requires an argument".to_string(),
+                                    ));
+                                }
+                                let col_idx = if let LogicalExpr::Column(col) = &args[0] {
+                                    let (idx, _) = input_schema
+                                        .find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| {
+                                            LimboError::ParseError(format!(
+                                                "json_group_array column '{}' not found in input",
+                                                col.name
+                                            ))
+                                        })?;
+                                    idx
+                                } else {
+                                    return Err(LimboError::ParseError(
+                                        "Only column references are supported in aggregate functions for incremental views".to_string()
+                                    ));
+                                };
+                                aggregate_functions.push(if *distinct {
+                                    AggregateFunction::JsonGroupArrayDistinct(col_idx)
+                                } else {
+                                    AggregateFunction::JsonGroupArray(col_idx)
+                                });
+                            }
+                            AggFunc::ArrayAgg => {
                                 return Err(LimboError::ParseError(
-                                    format!("Unsupported aggregate function in DBSP compiler: {fun:?}")
+                                    "array_agg is not supported in incremental views; use json_group_array instead".to_string()
                                 ));
                             }
+                            _ => {
+                                return Err(LimboError::ParseError(format!(
+                                    "Unsupported aggregate function in DBSP compiler: {fun:?}"
+                                )));
+                            }
                         }
+
+                        // Compile FILTER predicate, if present, against the
+                        // aggregate's input schema (post-pre-projection).
+                        // `compile_filter_predicate` rejects predicate shapes
+                        // it doesn't support with a clear error pointing at
+                        // the FILTER clause.
+                        let compiled_filter = if let Some(f) = filter {
+                            Some(
+                                Self::compile_filter_predicate(f, input_schema).map_err(|e| {
+                                    LimboError::ParseError(format!(
+                                        "FILTER expression on aggregate is unsupported: {e}"
+                                    ))
+                                })?,
+                            )
+                        } else {
+                            None
+                        };
+                        aggregate_filters.push(compiled_filter);
                     } else {
                         return Err(LimboError::ParseError(
-                            "Expected aggregate function in aggregate expressions".to_string()
+                            "Expected aggregate function in aggregate expressions".to_string(),
                         ));
+                    }
+                }
+
+                // Reject duplicate column with mismatched filter (C1).
+                // AggregateState is keyed by column index, so two aggregates
+                // over the same column with different filters would silently
+                // overwrite each other's state. Group aggregate indices by
+                // their column index and bail if any group has divergent
+                // filter shapes (None vs Some, or two Somes that differ).
+                debug_assert_eq!(aggregate_functions.len(), aggregate_filters.len());
+                let mut col_to_filter: std::collections::HashMap<
+                    usize,
+                    &Option<FilterPredicate>,
+                > = std::collections::HashMap::new();
+                let agg_col_idx = |af: &crate::incremental::aggregate_operator::AggregateFunction| -> Option<usize> {
+                    use crate::incremental::aggregate_operator::AggregateFunction;
+                    match af {
+                        AggregateFunction::Count => None,
+                        AggregateFunction::CountDistinct(c)
+                        | AggregateFunction::Sum(c)
+                        | AggregateFunction::SumDistinct(c)
+                        | AggregateFunction::Avg(c)
+                        | AggregateFunction::AvgDistinct(c)
+                        | AggregateFunction::Min(c)
+                        | AggregateFunction::Max(c)
+                        | AggregateFunction::JsonGroupArray(c)
+                        | AggregateFunction::JsonGroupArrayDistinct(c) => Some(*c),
+                        AggregateFunction::GroupConcat { col, .. }
+                        | AggregateFunction::GroupConcatDistinct { col, .. } => Some(*col),
+                    }
+                };
+                for (af, filt) in aggregate_functions.iter().zip(aggregate_filters.iter()) {
+                    if let Some(col_idx) = agg_col_idx(af) {
+                        if let Some(existing) = col_to_filter.get(&col_idx) {
+                            if *existing != filt {
+                                return Err(LimboError::ParseError(format!(
+                                    "FILTER on aggregate over column index {col_idx} \
+                                     conflicts with another aggregate over the same column \
+                                     with a different (or no) FILTER (v1 limitation)"
+                                )));
+                            }
+                        } else {
+                            col_to_filter.insert(col_idx, filt);
+                        }
                     }
                 }
 
@@ -1288,6 +2669,7 @@ impl DbspCompiler {
                     group_by_indices.clone(),
                     aggregate_functions.clone(),
                     input_column_names,
+                    aggregate_filters,
                 )?);
 
                 let result_node_id = self.circuit.add_node(
@@ -1304,55 +2686,112 @@ impl DbspCompiler {
             }
             LogicalPlan::Join(join) => {
                 // Compile left and right inputs
-                let left_id = self.compile_plan(&join.left)?;
-                let right_id = self.compile_plan(&join.right)?;
+                let mut left_id = self.compile_plan(&join.left)?;
+                let mut right_id = self.compile_plan(&join.right)?;
 
                 // Get schemas from inputs
                 let left_schema = join.left.schema();
                 let right_schema = join.right.schema();
 
-                // Get column names from left and right
-                let left_columns: Vec<String> = left_schema.columns.iter()
-                    .map(|col| col.name.clone())
-                    .collect();
-                let right_columns: Vec<String> = right_schema.columns.iter()
-                    .map(|col| col.name.clone())
-                    .collect();
-
-                // Check if there are any non-equijoin conditions in the filter
-                if join.filter.is_some() {
-                    return Err(LimboError::ParseError(
-                        "Non-equijoin conditions are not supported in materialized views. Only equality joins (=) are allowed.".to_string()
-                    ));
+                // Handle join filter conditions by pushing them down.
+                // For LEFT JOIN this must be join-type-aware: pushing a LeftOnly
+                // conjunct to the left input would drop L rows that should
+                // null-pad. Only RightOnly is safe to push (equivalent to
+                // LEFT JOIN (R WHERE p)). LeftOnly and Cross stay above the
+                // join (applied to the merged output).
+                let is_left_outer = matches!(join.join_type, LogicalJoinType::Left);
+                let mut cross_side_filters = Vec::new();
+                if let Some(ref filter) = join.filter {
+                    let conjuncts = Self::split_conjuncts(filter);
+                    for conjunct in conjuncts {
+                        match Self::classify_filter_side(&conjunct, left_schema, right_schema) {
+                            FilterSide::LeftOnly => {
+                                if is_left_outer {
+                                    // Pushing a LeftOnly ON-conjunct to L would
+                                    // drop L rows that should still appear with
+                                    // NULL R columns. Applying it post-merge
+                                    // would *also* drop the null-padded rows
+                                    // (they have non-NULL L columns and would
+                                    // also fail the predicate). Correct
+                                    // handling requires teaching Antijoin
+                                    // to treat LeftOnly-failing L rows as
+                                    // forced-unmatched. That's not in scope
+                                    // for this PR — reject to keep semantics
+                                    // safe.
+                                    return Err(LimboError::ParseError(
+                                        "LEFT JOIN with non-equijoin ON-conjuncts \
+                                         referencing only the left side is not yet \
+                                         supported in incremental views"
+                                            .to_string(),
+                                    ));
+                                } else {
+                                    left_id =
+                                        self.add_filter_node(left_id, &conjunct, left_schema)?;
+                                }
+                            }
+                            FilterSide::RightOnly => {
+                                right_id =
+                                    self.add_filter_node(right_id, &conjunct, right_schema)?;
+                            }
+                            FilterSide::Cross => {
+                                if is_left_outer {
+                                    return Err(LimboError::ParseError(
+                                        "LEFT JOIN with non-equijoin ON-conjuncts \
+                                         spanning both sides is not yet supported \
+                                         in incremental views"
+                                            .to_string(),
+                                    ));
+                                }
+                                cross_side_filters.push(conjunct);
+                            }
+                        }
+                    }
                 }
+
+                // Get column names from left and right
+                let left_columns: Vec<String> = left_schema
+                    .columns
+                    .iter()
+                    .map(|col| col.name.clone())
+                    .collect();
+                let right_columns: Vec<String> = right_schema
+                    .columns
+                    .iter()
+                    .map(|col| col.name.clone())
+                    .collect();
+                let right_column_count = right_columns.len();
 
                 // Check if we have at least one equijoin condition
                 if join.on.is_empty() {
                     return Err(LimboError::ParseError(
-                        "Joins in materialized views must have at least one equality condition.".to_string()
+                        "Joins in materialized views must have at least one equality condition."
+                            .to_string(),
                     ));
                 }
 
                 // Extract join key indices from join conditions
-                // For now, we only support equijoin conditions
                 let mut left_key_indices = Vec::new();
                 let mut right_key_indices = Vec::new();
                 let mut dbsp_on_exprs = Vec::new();
 
                 for (left_expr, right_expr) in &join.on {
-                    // Extract column indices from join expressions
-                    // We expect simple column references in join conditions
-                    if let (LogicalExpr::Column(first_col), LogicalExpr::Column(second_col)) = (left_expr, right_expr) {
+                    if let (LogicalExpr::Column(first_col), LogicalExpr::Column(second_col)) =
+                        (left_expr, right_expr)
+                    {
                         let (actual_left_col, actual_left_idx, actual_right_col, actual_right_idx) =
-                            Self::resolve_join_columns(first_col, second_col, left_schema, right_schema)?;
+                            Self::resolve_join_columns(
+                                first_col,
+                                second_col,
+                                left_schema,
+                                right_schema,
+                            )?;
 
                         left_key_indices.push(actual_left_idx);
                         right_key_indices.push(actual_right_idx);
 
-                        // Convert to DBSP expressions
                         dbsp_on_exprs.push((
                             DbspExpr::Column(actual_left_col.name.clone()),
-                            DbspExpr::Column(actual_right_col.name.clone())
+                            DbspExpr::Column(actual_right_col.name.clone()),
                         ));
                     } else {
                         return Err(LimboError::ParseError(
@@ -1361,36 +2800,118 @@ impl DbspCompiler {
                     }
                 }
 
-                // Convert logical join type to operator join type
-                let operator_join_type = match join.join_type {
-                    LogicalJoinType::Inner => JoinType::Inner,
-                    LogicalJoinType::Left => JoinType::Left,
-                    LogicalJoinType::Right => JoinType::Right,
-                    LogicalJoinType::Full => JoinType::Full,
-                    LogicalJoinType::Cross => JoinType::Cross,
+                // For LEFT JOIN, build a 3-operator subgraph:
+                //   InnerJoinOperator (matched rows) ─┐
+                //                                     ├─► MergeOperator (UNION ALL)
+                //   AntijoinOperator (null-pad) ─────┘
+                // Both children consume [left_id, right_id]. The MergeOperator's
+                // output replaces the single Join node that an INNER JOIN would
+                // produce.
+                let mut node_id = match join.join_type {
+                    LogicalJoinType::Left => {
+                        // 1. Inner join sub-component (matched rows).
+                        let inner_op_id = self.circuit.next_id;
+                        let inner_executable: Box<dyn IncrementalOperator> =
+                            Box::new(JoinOperator::new(
+                                inner_op_id,
+                                JoinType::Inner,
+                                left_key_indices.clone(),
+                                right_key_indices.clone(),
+                                left_columns,
+                                right_columns,
+                            )?);
+                        let inner_id = self.circuit.add_node(
+                            DbspOperator::Join {
+                                join_type: JoinType::Inner,
+                                on_exprs: dbsp_on_exprs.clone(),
+                                schema: join.schema.clone(),
+                            },
+                            vec![left_id, right_id],
+                            inner_executable,
+                        );
+
+                        // 2. Antijoin operator (null-padded unmatched half).
+                        let aj_op_id = self.circuit.next_id;
+                        let aj_executable: Box<dyn IncrementalOperator> =
+                            Box::new(AntijoinOperator::new(
+                                aj_op_id,
+                                left_key_indices.clone(),
+                                right_key_indices.clone(),
+                                right_column_count,
+                            ));
+                        let mc_id = self.circuit.add_node(
+                            DbspOperator::Antijoin {
+                                schema: join.schema.clone(),
+                                right_column_count,
+                            },
+                            vec![left_id, right_id],
+                            aj_executable,
+                        );
+
+                        // 3. UNION ALL the two outputs.
+                        use crate::incremental::merge_operator::{MergeOperator, UnionMode};
+                        let merge_op_id = self.circuit.next_id;
+                        let merge_executable: Box<dyn IncrementalOperator> =
+                            Box::new(MergeOperator::new(
+                                merge_op_id,
+                                UnionMode::All {
+                                    left_table: format!("_inner_join_{inner_id}"),
+                                    right_table: format!("_antijoin_{mc_id}"),
+                                },
+                            ));
+                        self.circuit.add_node(
+                            DbspOperator::Merge {
+                                schema: join.schema.clone(),
+                            },
+                            vec![inner_id, mc_id],
+                            merge_executable,
+                        )
+                    }
+                    LogicalJoinType::Inner
+                    | LogicalJoinType::Right
+                    | LogicalJoinType::Full
+                    | LogicalJoinType::Cross => {
+                        let operator_join_type = match join.join_type {
+                            LogicalJoinType::Inner => JoinType::Inner,
+                            LogicalJoinType::Left => unreachable!(),
+                            LogicalJoinType::Right => JoinType::Right,
+                            LogicalJoinType::Full => JoinType::Full,
+                            LogicalJoinType::Cross => JoinType::Cross,
+                        };
+                        let operator_id = self.circuit.next_id;
+                        let executable: Box<dyn IncrementalOperator> = Box::new(JoinOperator::new(
+                            operator_id,
+                            operator_join_type.clone(),
+                            left_key_indices,
+                            right_key_indices,
+                            left_columns,
+                            right_columns,
+                        )?);
+                        self.circuit.add_node(
+                            DbspOperator::Join {
+                                join_type: operator_join_type,
+                                on_exprs: dbsp_on_exprs,
+                                schema: join.schema.clone(),
+                            },
+                            vec![left_id, right_id],
+                            executable,
+                        )
+                    }
                 };
 
-                // Create JoinOperator
-                let operator_id = self.circuit.next_id;
-                let executable: Box<dyn IncrementalOperator> = Box::new(JoinOperator::new(
-                    operator_id,
-                    operator_join_type.clone(),
-                    left_key_indices,
-                    right_key_indices,
-                    left_columns,
-                    right_columns,
-                )?);
+                // Apply cross-side filters as a post-join filter
+                if !cross_side_filters.is_empty() {
+                    let combined = cross_side_filters
+                        .into_iter()
+                        .reduce(|a, b| LogicalExpr::BinaryExpr {
+                            left: Box::new(a),
+                            op: BinaryOperator::And,
+                            right: Box::new(b),
+                        })
+                        .unwrap();
+                    node_id = self.add_filter_node(node_id, &combined, &join.schema)?;
+                }
 
-                // Create join node
-                let node_id = self.circuit.add_node(
-                    DbspOperator::Join {
-                        join_type: operator_join_type,
-                        on_exprs: dbsp_on_exprs,
-                        schema: join.schema.clone(),
-                    },
-                    vec![left_id, right_id],
-                    executable,
-                );
                 Ok(node_id)
             }
             LogicalPlan::TableScan(scan) => {
@@ -1421,20 +2942,21 @@ impl DbspCompiler {
                 let group_by: Vec<usize> = (0..input_schema.columns.len()).collect();
 
                 // Column names for the operator
-                let input_column_names: Vec<String> = input_schema.columns.iter()
+                let input_column_names: Vec<String> = input_schema
+                    .columns
+                    .iter()
                     .map(|col| col.name.clone())
                     .collect();
 
                 // Create the aggregate operator with DISTINCT mode
                 let operator_id = self.circuit.next_id;
-                let executable: Box<dyn IncrementalOperator> = Box::new(
-                    AggregateOperator::new(
-                        operator_id,
-                        group_by,
-                        vec![], // Empty aggregates indicates plain DISTINCT
-                        input_column_names,
-                    )?,
-                );
+                let executable: Box<dyn IncrementalOperator> = Box::new(AggregateOperator::new(
+                    operator_id,
+                    group_by,
+                    vec![], // Empty aggregates indicates plain DISTINCT
+                    input_column_names,
+                    vec![], // No FILTERs on plain DISTINCT
+                )?);
 
                 // Add the node to the circuit
                 let node_id = self.circuit.add_node(
@@ -1447,21 +2969,163 @@ impl DbspCompiler {
 
                 Ok(node_id)
             }
-            _ => Err(LimboError::ParseError(
-                format!("Unsupported operator in DBSP compiler: only Filter, Projection, Join, Aggregate, and Union are supported, got: {:?}",
-                    match plan {
-                        LogicalPlan::Sort(_) => "Sort",
-                        LogicalPlan::Limit(_) => "Limit",
-                        LogicalPlan::Union(_) => "Union",
-                                    LogicalPlan::EmptyRelation(_) => "EmptyRelation",
-                        LogicalPlan::Values(_) => "Values",
-                        LogicalPlan::WithCTE(_) => "WithCTE",
-                        LogicalPlan::CTERef(_) => "CTERef",
-                        _ => "Unknown",
-                    }
-                )
-            )),
+            LogicalPlan::RecursiveCTE(recursive) => self.compile_recursive_cte(recursive),
+            LogicalPlan::RecursiveCTERef(cte_ref) => {
+                // Look up the delay input node for this recursive CTE
+                match self.recursive_cte_refs.get(&cte_ref.name) {
+                    Some(&delay_node_id) => Ok(delay_node_id),
+                    None => Err(LimboError::ParseError(format!(
+                        "Recursive CTE reference '{}' not found in scope",
+                        cte_ref.name
+                    ))),
+                }
+            }
+            LogicalPlan::EmptyRelation(empty) => {
+                // EmptyRelation produces either a single empty row or no rows
+                let executable: Box<dyn IncrementalOperator> = if empty.produce_one_row {
+                    Box::new(LiteralOperator::single_empty_row())
+                } else {
+                    Box::new(LiteralOperator::new(vec![]))
+                };
+
+                let node_id = self.circuit.add_node(
+                    DbspOperator::Literal {
+                        schema: empty.schema.clone(),
+                    },
+                    vec![],
+                    executable,
+                );
+                Ok(node_id)
+            }
+            LogicalPlan::Sort(sort) => {
+                // ORDER BY for materialized views is handled by the storage
+                // layer (the matview's output btree is index-organized when
+                // the SELECT has ORDER BY). The DBSP circuit itself works on
+                // unordered Z-sets, so we just pass through to the input.
+                self.compile_plan(&sort.input)
+            }
+            LogicalPlan::Limit(limit) => {
+                // LIMIT for materialized views is enforced at the cursor
+                // level (the matview stores every row but the cursor stops
+                // walking after N). DBSP doesn't model LIMIT directly.
+                self.compile_plan(&limit.input)
+            }
+            LogicalPlan::Values(values) => {
+                // Evaluate literal expressions to get concrete values
+                let rows: Result<Vec<Vec<Value>>> = values
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|expr| match expr {
+                                LogicalExpr::Literal(v) => Ok(v.clone()),
+                                _ => Err(LimboError::ParseError(
+                                    "VALUES expressions must be literals".to_string(),
+                                )),
+                            })
+                            .collect()
+                    })
+                    .collect();
+
+                let executable: Box<dyn IncrementalOperator> =
+                    Box::new(LiteralOperator::new(rows?));
+
+                let node_id = self.circuit.add_node(
+                    DbspOperator::Literal {
+                        schema: values.schema.clone(),
+                    },
+                    vec![],
+                    executable,
+                );
+                Ok(node_id)
+            }
+            _ => Err(LimboError::ParseError(format!(
+                "Unsupported operator in DBSP compiler: only Filter, Projection, Join, Aggregate, Union, EmptyRelation, and Values are supported, got: {:?}",
+                match plan {
+                    LogicalPlan::Sort(_) => "Sort",
+                    LogicalPlan::Limit(_) => "Limit",
+                    LogicalPlan::WithCTE(_) => "WithCTE",
+                    LogicalPlan::CTERef(_) => "CTERef",
+                    _ => "Unknown",
+                }
+            ))),
         }
+    }
+
+    /// Compile a recursive CTE to a DBSP circuit with feedback loop
+    ///
+    /// The circuit structure for recursion:
+    /// 1. Base case: compiled normally, produces initial rows
+    /// 2. Delay input: provides z^-1 feedback via a reserved `__delay_<name>` input
+    /// 3. Recursive step: references delay via RecursiveCTERef, joins with source tables
+    /// 4. Recursive container: orchestrates fixed-point iteration
+    ///
+    /// The Recursive node has exactly 3 inputs:
+    /// - inputs[0]: base_case_id - compiled base case subgraph
+    /// - inputs[1]: recursive_step_id - compiled recursive step subgraph
+    /// - inputs[2]: delay_id - delay input node for feedback loop
+    ///
+    /// During execution, the executor runs base case once, then iterates the
+    /// recursive step (feeding previous output via delay input) until fixed-point.
+    fn compile_recursive_cte(&mut self, recursive: &RecursiveCTE) -> Result<i64> {
+        let schema = recursive.schema.clone();
+        let max_iterations = recursive
+            .max_iterations
+            .unwrap_or(DEFAULT_RECURSIVE_MAX_ITERATIONS);
+        let recursive_name = recursive.name.clone();
+
+        // 1. Create a delay input (provides z^-1 feedback).
+        // This must be created first so RecursiveCTERef can resolve to it.
+        let delay_input_name = format!("__delay_{}", recursive.name);
+        let delay_executable: Box<dyn IncrementalOperator> =
+            Box::new(InputOperator::new(delay_input_name.clone()));
+        let delay_id = self.circuit.add_node(
+            DbspOperator::Input {
+                name: delay_input_name,
+                schema: schema.clone(),
+            },
+            vec![],
+            delay_executable,
+        );
+
+        // Register the delay input node for RecursiveCTERef resolution
+        self.recursive_cte_refs
+            .insert(recursive_name.clone(), delay_id);
+
+        let result = (|| -> Result<i64> {
+            // 2. Compile the base case
+            let base_case_id = self.compile_plan(&recursive.base_case)?;
+
+            // 3. Compile the recursive step (will resolve RecursiveCTERef to delay_id)
+            let recursive_step_id = self.compile_plan(&recursive.recursive_step)?;
+
+            // 4. Create the recursive container operator
+            let recursive_executable: Box<dyn IncrementalOperator> =
+                Box::new(RecursiveOperator::new(
+                    self.circuit.next_id,
+                    recursive_name.clone(),
+                    max_iterations,
+                    recursive.union_all,
+                ));
+
+            let recursive_id = self.circuit.add_node(
+                DbspOperator::Recursive {
+                    name: recursive.name.clone(),
+                    max_iterations,
+                    union_all: recursive.union_all,
+                    schema: schema.clone(),
+                },
+                vec![base_case_id, recursive_step_id, delay_id],
+                recursive_executable,
+            );
+
+            Ok(recursive_id)
+        })();
+
+        // 5. Clean up the recursive CTE reference even if compilation failed
+        self.recursive_cte_refs.remove(&recursive_name);
+
+        result
     }
 
     /// Extract a representative table name from a logical plan (for UNION ALL identification)
@@ -1525,6 +3189,14 @@ impl DbspCompiler {
             LogicalPlan::CTERef(cte_ref) => {
                 // CTE reference - use the CTE name
                 format!("cte_{}", cte_ref.name)
+            }
+            LogicalPlan::RecursiveCTE(recursive) => {
+                // Recursive CTE - use the CTE name
+                format!("recursive_{}", recursive.name)
+            }
+            LogicalPlan::RecursiveCTERef(cte_ref) => {
+                // Recursive CTE reference - use the CTE name
+                format!("recursive_ref_{}", cte_ref.name)
             }
             LogicalPlan::EmptyRelation(_) => "empty".to_string(),
             LogicalPlan::Values(_) => "values".to_string(),
@@ -1685,7 +3357,19 @@ impl DbspCompiler {
                 let lit = match val {
                     Value::Numeric(Numeric::Integer(i)) => ast::Literal::Numeric(i.to_string()),
                     Value::Numeric(Numeric::Float(f)) => {
-                        ast::Literal::Numeric(f64::from(*f).to_string())
+                        // Rust renders whole-valued floats without a decimal
+                        // point ("3.0" -> "3"); the downstream expression
+                        // compiler re-parses that as an INTEGER (parse::<i64>()
+                        // succeeds first), dropping REAL affinity. Preserve
+                        // float-ness precisely when the rendered form would
+                        // otherwise round-trip to an integer.
+                        let s = f64::from(*f).to_string();
+                        let s = if s.parse::<i64>().is_ok() {
+                            format!("{s}.0")
+                        } else {
+                            s
+                        };
+                        ast::Literal::Numeric(s)
                     }
                     Value::Text(t) => {
                         // Add quotes for string literals as translate_expr expects them
@@ -1733,6 +3417,11 @@ impl DbspCompiler {
                 fun,
                 args,
                 distinct,
+                // FILTER is consumed by the IVM aggregate operator at line
+                // ~2257; this AST round-trip is only used by code paths that
+                // operate on the aggregate arg expressions (e.g. projection
+                // pre-compilation), not on the filter.
+                filter: _,
             } => {
                 // Convert aggregate function to AST
                 let ast_args: Result<Vec<_>> = args
@@ -1751,7 +3440,7 @@ impl DbspCompiler {
                     _ => {
                         return Err(LimboError::ParseError(format!(
                             "Unsupported aggregate function: {fun:?}"
-                        )))
+                        )));
                     }
                 };
 
@@ -1871,6 +3560,16 @@ impl DbspCompiler {
                     type_name: type_name.clone(),
                 })
             }
+            LogicalExpr::ScalarSubquery(_) => Err(LimboError::ParseError(
+                "Correlated scalar subqueries in materialized view SELECT lists \
+                 are not yet supported by the IVM compiler. Rewrite as a LEFT \
+                 OUTER JOIN with GROUP BY for the same hydrated-row semantics, \
+                 e.g. `(SELECT json_group_array(t.tag) FROM tags t WHERE t.fk = b.id)` \
+                 → `LEFT OUTER JOIN tags t ON t.fk = b.id` + \
+                 `json_group_array(t.tag) FILTER (WHERE t.tag IS NOT NULL)` + \
+                 `GROUP BY b.id`."
+                    .to_string(),
+            )),
             _ => Err(LimboError::ParseError(format!(
                 "Cannot convert LogicalExpr to AST Expr: {expr:?}"
             ))),
@@ -1937,7 +3636,7 @@ impl DbspCompiler {
             }
 
             // Default: assume we need projection for safety
-            // This includes: Between, InList, Like, Cast, ScalarFunction, Case,
+            // This includes: Between, InList, Like, IsNull, Cast, ScalarFunction, Case,
             // InSubquery, Exists, ScalarSubquery, and any future expression types
             _ => true,
         }
@@ -2091,27 +3790,8 @@ impl DbspCompiler {
                     (left.as_ref(), right.as_ref())
                 {
                     // Resolve both column names to indices
-                    let left_idx = schema
-                        .columns
-                        .iter()
-                        .position(|c| c.name == left_col.name)
-                        .ok_or_else(|| {
-                            crate::LimboError::ParseError(format!(
-                                "Column '{}' not found in schema for filter",
-                                left_col.name
-                            ))
-                        })?;
-
-                    let right_idx = schema
-                        .columns
-                        .iter()
-                        .position(|c| c.name == right_col.name)
-                        .ok_or_else(|| {
-                            crate::LimboError::ParseError(format!(
-                                "Column '{}' not found in schema for filter",
-                                right_col.name
-                            ))
-                        })?;
+                    let left_idx = Self::resolve_column_index(left_col, schema)?;
+                    let right_idx = Self::resolve_column_index(right_col, schema)?;
 
                     match op {
                         BinaryOperator::Equals => Ok(FilterPredicate::ColumnEquals {
@@ -2164,16 +3844,7 @@ impl DbspCompiler {
                     (left.as_ref(), right.as_ref())
                 {
                     // Column-to-literal comparisons
-                    let column_idx = schema
-                        .columns
-                        .iter()
-                        .position(|c| c.name == col.name)
-                        .ok_or_else(|| {
-                            crate::LimboError::ParseError(format!(
-                                "Column '{}' not found in schema for filter",
-                                col.name
-                            ))
-                        })?;
+                    let column_idx = Self::resolve_column_index(col, schema)?;
 
                     match op {
                         BinaryOperator::Equals => Ok(FilterPredicate::Equals {
@@ -2246,16 +3917,7 @@ impl DbspCompiler {
             LogicalExpr::IsNull { expr, negated } => {
                 // Extract column index from the inner expression
                 if let LogicalExpr::Column(col) = expr.as_ref() {
-                    let column_idx = schema
-                        .columns
-                        .iter()
-                        .position(|c| c.name == col.name)
-                        .ok_or_else(|| {
-                            LimboError::ParseError(format!(
-                                "Column '{}' not found in schema for IS NULL filter",
-                                col.name
-                            ))
-                        })?;
+                    let column_idx = Self::resolve_column_index(col, schema)?;
 
                     if *negated {
                         Ok(FilterPredicate::IsNotNull { column_idx })
@@ -2271,6 +3933,44 @@ impl DbspCompiler {
             _ => Err(LimboError::ParseError(format!(
                 "Unsupported filter expression: {expr:?}"
             ))),
+        }
+    }
+
+    /// Resolve a column reference to its index in the schema, considering table
+    /// qualifiers to disambiguate columns with the same name (e.g. self-joins).
+    fn resolve_column_index(col: &Column, schema: &LogicalSchema) -> Result<usize> {
+        if let Some(ref table) = col.table {
+            // Strip database prefix if present (e.g. "main.customers" -> "customers")
+            let table_name = table
+                .rsplit_once('.')
+                .map(|(_, t)| t)
+                .unwrap_or(table.as_str());
+            // Qualified: match on both table_alias (or table) and name
+            schema
+                .columns
+                .iter()
+                .position(|c| {
+                    c.name == col.name
+                        && (c.table_alias.as_deref() == Some(table_name)
+                            || c.table.as_deref() == Some(table_name))
+                })
+                .ok_or_else(|| {
+                    LimboError::ParseError(format!(
+                        "Column '{}.{}' not found in schema for filter",
+                        table, col.name
+                    ))
+                })
+        } else {
+            schema
+                .columns
+                .iter()
+                .position(|c| c.name == col.name)
+                .ok_or_else(|| {
+                    LimboError::ParseError(format!(
+                        "Column '{}' not found in schema for filter",
+                        col.name
+                    ))
+                })
         }
     }
 }
@@ -2568,6 +4268,34 @@ mod tests {
                 .add_btree_table(Arc::new(sales_table))
                 .expect("Test setup: failed to add sales table");
 
+            // Add edges table for recursive CTE tests (transitive closure)
+            let edges_columns = vec![
+                SchemaColumn::new_default_integer(
+                    Some("src".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+                SchemaColumn::new_default_integer(
+                    Some("dst".to_string()),
+                    "INTEGER".to_string(),
+                    None,
+                ),
+            ];
+            let edges_table = BTreeTable::new(
+                9,
+                "edges".to_string(),
+                vec![],
+                edges_columns,
+                BTreeCharacteristics::HAS_ROWID,
+                vec![],
+                vec![],
+                vec![],
+                None,
+            );
+            schema
+                .add_btree_table(Arc::new(edges_table))
+                .expect("Test setup: failed to add edges table");
+
             schema
         }};
     }
@@ -2620,9 +4348,15 @@ mod tests {
                     let mut builder = LogicalPlanBuilder::new(&schema);
                     let logical_plan = builder.build_statement(&stmt).unwrap();
                     (
-                        DbspCompiler::new(main_root_page, dbsp_state_page, dbsp_state_index_page)
-                            .compile(&logical_plan)
-                            .unwrap(),
+                        DbspCompiler::new(
+                            main_root_page,
+                            dbsp_state_page,
+                            dbsp_state_index_page,
+                            crate::incremental::view::MatviewOrderBy::default(),
+                            None,
+                        )
+                        .compile(&logical_plan)
+                        .unwrap(),
                         pager,
                     )
                 }
@@ -2738,7 +4472,7 @@ mod tests {
         pager: Arc<Pager>,
     ) -> Result<Delta> {
         let mut execute_state = ExecuteState::Init {
-            input_data: DeltaSet::from_map(inputs),
+            input_data: InputDeltas::from_map(inputs),
         };
         match circuit.execute(pager, &mut execute_state)? {
             IOResult::Done(delta) => Ok(delta),
@@ -3267,6 +5001,70 @@ mod tests {
             "323535",
             "hex(255) should return '323535' (hex of ASCII '2', '5', '5')"
         );
+    }
+
+    #[test]
+    fn test_matview_whole_float_literal_keeps_real_affinity() {
+        // Regression: a whole-number float literal (3.0, 2.0, 1.0, ...) in a
+        // materialized-view projection lost its REAL affinity and was computed
+        // with integer semantics — e.g. (3.0 / 2.0) maintained as INTEGER 1
+        // instead of REAL 1.5. Root cause: logical_to_ast_expr_with_schema
+        // lowered a Float literal back to AST text via f64::to_string(), which
+        // renders 3.0 as "3", so the VDBE re-parsed it as an integer. Fractional
+        // literals (0.001) and genuine REAL columns were unaffected — asserted
+        // here as contrast so the fix stays narrow.
+        let (mut circuit, pager) = compile_sql!(
+            "SELECT id, \
+                (3.0 / 2.0) AS a, \
+                (age / 2.0) AS b, \
+                (3.0 * 1.0) AS c, \
+                typeof(3.0 / 2.0) AS ta, \
+                (0.001 * age) AS frac \
+             FROM users"
+        );
+
+        let mut input_delta = Delta::new();
+        input_delta.insert(
+            1,
+            vec![
+                Value::from_i64(1),
+                Value::Text("Alice".into()),
+                Value::from_i64(9),
+            ],
+        );
+
+        let mut inputs = HashMap::default();
+        inputs.insert("users".to_string(), input_delta);
+
+        let result = test_execute(&mut circuit, inputs.clone(), pager.clone()).unwrap();
+        pager
+            .io
+            .block(|| circuit.commit(inputs.clone(), pager.clone()))
+            .unwrap();
+
+        assert_eq!(result.changes.len(), 1);
+        let (row, _) = result.changes.iter().next().unwrap();
+        let values = &row.values;
+
+        let expect_real = |v: &Value, expected: f64, label: &str| match v {
+            Value::Numeric(Numeric::Float(f)) => {
+                assert!(
+                    (f64::from(*f) - expected).abs() < 1e-9,
+                    "{label}: expected REAL {expected}, got {}",
+                    f64::from(*f)
+                );
+            }
+            other => panic!("{label}: expected REAL {expected}, got {other:?}"),
+        };
+
+        expect_real(&values[1], 1.5, "3.0 / 2.0");
+        expect_real(&values[2], 4.5, "age(9) / 2.0");
+        expect_real(&values[3], 3.0, "3.0 * 1.0");
+        match &values[4] {
+            Value::Text(t) => assert_eq!(t.to_string(), "real", "typeof(3.0 / 2.0) must be 'real'"),
+            other => panic!("typeof(3.0 / 2.0): expected 'real', got {other:?}"),
+        }
+        expect_real(&values[5], 0.009, "0.001 * age(9) [fractional contrast]");
     }
 
     // TODO: This test currently fails on incremental updates.
@@ -4035,7 +5833,9 @@ mod tests {
         // Create a sales table schema for testing
         let _ = test_schema!();
 
-        let (mut circuit, pager) = compile_sql!("SELECT product_id, SUM(amount) as total, COUNT(*) as cnt FROM sales GROUP BY product_id");
+        let (mut circuit, pager) = compile_sql!(
+            "SELECT product_id, SUM(amount) as total, COUNT(*) as cnt FROM sales GROUP BY product_id"
+        );
 
         // Initialize with base data: (1, 100), (1, 200), (2, 150), (2, 250)
         let mut init_data = HashMap::default();
@@ -4518,7 +6318,7 @@ mod tests {
         let (pager, p1, p2, p3) = setup_btree_for_circuit();
 
         // Test that circuit properly consolidates state when rowid changes
-        let mut circuit = DbspCircuit::new(p1, p2, p3);
+        let mut circuit = DbspCircuit::new_table_only(p1, p2, p3);
 
         // Create a simple filter node
         let schema = Arc::new(LogicalSchema::new(vec![
@@ -4609,8 +6409,8 @@ mod tests {
         );
         assert_eq!(final_state.changes[0].0.rowid, 3);
         assert_eq!(
-            final_state.changes[0].0.values,
-            vec![Value::from_i64(3), Value::from_i64(20)]
+            &final_state.changes[0].0.values[..],
+            &[Value::from_i64(3), Value::from_i64(20)]
         );
         assert_eq!(final_state.changes[0].1, 1);
     }
@@ -6158,5 +7958,204 @@ mod tests {
         assert_eq!(left_idx, 0);
         assert_eq!(actual_right.name, "right_id");
         assert_eq!(right_idx, 0);
+    }
+
+    #[test]
+    fn test_simple_cte() {
+        // Simple CTE: WITH active_users AS (SELECT * FROM users WHERE age > 18) SELECT name FROM active_users
+        let (circuit, _) = compile_sql!(
+            "WITH active_users AS (SELECT * FROM users WHERE age > 18) SELECT name FROM active_users"
+        );
+
+        // After CTE inlining, this should be equivalent to:
+        // SELECT name FROM (SELECT * FROM users WHERE age > 18)
+        // Which compiles to: Projection (name) -> Projection (*) -> Filter -> Input
+        assert_circuit!(circuit, depth: 4, root: Projection);
+        assert_operator!(circuit, 0, Projection { columns: ["name"] });
+        assert_operator!(
+            circuit,
+            1,
+            Projection {
+                columns: ["id", "name", "age"]
+            }
+        );
+        assert_operator!(circuit, 2, Filter);
+        assert_operator!(circuit, 3, Input { name: "users" });
+    }
+
+    #[test]
+    fn test_cte_with_aggregation() {
+        // CTE with aggregation in the main query
+        let (mut circuit, pager) = compile_sql!(
+            "WITH user_ages AS (SELECT age FROM users) SELECT COUNT(*) FROM user_ages"
+        );
+
+        // After CTE inlining: Aggregate -> Projection -> Input
+        assert_circuit!(circuit, depth: 3, root: Aggregate);
+
+        // Test execution
+        let mut input_delta = Delta::new();
+        input_delta.insert(
+            1,
+            vec![
+                Value::from_i64(1),
+                Value::Text("Alice".into()),
+                Value::from_i64(25),
+            ],
+        );
+        input_delta.insert(
+            2,
+            vec![
+                Value::from_i64(2),
+                Value::Text("Bob".into()),
+                Value::from_i64(30),
+            ],
+        );
+
+        let mut inputs = HashMap::default();
+        inputs.insert("users".to_string(), input_delta);
+
+        let result = test_execute(&mut circuit, inputs, pager).unwrap();
+        assert_eq!(result.changes.len(), 1);
+        // COUNT(*) should be 2
+        assert_eq!(result.changes[0].0.values[0], Value::from_i64(2));
+    }
+
+    #[test]
+    fn test_recursive_cte_transitive_closure() {
+        // Test recursive CTE for transitive closure
+        let sql = r#"
+            WITH RECURSIVE reachable AS (
+                SELECT src, dst FROM edges
+                UNION
+                SELECT reachable.src, edges.dst FROM reachable INNER JOIN edges ON reachable.dst = edges.src
+            )
+            SELECT src, dst FROM reachable
+        "#;
+
+        let (mut circuit, pager) = compile_sql!(sql);
+
+        // Print the circuit structure for debugging
+        eprintln!("Circuit structure:\n{circuit}");
+
+        // Verify the circuit has a Recursive node somewhere
+        let has_recursive = circuit
+            .nodes
+            .values()
+            .any(|n| matches!(&n.operator, DbspOperator::Recursive { .. }));
+        assert!(
+            has_recursive,
+            "Expected a Recursive operator in the circuit"
+        );
+
+        // Create input delta with edges: 1->2, 2->3, 3->4
+        let mut input_delta = Delta::new();
+        input_delta.insert(1, vec![Value::from_i64(1), Value::from_i64(2)]);
+        input_delta.insert(2, vec![Value::from_i64(2), Value::from_i64(3)]);
+        input_delta.insert(3, vec![Value::from_i64(3), Value::from_i64(4)]);
+
+        let mut inputs = HashMap::default();
+        inputs.insert("edges".to_string(), input_delta);
+
+        // Execute the circuit
+        let result = test_execute(&mut circuit, inputs, pager).unwrap();
+
+        // Debug output
+        eprintln!("Result has {} rows:", result.changes.len());
+        for (row, weight) in &result.changes {
+            eprintln!("  {:?} (weight {})", row.values, weight);
+        }
+
+        // Expected: 1->2, 1->3, 1->4, 2->3, 2->4, 3->4 (6 edges including transitive)
+        assert!(
+            result.changes.len() >= 3,
+            "Expected at least base case (3 edges), got {}",
+            result.changes.len()
+        );
+    }
+
+    /// Reproduces the Holon split_block staleness bug: an UPDATE on a base
+    /// table that changes only a column NOT used in the CTE's intermediate
+    /// projection must still emit both retraction and insertion.
+    ///
+    /// Uses the `users` table from `test_schema!` (id, name, age).
+    /// The CTE projects only `id`, stripping `name` (analogous to
+    /// `content` in Holon).  The outer select restores `name` via a
+    /// self-join.
+    #[test]
+    fn test_recursive_cte_update_preserves_retraction_and_insertion() {
+        let sql = r#"
+            WITH RECURSIVE cte AS (
+                SELECT id FROM users
+                UNION ALL
+                SELECT u.id FROM cte JOIN users u ON u.age = cte.id
+            )
+            SELECT u.* FROM users u JOIN cte ON cte.id = u.id
+        "#;
+
+        let (mut circuit, pager) = compile_sql!(sql);
+
+        // Seed: users table has (id, name, age). Seed with two rows.
+        let mut seed = Delta::new();
+        seed.insert(
+            1,
+            vec![
+                Value::from_i64(1),
+                Value::from_text("old content"),
+                Value::from_i64(2),
+            ],
+        );
+        seed.insert(
+            2,
+            vec![
+                Value::from_i64(2),
+                Value::from_text("parent row"),
+                Value::from_i64(0),
+            ],
+        );
+
+        let mut inputs = HashMap::default();
+        inputs.insert("users".to_string(), seed);
+        let _ = test_execute(&mut circuit, inputs, pager.clone()).unwrap();
+
+        // UPDATE: only `name` changes (column not in CTE projection).
+        // Old row has name="old content", new row has name="new content".
+        let mut update_delta = Delta::new();
+        update_delta.delete(
+            1,
+            vec![
+                Value::from_i64(1),
+                Value::from_text("old content"),
+                Value::from_i64(2),
+            ],
+        );
+        update_delta.insert(
+            3,
+            vec![
+                Value::from_i64(1),
+                Value::from_text("new content"),
+                Value::from_i64(2),
+            ],
+        );
+
+        let mut update_inputs = HashMap::default();
+        update_inputs.insert("users".to_string(), update_delta);
+        let result = test_execute(&mut circuit, update_inputs, pager).unwrap();
+
+        let has_retraction = result.changes.iter().any(|(row, w)| {
+            *w == -1 && row.values.get(1).and_then(|v| v.to_text()) == Some("old content")
+        });
+        let has_insertion = result.changes.iter().any(|(row, w)| {
+            *w == 1 && row.values.get(1).and_then(|v| v.to_text()) == Some("new content")
+        });
+
+        assert!(
+            has_retraction,
+            "BUG: UPDATE must emit retraction of old content (name='old content')"
+        );
+        assert!(
+            has_insertion,
+            "BUG: UPDATE must emit insertion of new content (name='new content')"
+        );
     }
 }

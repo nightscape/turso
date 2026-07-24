@@ -69,21 +69,27 @@ pub enum WriteRow {
     GetRecord,
     Delete {
         rowid: i64,
+        sought: bool,
     },
-    DeleteIndex,
+    DeleteIndex {
+        sought: bool,
+    },
     ComputeNewRowId {
         final_weight: isize,
     },
     InsertNew {
         rowid: i64,
         final_weight: isize,
+        sought: bool,
     },
     InsertIndex {
         rowid: i64,
+        sought: bool,
     },
     UpdateExisting {
         rowid: i64,
         final_weight: isize,
+        sought: bool,
     },
     Done,
 }
@@ -110,21 +116,70 @@ impl WriteRow {
         loop {
             match self {
                 WriteRow::GetRecord => {
-                    // First, seek in the index to find if the row exists
+                    // First, seek in the index to find if the row exists.
+                    //
+                    // Use `eq_only: false` so that when the target key falls on
+                    // a leaf-page boundary, the btree returns `TryAdvance` and
+                    // we can step to the next page to inspect the actual entry.
+                    // With `eq_only: true` the btree collapses TryAdvance into
+                    // NotFound, which silently turns retractions into no-ops and
+                    // leaves stale entries behind. Mirrors the handling in
+                    // `read_next_join_row` (see core/incremental/join_operator.rs).
                     let index_values = index_key.clone();
                     let index_record =
                         ImmutableRecord::from_values(&index_values, index_values.len())?;
 
                     let res = return_if_io!(cursors.index_cursor.seek(
                         SeekKey::IndexKey(index_record.as_record_ref()),
-                        SeekOp::GE { eq_only: true }
+                        SeekOp::GE { eq_only: false }
                     ));
+                    // `eq_only: false` lets the btree return `TryAdvance` when
+                    // the target key sits on a leaf-page boundary (`eq_only:
+                    // true` collapses that case to `NotFound`, silently turning
+                    // retractions into no-ops and leaving stale entries
+                    // behind). Mirrors `read_next_join_row`.
+                    //
+                    // With `eq_only: false` the seek may also position at a
+                    // key strictly greater than the target. In every branch
+                    // we verify the cursor's (storage_id, key_hash,
+                    // element_hash) prefix matches before treating the entry
+                    // as a hit; otherwise this is treated as `NotFound`.
+                    let positioned = match res {
+                        SeekResult::Found => true,
+                        SeekResult::NotFound => false,
+                        SeekResult::TryAdvance => {
+                            return_if_io!(cursors.index_cursor.next());
+                            cursors.index_cursor.has_record()
+                        }
+                    };
+                    let found = if !positioned {
+                        false
+                    } else {
+                        let rec = return_if_io!(cursors.index_cursor.record());
+                        match rec {
+                            Some(r) => {
+                                let (v0, v1, v2) = r.get_three_values(0, 1, 2)?;
+                                v0.to_owned()? == index_key[0]
+                                    && v1.to_owned()? == index_key[1]
+                                    && v2.to_owned()? == index_key[2]
+                            }
+                            None => false,
+                        }
+                    };
 
-                    if !matches!(res, SeekResult::Found) {
-                        // Row doesn't exist, we'll insert a new one
-                        *self = WriteRow::ComputeNewRowId {
-                            final_weight: weight,
-                        };
+                    if !found {
+                        // Row doesn't exist
+                        if weight <= 0 {
+                            // Can't delete/subtract from a non-existent row - this is a no-op.
+                            // This can happen in recursive CTEs where intermediate results
+                            // are computed and then retracted before being persisted.
+                            *self = WriteRow::Done;
+                        } else {
+                            // Insert a new row with positive weight
+                            *self = WriteRow::ComputeNewRowId {
+                                final_weight: weight,
+                            };
+                        }
                     } else {
                         // Found in index, get the rowid it points to
                         let rowid = return_if_io!(cursors.index_cursor.rowid());
@@ -172,31 +227,79 @@ impl WriteRow {
 
                         let final_weight = existing_weight + weight;
                         if final_weight <= 0 {
-                            // Store index_key for later deletion of index entry
-                            *self = WriteRow::Delete { rowid }
+                            *self = WriteRow::Delete {
+                                rowid,
+                                sought: false,
+                            }
                         } else {
-                            // Store the rowid for update
                             *self = WriteRow::UpdateExisting {
                                 rowid,
                                 final_weight,
+                                sought: false,
                             }
                         }
                     }
                 }
-                WriteRow::Delete { rowid } => {
-                    // Seek to the row and delete it
-                    return_if_io!(cursors
-                        .table_cursor
-                        .seek(SeekKey::TableRowId(*rowid), SeekOp::GE { eq_only: true }));
-
-                    // Transition to DeleteIndex to also delete the index entry
-                    *self = WriteRow::DeleteIndex;
-                    return_if_io!(cursors.table_cursor.delete());
+                WriteRow::Delete { rowid, sought } => {
+                    let rowid = *rowid;
+                    if !*sought {
+                        return_if_io!(cursors
+                            .table_cursor
+                            .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
+                        *self = WriteRow::Delete {
+                            rowid,
+                            sought: true,
+                        };
+                    } else {
+                        return_if_io!(cursors.table_cursor.delete());
+                        *self = WriteRow::DeleteIndex { sought: false };
+                    }
                 }
-                WriteRow::DeleteIndex => {
-                    // Mark as Done before delete to avoid retry on I/O
-                    *self = WriteRow::Done;
-                    return_if_io!(cursors.index_cursor.delete());
+                WriteRow::DeleteIndex { sought } => {
+                    if !*sought {
+                        // See `GetRecord` for why this uses `eq_only: false`
+                        // plus an explicit prefix check: with `eq_only: true`
+                        // the btree returns `NotFound` at a leaf-page boundary,
+                        // leaving the index entry behind while the table row
+                        // has already been deleted by the prior state.
+                        let index_values = index_key.clone();
+                        let index_record =
+                            ImmutableRecord::from_values(&index_values, index_values.len())?;
+                        let res = return_if_io!(cursors.index_cursor.seek(
+                            SeekKey::IndexKey(&index_record),
+                            SeekOp::GE { eq_only: false }
+                        ));
+                        let positioned = match res {
+                            SeekResult::Found => true,
+                            SeekResult::NotFound => false,
+                            SeekResult::TryAdvance => {
+                                return_if_io!(cursors.index_cursor.next());
+                                cursors.index_cursor.has_record()
+                            }
+                        };
+                        let found = if !positioned {
+                            false
+                        } else {
+                            let rec = return_if_io!(cursors.index_cursor.record());
+                            match rec {
+                                Some(r) => {
+                                    let (v0, v1, v2) = r.get_three_values(0, 1, 2)?;
+                                    v0.to_owned()? == index_key[0]
+                                        && v1.to_owned()? == index_key[1]
+                                        && v2.to_owned()? == index_key[2]
+                                }
+                                None => false,
+                            }
+                        };
+                        if !found {
+                            *self = WriteRow::Done;
+                        } else {
+                            *self = WriteRow::DeleteIndex { sought: true };
+                        }
+                    } else {
+                        return_if_io!(cursors.index_cursor.delete());
+                        *self = WriteRow::Done;
+                    }
                 }
                 WriteRow::ComputeNewRowId { final_weight } => {
                     // Find the last rowid to compute the next one
@@ -214,77 +317,573 @@ impl WriteRow {
                         }
                     };
 
-                    // Transition to InsertNew with the computed rowid
                     *self = WriteRow::InsertNew {
                         rowid,
                         final_weight: *final_weight,
+                        sought: false,
                     };
                 }
                 WriteRow::InsertNew {
                     rowid,
                     final_weight,
+                    sought,
                 } => {
                     let rowid_val = *rowid;
                     let final_weight_val = *final_weight;
-
-                    // Seek to where we want to insert
-                    // The insert will position the cursor correctly
-                    return_if_io!(cursors.table_cursor.seek(
-                        SeekKey::TableRowId(rowid_val),
-                        SeekOp::GE { eq_only: false }
-                    ));
-
-                    // Build the complete record with weight
-                    // Use the function parameter record_values directly
-                    let mut complete_record = record_values.clone();
-                    complete_record.push(Value::from_i64(final_weight_val as i64));
-
-                    // Create an ImmutableRecord from the values
-                    let immutable_record =
-                        ImmutableRecord::from_values(&complete_record, complete_record.len())?;
-                    let btree_key = BTreeKey::new_table_rowid(rowid_val, Some(&immutable_record));
-
-                    // Transition to InsertIndex state after table insertion
-                    *self = WriteRow::InsertIndex { rowid: rowid_val };
-                    return_if_io!(cursors.table_cursor.insert(&btree_key));
+                    if !*sought {
+                        return_if_io!(cursors.table_cursor.seek(
+                            SeekKey::TableRowId(rowid_val),
+                            SeekOp::GE { eq_only: false }
+                        ));
+                        *self = WriteRow::InsertNew {
+                            rowid: rowid_val,
+                            final_weight: final_weight_val,
+                            sought: true,
+                        };
+                    } else {
+                        let mut complete_record = record_values.clone();
+                        complete_record.push(Value::from_i64(final_weight_val as i64));
+                        let immutable_record =
+                            ImmutableRecord::from_values(&complete_record, complete_record.len())?;
+                        let btree_key =
+                            BTreeKey::new_table_rowid(rowid_val, Some(&immutable_record));
+                        return_if_io!(cursors.table_cursor.insert(&btree_key));
+                        *self = WriteRow::InsertIndex {
+                            rowid: rowid_val,
+                            sought: false,
+                        };
+                    }
                 }
-                WriteRow::InsertIndex { rowid } => {
-                    // For has_rowid indexes, we need to append the rowid to the index key
-                    // Use the function parameter index_key directly
+                WriteRow::InsertIndex { rowid, sought } => {
+                    let rowid = *rowid;
                     let mut index_values = index_key.clone();
-                    index_values.push(Value::from_i64(*rowid));
-
-                    // Create the index record with the rowid appended
+                    index_values.push(Value::from_i64(rowid));
                     let index_record =
                         ImmutableRecord::from_values(&index_values, index_values.len())?;
-                    let index_btree_key = BTreeKey::new_index_key(index_record.as_record_ref());
 
-                    // Mark as Done before index insert to avoid retry on I/O
-                    *self = WriteRow::Done;
-                    return_if_io!(cursors.index_cursor.insert(&index_btree_key));
+                    if !*sought {
+                        return_if_io!(cursors.index_cursor.seek(
+                            SeekKey::IndexKey(&index_record),
+                            SeekOp::GE { eq_only: false }
+                        ));
+                        *self = WriteRow::InsertIndex {
+                            rowid,
+                            sought: true,
+                        };
+                    } else {
+                        let index_btree_key = BTreeKey::new_index_key(index_record.as_record_ref());
+                        return_if_io!(cursors.index_cursor.insert(&index_btree_key));
+                        *self = WriteRow::Done;
+                    }
                 }
                 WriteRow::UpdateExisting {
                     rowid,
                     final_weight,
+                    sought,
                 } => {
-                    // Build the complete record with weight
-                    let mut complete_record = record_values.clone();
-                    complete_record.push(Value::from_i64(*final_weight as i64));
-
-                    // Create an ImmutableRecord from the values
-                    let immutable_record =
-                        ImmutableRecord::from_values(&complete_record, complete_record.len())?;
-                    let btree_key = BTreeKey::new_table_rowid(*rowid, Some(&immutable_record));
-
-                    // Mark as Done before insert to avoid retry on I/O
-                    *self = WriteRow::Done;
-                    // BTree insert with existing key will replace the old value
-                    return_if_io!(cursors.table_cursor.insert(&btree_key));
+                    let rowid = *rowid;
+                    let final_weight = *final_weight;
+                    if !*sought {
+                        return_if_io!(cursors
+                            .table_cursor
+                            .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
+                        *self = WriteRow::UpdateExisting {
+                            rowid,
+                            final_weight,
+                            sought: true,
+                        };
+                    } else {
+                        let mut complete_record = record_values.clone();
+                        complete_record.push(Value::from_i64(final_weight as i64));
+                        let immutable_record =
+                            ImmutableRecord::from_values(&complete_record, complete_record.len())?;
+                        let btree_key = BTreeKey::new_table_rowid(rowid, Some(&immutable_record));
+                        return_if_io!(cursors.table_cursor.insert(&btree_key));
+                        *self = WriteRow::Done;
+                    }
                 }
                 WriteRow::Done => {
                     return Ok(IOResult::Done(()));
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::MemoryIO;
+    use crate::pager::CreateBTreeFlags;
+    use crate::util::IOExt;
+    use crate::{Database, Pager, IO};
+    use std::sync::Arc;
+
+    use crate::incremental::operator::{create_dbsp_state_index, DbspStateCursors};
+
+    /// Verify that every table row has a matching index entry by scanning the
+    /// table and seeking each row's key in the index. Returns the number of
+    /// verified rows.
+    fn verify_index_integrity(pager: &Arc<Pager>, cursors: &mut DbspStateCursors) -> usize {
+        pager.io.block(|| cursors.table_cursor.rewind()).unwrap();
+        let mut count = 0;
+
+        loop {
+            if cursors.table_cursor.is_empty() {
+                break;
+            }
+
+            let record = loop {
+                match cursors.table_cursor.record().unwrap() {
+                    IOResult::Done(r) => break r,
+                    IOResult::IO(io) => io.wait(&*pager.io).unwrap(),
+                }
+            };
+            let record = record.unwrap().to_owned();
+            let values: Vec<Value> = record.get_values_owned().unwrap();
+
+            let rowid = loop {
+                match cursors.table_cursor.rowid().unwrap() {
+                    IOResult::Done(r) => break r.unwrap(),
+                    IOResult::IO(io) => io.wait(&*pager.io).unwrap(),
+                }
+            };
+
+            // Build the index key: first 3 columns (operator_id, zset_id, element_id)
+            let index_key: Vec<Value> = values[..3].to_vec();
+            let index_record = ImmutableRecord::from_values(&index_key, index_key.len()).unwrap();
+
+            let seek_result = pager
+                .io
+                .block(|| {
+                    cursors.index_cursor.seek(
+                        SeekKey::IndexKey(&index_record),
+                        SeekOp::GE { eq_only: true },
+                    )
+                })
+                .unwrap();
+
+            assert!(
+                matches!(seek_result, SeekResult::Found),
+                "Index entry not found for table rowid={rowid}, key={index_key:?}"
+            );
+
+            // Verify the index entry points to the correct rowid
+            let index_rowid = pager
+                .io
+                .block(|| cursors.index_cursor.rowid())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                index_rowid, rowid,
+                "Index rowid mismatch: expected {rowid}, got {index_rowid}"
+            );
+
+            count += 1;
+            pager.io.block(|| cursors.table_cursor.next()).unwrap();
+        }
+        count
+    }
+
+    fn create_test_pager() -> (Arc<Pager>, i64, i64) {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io.clone(), ":memory:").unwrap();
+        let conn = db.connect().unwrap();
+        let pager = conn.pager.load().clone();
+        let _ = pager.io.block(|| pager.allocate_page1());
+        let table_root_page_id = pager
+            .io
+            .block(|| pager.btree_create(&CreateBTreeFlags::new_table()))
+            .expect("Failed to create table BTree") as i64;
+        let index_root_page_id = pager
+            .io
+            .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
+            .expect("Failed to create index BTree") as i64;
+        (pager, table_root_page_id, index_root_page_id)
+    }
+
+    /// Test that calling write_row with a negative weight for a key that
+    /// doesn't exist in the btree is a no-op (WriteRow::Done) rather than
+    /// inserting a row with negative weight.
+    ///
+    /// This can happen in recursive CTEs where intermediate results are
+    /// computed and then retracted before being persisted.
+    #[test]
+    fn test_write_row_negative_weight_nonexistent_key_is_noop() {
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
+        let index_cursor =
+            BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let index_key = vec![Value::from_i64(1), Value::from_i64(100), Value::from_i64(0)];
+        let record_values = vec![
+            Value::from_i64(1),
+            Value::from_i64(100),
+            Value::from_i64(0),
+            Value::Null,
+        ];
+
+        let mut write_row = WriteRow::new();
+        pager
+            .io
+            .block(|| {
+                write_row.write_row(&mut cursors, index_key.clone(), record_values.clone(), -1)
+            })
+            .unwrap();
+
+        // Verify the btree is still empty - no row with negative weight was inserted.
+        // We check via the index cursor: seek for the key and verify it's not found.
+        let index_record = ImmutableRecord::from_values(&index_key, index_key.len()).unwrap();
+        let res = pager.io.block(|| {
+            cursors.index_cursor.seek(
+                SeekKey::IndexKey(&index_record),
+                SeekOp::GE { eq_only: true },
+            )
+        });
+        assert!(
+            !matches!(res, Ok(SeekResult::Found)),
+            "Expected no index entry after negative weight write for non-existent key, \
+             but found one. This means a row with negative weight was incorrectly inserted."
+        );
+    }
+
+    /// Test that writing a positive weight for a new key works, and then
+    /// writing a negative weight that brings it to zero removes the row.
+    #[test]
+    fn test_write_row_positive_then_negative_removes_row() {
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
+        let index_cursor =
+            BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4).unwrap();
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let index_key = vec![Value::from_i64(1), Value::from_i64(200), Value::from_i64(0)];
+        let record_values = vec![
+            Value::from_i64(1),
+            Value::from_i64(200),
+            Value::from_i64(0),
+            Value::Null,
+        ];
+
+        let index_record = ImmutableRecord::from_values(&index_key, index_key.len()).unwrap();
+
+        // Insert with positive weight
+        let mut write_row = WriteRow::new();
+        pager
+            .io
+            .block(|| {
+                write_row.write_row(&mut cursors, index_key.clone(), record_values.clone(), 1)
+            })
+            .unwrap();
+
+        // Verify the row exists via index seek
+        let res = pager.io.block(|| {
+            cursors.index_cursor.seek(
+                SeekKey::IndexKey(&index_record),
+                SeekOp::GE { eq_only: true },
+            )
+        });
+        assert!(
+            matches!(res, Ok(SeekResult::Found)),
+            "Row should exist after positive weight insert"
+        );
+
+        // Now apply negative weight to remove it
+        let mut write_row2 = WriteRow::new();
+        pager
+            .io
+            .block(|| {
+                write_row2.write_row(&mut cursors, index_key.clone(), record_values.clone(), -1)
+            })
+            .unwrap();
+
+        // Verify the row is gone
+        let res2 = pager.io.block(|| {
+            cursors.index_cursor.seek(
+                SeekKey::IndexKey(&index_record),
+                SeekOp::GE { eq_only: true },
+            )
+        });
+        assert!(
+            !matches!(res2, Ok(SeekResult::Found)),
+            "Row should be removed after net-zero weight"
+        );
+    }
+
+    /// Simulates the scenario where an I/O yield occurs during the table insert
+    /// in InsertNew, and the index cursor is left in a stale position.
+    ///
+    /// Verifies that InsertIndex re-seeks the index cursor before inserting.
+    /// After an I/O yield during the table insert, the index cursor may have been
+    /// repositioned by other operations. InsertIndex always re-seeks before
+    /// inserting to handle this (see issue #4089).
+    #[test]
+    fn test_write_row_stale_index_cursor_after_simulated_io_yield() {
+        let (pager, table_root, index_root) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root, 5);
+        let index_def = create_dbsp_state_index(index_root);
+        let index_cursor =
+            BTreeCursor::new_index(pager.clone(), index_root, &index_def, 4).unwrap();
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let op_id = 1i64;
+        let zset_id = 1i64;
+
+        // Insert some entries normally to populate the B-tree
+        for i in 1..=10 {
+            let mut wr = WriteRow::new();
+            let ik = vec![
+                Value::from_i64(op_id),
+                Value::from_i64(zset_id),
+                Value::from_i64(i),
+            ];
+            let rv = vec![
+                Value::from_i64(op_id),
+                Value::from_i64(zset_id),
+                Value::from_i64(i),
+                Value::Null,
+            ];
+            pager
+                .io
+                .block(|| wr.write_row(&mut cursors, ik.clone(), rv.clone(), 1))
+                .unwrap();
+        }
+
+        // Now simulate inserting element_id=20 with a simulated I/O yield.
+        // Step 1: Manually perform the table insert (what InsertNew does)
+        let new_elem_id = 20i64;
+        let rowid = 11i64; // next rowid after 10 entries
+
+        // Seek and insert into table
+        pager
+            .io
+            .block(|| {
+                cursors
+                    .table_cursor
+                    .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: false })
+            })
+            .unwrap();
+        let complete_record = vec![
+            Value::from_i64(op_id),
+            Value::from_i64(zset_id),
+            Value::from_i64(new_elem_id),
+            Value::Null,
+            Value::from_i64(1), // weight=1
+        ];
+        let immutable_record =
+            ImmutableRecord::from_values(&complete_record, complete_record.len()).unwrap();
+        let btree_key = BTreeKey::new_table_rowid(rowid, Some(&immutable_record));
+        pager
+            .io
+            .block(|| cursors.table_cursor.insert(&btree_key))
+            .unwrap();
+
+        // Step 2: Simulate I/O yield invalidating the index cursor.
+        // Move the index cursor to element_id=1 (a wrong position for inserting element_id=20).
+        let wrong_key = vec![
+            Value::from_i64(op_id),
+            Value::from_i64(zset_id),
+            Value::from_i64(1i64),
+        ];
+        let wrong_record = ImmutableRecord::from_values(&wrong_key, wrong_key.len()).unwrap();
+        pager
+            .io
+            .block(|| {
+                cursors.index_cursor.seek(
+                    SeekKey::IndexKey(&wrong_record),
+                    SeekOp::GE { eq_only: false },
+                )
+            })
+            .unwrap();
+
+        // Step 3: Resume from InsertIndex (the state after InsertNew's table insert).
+        // InsertIndex always re-seeks before inserting to handle stale cursor state.
+        let index_key = vec![
+            Value::from_i64(op_id),
+            Value::from_i64(zset_id),
+            Value::from_i64(new_elem_id),
+        ];
+        let record_values = vec![
+            Value::from_i64(op_id),
+            Value::from_i64(zset_id),
+            Value::from_i64(new_elem_id),
+            Value::Null,
+        ];
+        let mut wr = WriteRow::InsertIndex {
+            rowid,
+            sought: false,
+        };
+        pager
+            .io
+            .block(|| wr.write_row(&mut cursors, index_key.clone(), record_values.clone(), 1))
+            .unwrap();
+
+        // Step 4: Verify the index entry for element_id=20 exists and points to
+        // the correct rowid
+        let search_key = vec![
+            Value::from_i64(op_id),
+            Value::from_i64(zset_id),
+            Value::from_i64(new_elem_id),
+        ];
+        let search_record = ImmutableRecord::from_values(&search_key, search_key.len()).unwrap();
+        let seek_result = pager
+            .io
+            .block(|| {
+                cursors.index_cursor.seek(
+                    SeekKey::IndexKey(&search_record),
+                    SeekOp::GE { eq_only: true },
+                )
+            })
+            .unwrap();
+        assert!(
+            matches!(seek_result, SeekResult::Found),
+            "Index entry not found for element_id={new_elem_id} after simulated I/O yield"
+        );
+        let found_rowid = pager
+            .io
+            .block(|| cursors.index_cursor.rowid())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            found_rowid, rowid,
+            "Index entry for element_id={new_elem_id} points to wrong rowid: expected {rowid}, got {found_rowid}"
+        );
+
+        // Also verify ALL entries are intact (the wrong cursor position might have
+        // corrupted an existing entry)
+        let count = verify_index_integrity(&pager, &mut cursors);
+        assert_eq!(
+            count, 11,
+            "Expected 11 rows (10 original + 1 new), found {count}"
+        );
+    }
+
+    #[test]
+    fn test_write_row_many_entries_index_integrity() {
+        let (pager, table_root, index_root) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root, 5);
+        let index_def = create_dbsp_state_index(index_root);
+        let index_cursor =
+            BTreeCursor::new_index(pager.clone(), index_root, &index_def, 4).unwrap();
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let op_id = 1i64;
+        let zset_id = 1i64;
+
+        // Insert 200+ entries with distinct element_ids to force multi-page B-tree.
+        // Each entry is a new group, so WriteRow takes the InsertNew path every time.
+        let n = 250;
+        for i in 1..=n {
+            let mut wr = WriteRow::new();
+            let index_key = vec![
+                Value::from_i64(op_id),
+                Value::from_i64(zset_id),
+                Value::from_i64(i),
+            ];
+            let record_values = vec![
+                Value::from_i64(op_id),
+                Value::from_i64(zset_id),
+                Value::from_i64(i),
+                Value::Null,
+            ];
+            pager
+                .io
+                .block(|| wr.write_row(&mut cursors, index_key.clone(), record_values.clone(), 1))
+                .unwrap();
+        }
+
+        let count = verify_index_integrity(&pager, &mut cursors);
+        assert_eq!(count, n as usize, "Expected {n} rows, found {count}");
+    }
+
+    /// Test WriteRow with interleaved inserts and updates across many groups.
+    /// First inserts create new entries (InsertNew path), then updates modify
+    /// existing entries (UpdateExisting path). The alternation stresses cursor
+    /// positioning between the "found" and "not found" index seek paths.
+    #[test]
+    fn test_write_row_interleaved_insert_update_index_integrity() {
+        let (pager, table_root, index_root) = create_test_pager();
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root, 5);
+        let index_def = create_dbsp_state_index(index_root);
+        let index_cursor =
+            BTreeCursor::new_index(pager.clone(), index_root, &index_def, 4).unwrap();
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let op_id = 1i64;
+        let zset_id = 1i64;
+        let n = 150;
+
+        // Phase 1: Insert n entries
+        for i in 1..=n {
+            let mut wr = WriteRow::new();
+            let index_key = vec![
+                Value::from_i64(op_id),
+                Value::from_i64(zset_id),
+                Value::from_i64(i),
+            ];
+            let record_values = vec![
+                Value::from_i64(op_id),
+                Value::from_i64(zset_id),
+                Value::from_i64(i),
+                Value::Null,
+            ];
+            pager
+                .io
+                .block(|| wr.write_row(&mut cursors, index_key.clone(), record_values.clone(), 1))
+                .unwrap();
+        }
+
+        // Phase 2: Interleave updates to existing entries with inserts of new entries
+        for i in 1..=n {
+            // Update existing entry i (weight +1 → UpdateExisting path)
+            let mut wr = WriteRow::new();
+            let index_key = vec![
+                Value::from_i64(op_id),
+                Value::from_i64(zset_id),
+                Value::from_i64(i),
+            ];
+            let record_values = vec![
+                Value::from_i64(op_id),
+                Value::from_i64(zset_id),
+                Value::from_i64(i),
+                Value::Null,
+            ];
+            pager
+                .io
+                .block(|| wr.write_row(&mut cursors, index_key.clone(), record_values.clone(), 1))
+                .unwrap();
+
+            // Insert a new entry n+i (InsertNew path)
+            let mut wr2 = WriteRow::new();
+            let new_id = n + i;
+            let index_key2 = vec![
+                Value::from_i64(op_id),
+                Value::from_i64(zset_id),
+                Value::from_i64(new_id),
+            ];
+            let record_values2 = vec![
+                Value::from_i64(op_id),
+                Value::from_i64(zset_id),
+                Value::from_i64(new_id),
+                Value::Null,
+            ];
+            pager
+                .io
+                .block(|| {
+                    wr2.write_row(&mut cursors, index_key2.clone(), record_values2.clone(), 1)
+                })
+                .unwrap();
+        }
+
+        let count = verify_index_integrity(&pager, &mut cursors);
+        assert_eq!(
+            count,
+            (2 * n) as usize,
+            "Expected {} rows, found {count}",
+            2 * n
+        );
     }
 }

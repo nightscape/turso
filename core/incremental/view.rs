@@ -1,24 +1,109 @@
 use super::compiler::{DbspCircuit, DbspCompiler, DeltaSet};
-use super::dbsp::Delta;
+use super::dbsp::{Delta, RowValues};
 use super::operator::ComputationTracker;
 use crate::numeric::Numeric;
-use crate::schema::{BTreeTable, Schema};
+use crate::schema::{BTreeTable, Column, Schema, Table};
 use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::logical::LogicalPlanBuilder;
 use crate::types::{IOResult, Value};
 use crate::util::{extract_view_columns, ViewColumnSchema};
+use crate::vtab::VirtualTable;
 use crate::{return_if_io, LimboError, Pager, Result, Statement};
+use parking_lot::Mutex as ParkingLotMutex;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::cell::RefCell;
 use std::fmt;
-use std::rc::Rc;
+use std::sync::Arc as StdArc;
 use turso_parser::ast;
 use turso_parser::{
     ast::{Cmd, Stmt},
     parser::Parser,
 };
+
+/// Parsed ORDER BY clause for a materialized view.
+/// Each entry is (output_column_index, sort_order, explicit_nulls_order).
+#[derive(Debug, Clone, Default)]
+pub struct MatviewOrderBy {
+    pub columns: Vec<(usize, ast::SortOrder, Option<ast::NullsOrder>)>,
+}
+
+impl MatviewOrderBy {
+    pub fn is_empty(&self) -> bool {
+        self.columns.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// Number of key parts for IndexInfo: sort columns + 1 (rowid tiebreaker).
+    pub fn num_key_parts(&self) -> usize {
+        self.columns.len() + 1
+    }
+
+    /// Permute a storage-order data tuple back into logical column order.
+    ///
+    /// Storage layout (after rowid + weight have been stripped): the first
+    /// `N` positions hold the user-specified sort columns in `ORDER BY`
+    /// order; the remaining positions hold non-sort columns in
+    /// logical-index-ascending order.
+    ///
+    /// `storage` MUST have length equal to the number of *logical* output
+    /// data columns (i.e. `output_schema.columns.len()`).
+    pub fn permute_storage_to_logical(&self, storage: &[Value]) -> Vec<Value> {
+        let num_data_cols = storage.len();
+        let mut logical = vec![Value::Null; num_data_cols];
+        let sort_set: HashSet<usize> = self.columns.iter().map(|(i, _, _)| *i).collect();
+        // Sort columns: storage[i] → logical[order_by.columns[i].0]
+        for (storage_pos, (logical_pos, _, _)) in self.columns.iter().enumerate() {
+            logical[*logical_pos] = storage[storage_pos].clone();
+        }
+        // Non-sort columns: storage positions [N..) hold logical positions in
+        // ascending order, skipping the sort-column positions.
+        let mut j = self.columns.len();
+        for l in 0..num_data_cols {
+            if !sort_set.contains(&l) {
+                logical[l] = storage[j].clone();
+                j += 1;
+            }
+        }
+        logical
+    }
+
+    /// Build the synthetic IndexInfo describing the on-disk record layout.
+    ///
+    /// Layout: `[sort_v_1, ..., sort_v_N, rowid, non_sort_data_cols..., weight]`
+    ///
+    /// `has_rowid` is `false` because `BTreeCursor::get_index_rowid_from_record`
+    /// reads the LAST record value as rowid — that would be the weight column,
+    /// not the rowid. Rowid extraction for matview cursors is done manually at
+    /// `record.values[num_sort_cols]`.
+    pub fn to_index_info(&self) -> crate::types::IndexInfo {
+        use crate::translate::collate::CollationSeq;
+        use crate::types::{IndexInfo, KeyInfo};
+        let mut key_info = Vec::with_capacity(self.columns.len() + 1);
+        for (_, sort_order, nulls_order) in &self.columns {
+            key_info.push(KeyInfo {
+                sort_order: *sort_order,
+                collation: CollationSeq::Binary, // COLLATE in ORDER BY rejected at DDL
+                nulls_order: *nulls_order,
+            });
+        }
+        // rowid tiebreaker — matches IndexInfo::new_from_index for indexes with rowid
+        key_info.push(KeyInfo {
+            sort_order: ast::SortOrder::Asc,
+            collation: CollationSeq::Binary,
+            nulls_order: None,
+        });
+        IndexInfo {
+            key_info,
+            has_rowid: false,
+            num_cols: self.columns.len() + 1,
+            is_unique: true,
+        }
+    }
+}
 
 /// State machine for populating a view from its source table
 pub enum PopulateState {
@@ -37,6 +122,22 @@ pub enum PopulateState {
         rows_processed: usize,
         /// If we're in the middle of processing a row (merge_delta returned I/O)
         pending_row: Option<(i64, Vec<Value>)>, // (rowid, values)
+    },
+    /// Collecting data from source tables for recursive CTE (must batch all data first)
+    CollectingRecursiveCteData {
+        /// Names of tables still to be processed
+        remaining_tables: Vec<String>,
+        /// Current statement if we're in the middle of reading a table
+        current_stmt: Option<(String, Box<Statement>)>, // (table_name, stmt)
+        /// Accumulated deltas from tables already processed
+        accumulated_deltas: DeltaSet,
+    },
+    /// Executing the recursive circuit after all data has been collected.
+    /// On first entry, input_map contains the data to pass to the circuit.
+    /// On resume (after I/O yield), input_map is None and the circuit uses its internal state.
+    ExecutingRecursiveCircuit {
+        /// Input data for the circuit (Some on first entry, None on resume)
+        input_map: Option<HashMap<String, Delta>>,
     },
     /// Population complete
     Done,
@@ -74,115 +175,250 @@ impl fmt::Debug for PopulateState {
                 .field("has_pending", &pending_row.is_some())
                 .field("total_queries", &queries.len())
                 .finish(),
+            PopulateState::CollectingRecursiveCteData {
+                remaining_tables,
+                current_stmt,
+                ..
+            } => f
+                .debug_struct("CollectingRecursiveCteData")
+                .field("remaining_tables", &remaining_tables.len())
+                .field("has_current_stmt", &current_stmt.is_some())
+                .finish(),
+            PopulateState::ExecutingRecursiveCircuit { input_map } => f
+                .debug_struct("ExecutingRecursiveCircuit")
+                .field("has_input", &input_map.is_some())
+                .finish(),
             PopulateState::Done => write!(f, "Done"),
         }
     }
 }
 
-/// Per-connection transaction state for incremental views
-#[derive(Debug, Clone, Default)]
+/// Per-connection transaction state for incremental views.
+/// Uses Mutex instead of RefCell for thread safety.
+#[derive(Debug, Default)]
 pub struct ViewTransactionState {
-    // Per-table deltas for uncommitted changes
+    // Per-table deltas for uncommitted changes (input to the view)
     // Maps table_name -> Delta for that table
-    // Using RefCell for interior mutability
-    table_deltas: RefCell<HashMap<String, Delta>>,
+    table_deltas: ParkingLotMutex<HashMap<String, Delta>>,
+    // Output delta for the view (the actual changes to the view's result set)
+    // Computed when merge_delta is called
+    output_delta: ParkingLotMutex<Option<Delta>>,
+}
+
+impl Clone for ViewTransactionState {
+    fn clone(&self) -> Self {
+        Self {
+            table_deltas: ParkingLotMutex::new(self.table_deltas.lock().clone()),
+            output_delta: ParkingLotMutex::new(self.output_delta.lock().clone()),
+        }
+    }
 }
 
 impl ViewTransactionState {
     /// Create a new transaction state
     pub fn new() -> Self {
         Self {
-            table_deltas: RefCell::new(HashMap::default()),
+            table_deltas: ParkingLotMutex::new(HashMap::default()),
+            output_delta: ParkingLotMutex::new(None),
         }
     }
 
     /// Insert a row into the delta for a specific table
-    pub fn insert(&self, table_name: &str, key: i64, values: Vec<Value>) {
-        let mut deltas = self.table_deltas.borrow_mut();
+    pub fn insert(&self, table_name: &str, key: i64, values: impl Into<RowValues>) {
+        let mut deltas = self.table_deltas.lock();
         let delta = deltas.entry(table_name.to_string()).or_default();
         delta.insert(key, values);
     }
 
     /// Delete a row from the delta for a specific table
-    pub fn delete(&self, table_name: &str, key: i64, values: Vec<Value>) {
-        let mut deltas = self.table_deltas.borrow_mut();
+    pub fn delete(&self, table_name: &str, key: i64, values: impl Into<RowValues>) {
+        let mut deltas = self.table_deltas.lock();
         let delta = deltas.entry(table_name.to_string()).or_default();
         delta.delete(key, values);
     }
 
     /// Clear all changes in the delta
     pub fn clear(&self) {
-        self.table_deltas.borrow_mut().clear();
+        self.table_deltas.lock().clear();
+        *self.output_delta.lock() = None;
     }
 
-    /// Get deltas organized by table
+    /// Get deltas organized by table (input deltas)
     pub fn get_table_deltas(&self) -> HashMap<String, Delta> {
-        self.table_deltas.borrow().clone()
+        self.table_deltas.lock().clone()
+    }
+
+    /// Set the output delta (the actual changes to the view's result set)
+    pub fn set_output_delta(&self, delta: Delta) {
+        *self.output_delta.lock() = Some(delta);
+    }
+
+    /// Get the output delta (the actual changes to the view's result set)
+    pub fn get_output_delta(&self) -> Option<Delta> {
+        self.output_delta.lock().clone()
     }
 
     /// Check if the delta is empty
     pub fn is_empty(&self) -> bool {
-        self.table_deltas.borrow().values().all(|d| d.is_empty())
+        self.table_deltas.lock().values().all(|d| d.is_empty())
     }
 
     /// Returns how many elements exist in the delta.
     pub fn len(&self) -> usize {
-        self.table_deltas.borrow().values().map(|d| d.len()).sum()
+        self.table_deltas.lock().values().map(|d| d.len()).sum()
+    }
+
+    /// Capture per-table delta lengths for later statement-level rollback.
+    /// Returns a snapshot that records how many `changes` each table delta has
+    /// at the moment of the call. Pass to `rollback_to` to discard any deltas
+    /// appended after the snapshot was taken.
+    pub fn snapshot_lengths(&self) -> HashMap<String, usize> {
+        self.table_deltas
+            .lock()
+            .iter()
+            .map(|(table, delta)| (table.clone(), delta.changes.len()))
+            .collect()
+    }
+
+    /// Truncate each table delta back to the lengths recorded in `snapshot`.
+    /// Tables absent from the snapshot are dropped entirely (they were created
+    /// after the snapshot). The output delta is cleared since it is rebuilt
+    /// from input deltas at commit time.
+    pub fn rollback_to(&self, snapshot: &HashMap<String, usize>) {
+        let mut deltas = self.table_deltas.lock();
+        deltas.retain(|table, delta| match snapshot.get(table) {
+            Some(&len) => {
+                delta.changes.truncate(len);
+                !delta.changes.is_empty() || len > 0
+            }
+            None => false,
+        });
+        *self.output_delta.lock() = None;
     }
 }
 
-/// Container for all view transaction states within a connection
-/// Provides interior mutability for the map of view states
-#[derive(Debug, Clone, Default)]
+/// Container for all view transaction states within a connection.
+/// Thread-safe implementation using parking_lot::Mutex.
+#[derive(Debug, Default)]
 pub struct AllViewsTxState {
-    states: Rc<RefCell<HashMap<String, Arc<ViewTransactionState>>>>,
+    states: StdArc<ParkingLotMutex<HashMap<String, StdArc<ViewTransactionState>>>>,
 }
 
-// SAFETY: This needs to be audited for thread safety.
-// See: https://github.com/tursodatabase/turso/issues/1552
-unsafe impl Send for AllViewsTxState {}
-unsafe impl Sync for AllViewsTxState {}
-crate::assert::assert_send_sync!(AllViewsTxState);
+impl Clone for AllViewsTxState {
+    fn clone(&self) -> Self {
+        Self {
+            states: self.states.clone(),
+        }
+    }
+}
 
 impl AllViewsTxState {
     /// Create a new container for view transaction states
     pub fn new() -> Self {
         Self {
-            states: Rc::new(RefCell::new(HashMap::default())),
+            states: StdArc::new(ParkingLotMutex::new(HashMap::default())),
         }
     }
 
     /// Get or create a transaction state for a view
-    #[allow(clippy::arc_with_non_send_sync)]
-    pub fn get_or_create(&self, view_name: &str) -> Arc<ViewTransactionState> {
-        let mut states = self.states.borrow_mut();
-        // ViewTransactionState uses RefCell (not Sync), but AllViewsTxState is
-        // single-threaded (Rc-based). Arc is used for shared ownership, not
-        // cross-thread sharing.
+    pub fn get_or_create(&self, view_name: &str) -> StdArc<ViewTransactionState> {
+        let mut states = self.states.lock();
         states
             .entry(view_name.to_string())
-            .or_insert_with(|| Arc::new(ViewTransactionState::new()))
+            .or_insert_with(|| StdArc::new(ViewTransactionState::new()))
             .clone()
     }
 
     /// Get a transaction state for a view if it exists
-    pub fn get(&self, view_name: &str) -> Option<Arc<ViewTransactionState>> {
-        self.states.borrow().get(view_name).cloned()
+    pub fn get(&self, view_name: &str) -> Option<StdArc<ViewTransactionState>> {
+        self.states.lock().get(view_name).cloned()
     }
 
     /// Clear all transaction states
     pub fn clear(&self) {
-        self.states.borrow_mut().clear();
+        self.states.lock().clear();
     }
 
     /// Check if there are no transaction states
     pub fn is_empty(&self) -> bool {
-        self.states.borrow().is_empty()
+        self.states.lock().is_empty()
     }
 
     /// Get all view names that have transaction states
     pub fn get_view_names(&self) -> Vec<String> {
-        self.states.borrow().keys().cloned().collect()
+        self.states.lock().keys().cloned().collect()
+    }
+
+    /// Snapshot the current per-view, per-table delta lengths so that a
+    /// failed statement can roll back its partial deltas via `rollback_to`.
+    pub fn snapshot_lengths(&self) -> HashMap<String, HashMap<String, usize>> {
+        self.states
+            .lock()
+            .iter()
+            .map(|(view, state)| (view.clone(), state.snapshot_lengths()))
+            .collect()
+    }
+
+    /// Restore each view's deltas to the lengths captured in `snapshot`.
+    /// Views created after the snapshot are removed entirely.
+    pub fn rollback_to(&self, snapshot: &HashMap<String, HashMap<String, usize>>) {
+        let mut states = self.states.lock();
+        states.retain(|view, state| match snapshot.get(view) {
+            Some(view_snapshot) => {
+                state.rollback_to(view_snapshot);
+                true
+            }
+            None => false,
+        });
+    }
+}
+
+/// Lightweight representation of a table referenced by a materialized view.
+/// Works for both BTree tables and virtual/foreign tables.
+#[derive(Debug, Clone)]
+pub struct ReferencedTable {
+    pub name: String,
+    pub columns: Vec<Column>,
+    pub has_rowid: bool,
+    rowid_alias_index: Option<usize>,
+    /// Virtual/foreign tables don't expose `rowid` in SQL — need synthetic rowids.
+    is_virtual: bool,
+}
+
+impl ReferencedTable {
+    /// Build from any table type in the schema.
+    /// Returns None for FromClauseSubquery (not a real table).
+    pub fn from_schema(schema: &Schema, table_name: &str) -> Option<Self> {
+        match schema.get_table(table_name)?.as_ref() {
+            Table::BTree(btree) => Some(Self::from_btree(btree)),
+            Table::Virtual(vtab) => Some(Self::from_virtual(vtab)),
+            Table::FromClauseSubquery(_) | Table::RecursiveCte(_) => None,
+        }
+    }
+
+    pub fn from_btree(table: &BTreeTable) -> Self {
+        let rowid_alias_index = table.get_rowid_alias_column().map(|(idx, _)| idx);
+        Self {
+            name: table.name.clone(),
+            columns: table.columns().to_vec(),
+            has_rowid: table.has_rowid,
+            rowid_alias_index,
+            is_virtual: false,
+        }
+    }
+
+    pub fn from_virtual(table: &VirtualTable) -> Self {
+        Self {
+            name: table.name.clone(),
+            columns: table.columns.clone(),
+            has_rowid: true,
+            rowid_alias_index: None,
+            is_virtual: true,
+        }
+    }
+
+    pub fn get_rowid_alias_column(&self) -> Option<usize> {
+        self.rowid_alias_index
     }
 }
 
@@ -207,7 +443,7 @@ pub struct IncrementalView {
     circuit: DbspCircuit,
 
     // All tables referenced by this view (from FROM clause and JOINs)
-    referenced_tables: Vec<Arc<BTreeTable>>,
+    referenced_tables: Vec<ReferencedTable>,
     // Mapping from table aliases to actual table names (e.g., "c" -> "customers")
     table_aliases: HashMap<String, String>,
     // Mapping from table name to fully qualified name (e.g., "customers" -> "main.customers")
@@ -226,6 +462,14 @@ pub struct IncrementalView {
     pub tracker: Arc<Mutex<ComputationTracker>>,
     // Root page of the btree storing the materialized state (0 for unmaterialized)
     root_page: i64,
+    // Whether this view contains a WITH RECURSIVE clause
+    has_recursive_cte: bool,
+    // ORDER BY columns (empty vec if no ORDER BY)
+    pub order_by: MatviewOrderBy,
+    // LIMIT clause (None if no LIMIT)
+    pub limit: Option<i64>,
+    // Whether to store data in an index btree (true when ORDER BY is present)
+    pub has_order_by: bool,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -242,11 +486,23 @@ impl IncrementalView {
         main_data_root: i64,
         internal_state_root: i64,
         internal_state_index_root: i64,
+        order_by: &MatviewOrderBy,
+        limit: Option<i64>,
     ) -> Result<DbspCircuit> {
-        // Build the logical plan from the SELECT statement
+        // Build the logical plan from the SELECT statement.
+        //
+        // We strip ORDER BY and LIMIT from the SELECT before logical-plan
+        // building because both are enforced by the storage layer (the
+        // matview's index btree gives sort order; the cursor enforces
+        // LIMIT). The general logical-plan `build_limit` rejects negative
+        // LIMITs, so passing through the user's `LIMIT -1` (= unlimited)
+        // would fail there. The original `select_stmt` keeps ORDER BY/LIMIT
+        // for SQL round-trips (recursive-CTE full-result mode etc.).
+        let mut select_for_plan = select.clone();
+        select_for_plan.order_by.clear();
+        select_for_plan.limit = None;
         let mut builder = LogicalPlanBuilder::new(schema);
-        // Convert Select to a Stmt for the builder
-        let stmt = ast::Stmt::Select(select.clone());
+        let stmt = ast::Stmt::Select(select_for_plan);
         let logical_plan = builder.build_statement(&stmt)?;
 
         // Compile the logical plan to a DBSP circuit with the storage roots
@@ -254,6 +510,8 @@ impl IncrementalView {
             main_data_root,
             internal_state_root,
             internal_state_index_root,
+            order_by.clone(),
+            limit,
         );
         let circuit = compiler.compile(&logical_plan)?;
 
@@ -340,6 +598,12 @@ impl IncrementalView {
         // Extract output columns using the shared function
         let column_schema = extract_view_columns(&select, schema)?;
 
+        // Parse ORDER BY and LIMIT from the SELECT
+        let (order_by, limit) = Self::parse_order_by_and_limit(&select, &column_schema)?;
+
+        // Check for matview-on-matview upstream LIMIT restriction
+        // (will be validated after we check referenced tables below)
+
         let mut referenced_tables = Vec::new();
         let mut table_aliases = HashMap::default();
         let mut qualified_table_names = HashMap::default();
@@ -353,7 +617,27 @@ impl IncrementalView {
             &mut table_conditions,
         )?;
 
-        Self::new(
+        // Matview-on-matview restriction: an upstream matview that uses
+        // ORDER BY or LIMIT is stored in a different btree shape (index vs
+        // table) and may have its row count truncated by LIMIT. Until we
+        // make the downstream IVM input adapter cursor-aware (so it sees
+        // the LIMIT-applied, sort-ordered rows the same way the user does),
+        // refuse the chain at DDL time. ORDER BY is also restricted because
+        // raw btree iteration over an upstream index page would crash a
+        // table cursor.
+        for ref_table in &referenced_tables {
+            if let Some(upstream_arc) = schema.get_materialized_view(&ref_table.name) {
+                let upstream = upstream_arc.lock();
+                if !upstream.order_by.is_empty() || upstream.limit.is_some() {
+                    return Err(LimboError::ParseError(format!(
+                        "matview-on-matview is not yet supported when the upstream view uses ORDER BY or LIMIT (view '{}')",
+                        ref_table.name
+                    )));
+                }
+            }
+        }
+
+        Self::new_with_order_by(
             name,
             select.clone(),
             referenced_tables,
@@ -365,6 +649,8 @@ impl IncrementalView {
             main_data_root,
             internal_state_root,
             internal_state_index_root,
+            order_by,
+            limit,
         )
     }
 
@@ -372,7 +658,7 @@ impl IncrementalView {
     pub fn new(
         name: String,
         select_stmt: ast::Select,
-        referenced_tables: Vec<Arc<BTreeTable>>,
+        referenced_tables: Vec<ReferencedTable>,
         table_aliases: HashMap<String, String>,
         qualified_table_names: HashMap<String, String>,
         table_conditions: HashMap<String, Vec<Option<ast::Expr>>>,
@@ -382,8 +668,46 @@ impl IncrementalView {
         internal_state_root: i64,
         internal_state_index_root: i64,
     ) -> Result<Self> {
+        Self::new_with_order_by(
+            name,
+            select_stmt,
+            referenced_tables,
+            table_aliases,
+            qualified_table_names,
+            table_conditions,
+            column_schema,
+            schema,
+            main_data_root,
+            internal_state_root,
+            internal_state_index_root,
+            MatviewOrderBy::default(),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_order_by(
+        name: String,
+        select_stmt: ast::Select,
+        referenced_tables: Vec<ReferencedTable>,
+        table_aliases: HashMap<String, String>,
+        qualified_table_names: HashMap<String, String>,
+        table_conditions: HashMap<String, Vec<Option<ast::Expr>>>,
+        column_schema: ViewColumnSchema,
+        schema: &Schema,
+        main_data_root: i64,
+        internal_state_root: i64,
+        internal_state_index_root: i64,
+        order_by: MatviewOrderBy,
+        limit: Option<i64>,
+    ) -> Result<Self> {
         // Create the tracker that will be shared by all operators
         let tracker = Arc::new(Mutex::new(ComputationTracker::new()));
+
+        // Check if the SELECT statement has a WITH RECURSIVE clause
+        let has_recursive_cte = select_stmt.with.as_ref().is_some_and(|w| w.recursive);
+
+        let has_order_by = !order_by.is_empty();
 
         // Compile the SELECT statement into a DBSP circuit
         let circuit = Self::try_compile_circuit(
@@ -392,6 +716,8 @@ impl IncrementalView {
             main_data_root,
             internal_state_root,
             internal_state_index_root,
+            &order_by,
+            limit,
         )?;
 
         Ok(Self {
@@ -406,6 +732,10 @@ impl IncrementalView {
             populate_state: PopulateState::Start,
             tracker,
             root_page: main_data_root,
+            has_recursive_cte,
+            order_by,
+            limit,
+            has_order_by,
         })
     }
 
@@ -413,18 +743,142 @@ impl IncrementalView {
         &self.name
     }
 
+    /// Parse ORDER BY and LIMIT from the SELECT statement.
+    /// Returns (order_by, limit) where order_by columns are indices into the
+    /// expanded column_schema.
+    fn parse_order_by_and_limit(
+        select: &ast::Select,
+        column_schema: &ViewColumnSchema,
+    ) -> Result<(MatviewOrderBy, Option<i64>)> {
+        let num_output_cols = column_schema.columns.len();
+
+        // Validate ORDER BY columns
+        let mut order_columns = Vec::new();
+        for sc in &select.order_by {
+            let col_idx = resolve_sorted_column_to_index(sc, num_output_cols).map_err(|msg| {
+                LimboError::ParseError(format!("ORDER BY in materialized view: {msg}"))
+            })?;
+            let sort_order = sc.order.unwrap_or(ast::SortOrder::Asc);
+            order_columns.push((col_idx, sort_order, sc.nulls));
+        }
+
+        // Validate LIMIT
+        let limit = if let Some(ref limit_clause) = select.limit {
+            // Reject OFFSET
+            if limit_clause.offset.is_some() {
+                return Err(LimboError::ParseError(
+                    "LIMIT ... OFFSET is not yet supported in materialized views".to_string(),
+                ));
+            }
+            let limit_val = extract_integer_literal(&limit_clause.expr).ok_or_else(|| {
+                LimboError::ParseError(
+                    "LIMIT must be a constant integer in materialized views".to_string(),
+                )
+            })?;
+            // SQLite-compat: `LIMIT -1` means "unlimited" (legacy sentinel).
+            // Other negatives are rejected with a message that names the rule.
+            if limit_val == -1 {
+                None
+            } else if limit_val < 0 {
+                return Err(LimboError::ParseError(
+                    "LIMIT must be non-negative or -1 (unlimited) in materialized views"
+                        .to_string(),
+                ));
+            } else {
+                Some(limit_val)
+            }
+        } else {
+            None
+        };
+
+        // Reject LIMIT without ORDER BY
+        if limit.is_some() && order_columns.is_empty() {
+            return Err(LimboError::ParseError(
+                "LIMIT without ORDER BY is not supported in materialized views".to_string(),
+            ));
+        }
+
+        Ok((
+            MatviewOrderBy {
+                columns: order_columns,
+            },
+            limit,
+        ))
+    }
+
+    /// Reset the populate state so the view can be repopulated (used by REFRESH).
+    pub fn populate_state_is_done(&self) -> bool {
+        matches!(self.populate_state, PopulateState::Done)
+    }
+
+    pub fn reset_populate_state(&mut self) {
+        self.populate_state = PopulateState::Start;
+    }
+
+    /// Reset DBSP circuit state after a ROLLBACK so that recursive operator
+    /// state (seen_rows, union_all_rowids, etc.) is rebuilt from the btree on
+    /// the next execution.
+    pub fn reset_circuit_for_rollback(&mut self) {
+        self.circuit.reset_recursive_operators_for_rollback();
+    }
+
     /// Execute the circuit with uncommitted changes to get processed delta
+    /// Returns (delta, is_full_result). When is_full_result is true, the delta
+    /// contains the COMPLETE matview output (not an incremental change), and the
+    /// cursor should use it directly instead of merging with the btree.
     pub fn execute_with_uncommitted(
         &mut self,
         uncommitted: DeltaSet,
         pager: Arc<Pager>,
         execute_state: &mut crate::incremental::compiler::ExecuteState,
-    ) -> crate::Result<crate::types::IOResult<Delta>> {
-        // Initialize execute_state with the input data
+        conn: &crate::sync::Arc<crate::Connection>,
+    ) -> crate::Result<crate::types::IOResult<(Delta, bool)>> {
+        if self.has_recursive_cte {
+            // For recursive CTE matviews, the DBSP incremental circuit can't correctly
+            // compute uncommitted deltas because:
+            // - The recursive output includes computed columns (paths) whose values
+            //   differ between commit-time and read-time computations
+            // - seen_counts/seen_rows use value hashes that don't match across contexts
+            // - This causes either missing rows or massive over-counting
+            //
+            // Instead, evaluate the matview SQL directly on the parent connection
+            // (which sees committed + uncommitted data). Return the full result.
+            let sql = self.select_stmt.to_string();
+            let mut stmt = conn.prepare(&sql)?;
+            let mut delta = super::dbsp::Delta::new();
+            let mut rowid = 1i64;
+            loop {
+                match stmt.step()? {
+                    crate::vdbe::StepResult::Row => {
+                        if let Some(row) = stmt.row() {
+                            let values: Vec<crate::types::Value> =
+                                row.get_values().cloned().collect();
+                            delta.insert(rowid, values);
+                            rowid += 1;
+                        }
+                    }
+                    crate::vdbe::StepResult::Done => break,
+                    crate::vdbe::StepResult::IO => {
+                        let completion = crate::io::Completion::new_yield();
+                        return Ok(crate::types::IOResult::IO(
+                            crate::types::IOCompletions::Single(completion),
+                        ));
+                    }
+                    _ => break,
+                }
+            }
+            return Ok(crate::types::IOResult::Done((delta, true)));
+        }
+
+        // Non-recursive matviews: use DBSP incremental delta computation
         *execute_state = crate::incremental::compiler::ExecuteState::Init {
-            input_data: uncommitted,
+            input_data: crate::incremental::compiler::InputDeltas::from_delta_set(uncommitted),
         };
-        self.circuit.execute(pager, execute_state)
+        let result = self.circuit.execute(pager, execute_state)?;
+        match result {
+            crate::types::IOResult::Done(delta) => Ok(crate::types::IOResult::Done((delta, false))),
+            crate::types::IOResult::IO(io) => Ok(crate::types::IOResult::IO(io)),
+        }
     }
 
     /// Get the root page for this materialized view's btree
@@ -441,8 +895,8 @@ impl IncrementalView {
     }
 
     /// Get all tables referenced by this view
-    pub fn get_referenced_tables(&self) -> Vec<Arc<BTreeTable>> {
-        self.referenced_tables.clone()
+    pub fn get_referenced_tables(&self) -> &[ReferencedTable] {
+        &self.referenced_tables
     }
 
     /// Process a single table reference from a FROM or JOIN clause
@@ -450,7 +904,7 @@ impl IncrementalView {
         name: &ast::QualifiedName,
         alias: &Option<ast::As>,
         schema: &Schema,
-        table_map: &mut HashMap<String, Arc<BTreeTable>>,
+        table_map: &mut HashMap<String, ReferencedTable>,
         aliases: &mut HashMap<String, String>,
         qualified_names: &mut HashMap<String, String>,
         cte_names: &HashSet<String>,
@@ -466,21 +920,18 @@ impl IncrementalView {
 
         // Skip CTEs - they're not real tables
         if !cte_names.contains(table_name) {
-            if let Some(table) = schema.get_btree_table(table_name) {
-                table_map.insert(table_name.to_string(), table);
-                qualified_names.insert(table_name.to_string(), qualified_name);
+            let ref_table = ReferencedTable::from_schema(schema, table_name).ok_or_else(|| {
+                LimboError::ParseError(format!("Table '{table_name}' not found in schema"))
+            })?;
+            table_map.insert(table_name.to_string(), ref_table);
+            qualified_names.insert(table_name.to_string(), qualified_name);
 
-                // Store the alias mapping if there is an alias
-                if let Some(alias_enum) = alias {
-                    aliases.insert(
-                        alias_enum.name().as_str().to_string(),
-                        table_name.to_string(),
-                    );
-                }
-            } else {
-                return Err(LimboError::ParseError(format!(
-                    "Table '{table_name}' not found in schema"
-                )));
+            // Store the alias mapping if there is an alias
+            if let Some(alias_enum) = alias {
+                aliases.insert(
+                    alias_enum.name().as_str().to_string(),
+                    table_name.to_string(),
+                );
             }
         }
         Ok(())
@@ -489,7 +940,7 @@ impl IncrementalView {
     fn extract_one_statement(
         select: &ast::OneSelect,
         schema: &Schema,
-        table_map: &mut HashMap<String, Arc<BTreeTable>>,
+        table_map: &mut HashMap<String, ReferencedTable>,
         aliases: &mut HashMap<String, String>,
         qualified_names: &mut HashMap<String, String>,
         table_conditions: &mut HashMap<String, Vec<Option<ast::Expr>>>,
@@ -528,6 +979,17 @@ impl IncrementalView {
                 }
             }
         }
+        // Detect self-joined tables (same table under multiple aliases)
+        let mut alias_count: HashMap<String, usize> = HashMap::default();
+        for (_alias, table_name) in aliases.iter() {
+            *alias_count.entry(table_name.clone()).or_insert(0) += 1;
+        }
+        let self_joined_tables: HashSet<String> = alias_count
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|(name, _)| name)
+            .collect();
+
         // Extract WHERE conditions for this SELECT
         let where_expr = if let ast::OneSelect::Select {
             where_clause: Some(ref where_expr),
@@ -547,6 +1009,17 @@ impl IncrementalView {
         // Extract and store table-specific conditions from the WHERE clause
         if let Some(ref where_expr) = where_expr {
             for table_name in table_map.keys() {
+                let conditions = table_conditions.get_mut(table_name).ok_or_else(|| {
+                    LimboError::InternalError(
+                        "table_conditions should have entry for table_name".to_string(),
+                    )
+                })?;
+                if self_joined_tables.contains(table_name) {
+                    // Self-joined table: conditions reference different aliases of the same
+                    // table. We must fetch all rows; the circuit handles filtering post-join.
+                    conditions.push(None);
+                    continue;
+                }
                 let all_tables: Vec<String> = table_map.keys().cloned().collect();
                 let table_specific_condition = Self::extract_conditions_for_table(
                     where_expr,
@@ -555,13 +1028,7 @@ impl IncrementalView {
                     &all_tables,
                     schema,
                 );
-                // Only add if there's actually a condition for this table
                 if let Some(condition) = table_specific_condition {
-                    let conditions = table_conditions.get_mut(table_name).ok_or_else(|| {
-                        LimboError::InternalError(
-                            "table_conditions should have entry for table_name".to_string(),
-                        )
-                    })?;
                     conditions.push(Some(condition));
                 }
             }
@@ -588,7 +1055,7 @@ impl IncrementalView {
     fn extract_all_tables(
         select: &ast::Select,
         schema: &Schema,
-        tables: &mut Vec<Arc<BTreeTable>>,
+        tables: &mut Vec<ReferencedTable>,
         aliases: &mut HashMap<String, String>,
         qualified_names: &mut HashMap<String, String>,
         table_conditions: &mut HashMap<String, Vec<Option<ast::Expr>>>,
@@ -615,7 +1082,7 @@ impl IncrementalView {
     fn extract_all_tables_inner(
         select: &ast::Select,
         schema: &Schema,
-        table_map: &mut HashMap<String, Arc<BTreeTable>>,
+        table_map: &mut HashMap<String, ReferencedTable>,
         aliases: &mut HashMap<String, String>,
         qualified_names: &mut HashMap<String, String>,
         table_conditions: &mut HashMap<String, Vec<Option<ast::Expr>>>,
@@ -688,7 +1155,7 @@ impl IncrementalView {
 
     pub fn generate_populate_queries(
         select_stmt: &ast::Select,
-        referenced_tables: &[Arc<BTreeTable>],
+        referenced_tables: &[ReferencedTable],
         table_aliases: &HashMap<String, String>,
         qualified_table_names: &HashMap<String, String>,
         table_conditions: &HashMap<String, Vec<Option<ast::Expr>>>,
@@ -702,12 +1169,10 @@ impl IncrementalView {
         let mut queries = Vec::new();
 
         for table in referenced_tables {
-            // Check if the table has a rowid alias (INTEGER PRIMARY KEY column)
-            let has_rowid_alias = table.columns().iter().any(|col| col.is_rowid_alias());
-
-            // Select all columns. The circuit will handle filtering and projection
-            // If there's a rowid alias, we don't need to select rowid separately
-            let select_clause = if has_rowid_alias {
+            // Virtual tables (including foreign tables) don't expose `rowid` in SQL.
+            // BTree tables with a rowid alias include it in `*`.
+            // Only bare BTree tables without a rowid alias need explicit `, rowid`.
+            let select_clause = if table.is_virtual || table.get_rowid_alias_column().is_some() {
                 "*".to_string()
             } else {
                 "*, rowid".to_string()
@@ -750,7 +1215,7 @@ impl IncrementalView {
         _select_stmt: &ast::Select,
         conditions: &[Option<ast::Expr>],
         table_name: &str,
-        _referenced_tables: &[Arc<BTreeTable>],
+        _referenced_tables: &[ReferencedTable],
         table_aliases: &HashMap<String, String>,
     ) -> crate::Result<String> {
         // Check if any conditions are None (SELECTs without WHERE)
@@ -1098,7 +1563,7 @@ impl IncrementalView {
                 } else {
                     // Check which table has this column
                     for table_name in all_tables {
-                        if let Some(table) = schema.get_btree_table(table_name) {
+                        if let Some(table) = schema.get_table(table_name) {
                             if table
                                 .columns()
                                 .iter()
@@ -1174,6 +1639,24 @@ impl IncrementalView {
         'outer: loop {
             match std::mem::replace(&mut self.populate_state, PopulateState::Done) {
                 PopulateState::Start => {
+                    // For recursive CTEs, we must gather all source table data first,
+                    // then run through the circuit in one batch, because fixed-point iteration
+                    // requires all base case rows to be available together.
+                    if self.has_recursive_cte {
+                        // Transition to the collecting state
+                        let remaining_tables: Vec<String> = self
+                            .referenced_tables
+                            .iter()
+                            .map(|t| t.name.clone())
+                            .collect();
+                        self.populate_state = PopulateState::CollectingRecursiveCteData {
+                            remaining_tables,
+                            current_stmt: None,
+                            accumulated_deltas: DeltaSet::new(),
+                        };
+                        continue 'outer;
+                    }
+
                     // Generate the SQL query for populating the view
                     // It is best to use a standard query than a cursor for two reasons:
                     // 1) Using a sql query will allow us to be much more efficient in cases where we only want
@@ -1268,15 +1751,18 @@ impl IncrementalView {
                                     row.get_values().cloned().collect();
 
                                 // Extract rowid and values using helper
-                                let (rowid, values) =
-                                    match self.extract_rowid_and_values(all_values, current_idx) {
-                                        Some(result) => result,
-                                        None => {
-                                            // Invalid rowid, skip this row
-                                            rows_processed += 1;
-                                            continue;
-                                        }
-                                    };
+                                let (rowid, values) = match self.extract_rowid_and_values(
+                                    all_values,
+                                    current_idx,
+                                    rows_processed as i64 + 1,
+                                ) {
+                                    Some(result) => result,
+                                    None => {
+                                        // Invalid rowid, skip this row
+                                        rows_processed += 1;
+                                        continue;
+                                    }
+                                };
 
                                 // Process this row
                                 match self.process_one_row(
@@ -1344,6 +1830,120 @@ impl IncrementalView {
                     }
                 }
 
+                PopulateState::CollectingRecursiveCteData {
+                    mut remaining_tables,
+                    current_stmt,
+                    mut accumulated_deltas,
+                } => {
+                    // If we have an active statement, continue reading from it
+                    if let Some((table_name, mut stmt)) = current_stmt {
+                        let mut table_delta = accumulated_deltas.get(&table_name);
+
+                        loop {
+                            match stmt.step()? {
+                                crate::vdbe::StepResult::Row => {
+                                    let row = stmt.row().ok_or_else(|| {
+                                        LimboError::InternalError(
+                                            "row should exist after StepResult::Row".to_string(),
+                                        )
+                                    })?;
+                                    let all_values: Vec<crate::types::Value> =
+                                        row.get_values().cloned().collect();
+
+                                    // Last value is rowid
+                                    let rowid = match all_values.last() {
+                                        Some(crate::types::Value::Numeric(
+                                            crate::numeric::Numeric::Integer(id),
+                                        )) => *id,
+                                        _ => continue,
+                                    };
+                                    let values = all_values[..all_values.len() - 1].to_vec();
+                                    table_delta.insert(rowid, values);
+                                }
+                                crate::vdbe::StepResult::Done => {
+                                    // Finished this table, save delta and continue to next
+                                    accumulated_deltas.insert(table_name.clone(), table_delta);
+                                    self.populate_state =
+                                        PopulateState::CollectingRecursiveCteData {
+                                            remaining_tables,
+                                            current_stmt: None,
+                                            accumulated_deltas,
+                                        };
+                                    continue 'outer;
+                                }
+                                crate::vdbe::StepResult::Interrupt
+                                | crate::vdbe::StepResult::Busy => {
+                                    // Save state and retry
+                                    accumulated_deltas.insert(table_name.clone(), table_delta);
+                                    self.populate_state =
+                                        PopulateState::CollectingRecursiveCteData {
+                                            remaining_tables,
+                                            current_stmt: Some((table_name, stmt)),
+                                            accumulated_deltas,
+                                        };
+                                    return Err(LimboError::Busy);
+                                }
+                                crate::vdbe::StepResult::IO | crate::vdbe::StepResult::Yield => {
+                                    // Save state and return I/O
+                                    accumulated_deltas.insert(table_name.clone(), table_delta);
+                                    self.populate_state =
+                                        PopulateState::CollectingRecursiveCteData {
+                                            remaining_tables,
+                                            current_stmt: Some((table_name, stmt)),
+                                            accumulated_deltas,
+                                        };
+                                    let completion = crate::io::Completion::new_yield();
+                                    return Ok(IOResult::IO(crate::types::IOCompletions::Single(
+                                        completion,
+                                    )));
+                                }
+                            }
+                        }
+                    }
+
+                    // No active statement - start reading next table or finish
+                    if let Some(table_name) = remaining_tables.pop() {
+                        let quoted = table_name.replace('"', "\"\"");
+                        let query = format!("SELECT *, rowid FROM \"{quoted}\" ORDER BY rowid");
+                        // Use the parent connection to see uncommitted writes
+                        // in the current transaction (same fix as ProcessingAllTables).
+                        let stmt = conn.prepare(&query)?;
+
+                        self.populate_state = PopulateState::CollectingRecursiveCteData {
+                            remaining_tables,
+                            current_stmt: Some((table_name, Box::new(stmt))),
+                            accumulated_deltas,
+                        };
+                        continue 'outer;
+                    }
+
+                    // All tables collected, transition to circuit execution
+                    let input_map = accumulated_deltas.into_map();
+                    self.populate_state = PopulateState::ExecutingRecursiveCircuit {
+                        input_map: Some(input_map),
+                    };
+                    continue 'outer;
+                }
+
+                PopulateState::ExecutingRecursiveCircuit { input_map } => {
+                    // Run circuit with input data (first call) or empty map (resume after I/O)
+                    let data = input_map.unwrap_or_default();
+                    match self.circuit.commit(data, pager.clone())? {
+                        IOResult::Done(_) => {
+                            self.populate_state = PopulateState::Done;
+                            return Ok(IOResult::Done(()));
+                        }
+                        IOResult::IO(io) => {
+                            // Save state for resume — the circuit stores its commit progress
+                            // internally in self.circuit.commit_state, so it resumes correctly
+                            // even though we pass None for input_map on re-entry.
+                            self.populate_state =
+                                PopulateState::ExecutingRecursiveCircuit { input_map: None };
+                            return Ok(IOResult::IO(io));
+                        }
+                    }
+                }
+
                 PopulateState::Done => {
                     return Ok(IOResult::Done(()));
                 }
@@ -1368,31 +1968,39 @@ impl IncrementalView {
         let table_name = self.referenced_tables[table_idx].name.clone();
         delta_set.insert(table_name, single_row_delta);
 
-        // Process through merge_delta
-        self.merge_delta(delta_set, pager)
+        // Process through merge_delta - we discard the output delta here since
+        // this is used during population, not during transaction commit
+        match self.merge_delta(delta_set, pager)? {
+            IOResult::Done(_output_delta) => Ok(IOResult::Done(())),
+            IOResult::IO(io) => Ok(IOResult::IO(io)),
+        }
     }
 
-    /// Extract rowid and values from a row
+    /// Extract rowid and values from a row.
+    /// `synthetic_rowid` is used for virtual/foreign tables that don't expose rowid in SQL.
     fn extract_rowid_and_values(
         &self,
         all_values: Vec<Value>,
         table_idx: usize,
+        synthetic_rowid: i64,
     ) -> Option<(i64, Vec<Value>)> {
-        if let Some((idx, _)) = self.referenced_tables[table_idx].get_rowid_alias_column() {
+        let table = &self.referenced_tables[table_idx];
+        if table.is_virtual {
+            // Virtual/foreign tables: all values are columns, use synthetic rowid
+            Some((synthetic_rowid, all_values))
+        } else if let Some(idx) = table.get_rowid_alias_column() {
             // The rowid is the value at the rowid alias column index
             let rowid = match all_values.get(idx) {
                 Some(Value::Numeric(Numeric::Integer(id))) => *id,
-                _ => return None, // Invalid rowid
+                _ => return None,
             };
-            // All values are table columns (no separate rowid was selected)
             Some((rowid, all_values))
         } else {
             // The last value is the explicitly selected rowid
             let rowid = match all_values.last() {
                 Some(Value::Numeric(Numeric::Integer(id))) => *id,
-                _ => return None, // Invalid rowid
+                _ => return None,
             };
-            // Get all values except the rowid
             let values = all_values[..all_values.len() - 1].to_vec();
             Some((rowid, values))
         }
@@ -1403,18 +2011,18 @@ impl IncrementalView {
         &mut self,
         delta_set: DeltaSet,
         pager: Arc<crate::Pager>,
-    ) -> crate::Result<IOResult<()>> {
+    ) -> crate::Result<IOResult<Delta>> {
         // Early return if all deltas are empty
         if delta_set.is_empty() {
-            return Ok(IOResult::Done(()));
+            return Ok(IOResult::Done(Delta::new()));
         }
 
         // Use the circuit to process the deltas and write to btree
         let input_data = delta_set.into_map();
 
-        // The circuit now handles all btree I/O internally with the provided pager
-        let _delta = return_if_io!(self.circuit.commit(input_data, pager));
-        Ok(IOResult::Done(()))
+        // The circuit handles all btree I/O internally and returns the output delta
+        let output_delta = return_if_io!(self.circuit.commit(input_data, pager));
+        Ok(IOResult::Done(output_delta))
     }
 }
 
@@ -1620,7 +2228,7 @@ mod tests {
 
     // Type alias for the complex return type of extract_all_tables
     type ExtractedTableInfo = (
-        Vec<Arc<BTreeTable>>,
+        Vec<ReferencedTable>,
         HashMap<String, String>,
         HashMap<String, String>,
         HashMap<String, Vec<Option<ast::Expr>>>,
@@ -2554,7 +3162,7 @@ mod tests {
         let schema = create_test_schema();
 
         // Get the orders table twice (simulating what would happen with CTEs)
-        let orders_table = schema.get_btree_table("orders").unwrap();
+        let orders_table = ReferencedTable::from_btree(&schema.get_btree_table("orders").unwrap());
 
         let referenced_tables = std::vec![orders_table.clone(), orders_table];
 
@@ -2731,5 +3339,365 @@ mod tests {
             customers_query.contains("WHERE"),
             "Customers query should have WHERE clause"
         );
+    }
+}
+
+/// Tests for concurrent IVM operations.
+///
+/// These tests verify thread safety of IVM operations under concurrent access.
+/// Related to: https://github.com/tursodatabase/turso/issues/1552
+#[cfg(all(shuttle, test))]
+mod shuttle_ivm_tests {
+    use crate::io::MemoryIO;
+    use crate::sync::Arc;
+    use crate::thread;
+    use crate::{Database, DatabaseOpts, OpenFlags};
+
+    fn create_test_db_with_views() -> Arc<Database> {
+        let io = Arc::new(MemoryIO::new());
+        Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::default(),
+            DatabaseOpts::new().with_views(true),
+            None,
+            Arc::new(crate::dialect::SqliteDialect),
+        )
+        .unwrap()
+    }
+
+    /// Test concurrent INSERTs triggering IVM on the same materialized view.
+    ///
+    /// This test reproduces the bug described in IVM-CONCURRENCY-BUG.md:
+    /// When two concurrent write operations both trigger IVM on the same
+    /// materialized view, the B-tree's overflow cell ordering invariant
+    /// can be violated.
+    ///
+    /// The assertion at btree.rs checks that overflow cells are sequential:
+    /// ```
+    /// turso_assert!(overflow_cell.index + 1 == cell_idx, "multiple overflow cells...")
+    /// ```
+    ///
+    /// This fails when:
+    /// 1. Thread A inserts at cell_idx=N, page overflows, creates overflow cell at index N
+    /// 2. Thread B inserts at cell_idx=M (where M != N+1), tries to create overflow cell
+    /// 3. Assertion fails because M != N+1
+    #[test]
+    fn concurrent_ivm_inserts_overflow_cell_ordering() {
+        shuttle::check_random(
+            || {
+                let db = create_test_db_with_views();
+
+                // Setup: create table and materialized view
+                let setup_conn = db.connect().unwrap();
+                setup_conn
+                    .execute("CREATE TABLE events (id INTEGER PRIMARY KEY, data TEXT)")
+                    .unwrap();
+                setup_conn
+                    .execute("CREATE MATERIALIZED VIEW events_view AS SELECT id, data FROM events")
+                    .unwrap();
+                setup_conn.close().unwrap();
+
+                // Spawn multiple threads doing concurrent inserts
+                // Each insert triggers IVM on the same materialized view
+                // Note: Keep these numbers small for shuttle (deterministic scheduler has limited stack)
+                let num_threads = 2;
+                let inserts_per_thread = 3;
+
+                let mut handles = vec![];
+                for thread_id in 0..num_threads {
+                    let db_clone = db.clone();
+                    let handle = thread::spawn(move || {
+                        let conn = db_clone.connect().unwrap();
+                        for i in 0..inserts_per_thread {
+                            let id = thread_id * 1000 + i;
+                            let sql = format!(
+                                "INSERT INTO events (id, data) VALUES ({}, 'thread_{}_item_{}')",
+                                id, thread_id, i
+                            );
+                            // This may fail with BUSY, which is acceptable
+                            let _ = conn.execute(&sql);
+                        }
+                        conn.close().unwrap();
+                    });
+                    handles.push(handle);
+                }
+
+                // Wait for all threads - if the bug manifests, one will panic with:
+                // "multiple overflow cells can only occur when a parent overflows..."
+                for handle in handles {
+                    handle.join().unwrap();
+                }
+
+                // Verify data integrity if we get here
+                let verify_conn = db.connect().unwrap();
+                let mut count = 0i64;
+                let mut stmt = verify_conn
+                    .query("SELECT COUNT(*) FROM events_view")
+                    .unwrap()
+                    .unwrap();
+                stmt.run_with_row_callback(|row| {
+                    count = row.get_value(0).as_int().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+                // Some inserts may have failed due to BUSY, but we should have some data
+                assert!(count > 0, "Should have inserted some rows");
+            },
+            100, // Keep iterations low for shuttle's stack limits
+        );
+    }
+
+    /// Test concurrent INSERTs with a simple view (no aggregation).
+    ///
+    /// This is a minimal test that should work within shuttle's stack limits.
+    #[test]
+    fn concurrent_ivm_simple_view() {
+        shuttle::check_random(
+            || {
+                let db = create_test_db_with_views();
+
+                let setup_conn = db.connect().unwrap();
+                setup_conn
+                    .execute("CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER)")
+                    .unwrap();
+                setup_conn
+                    .execute("CREATE MATERIALIZED VIEW items_view AS SELECT id, value FROM items")
+                    .unwrap();
+                setup_conn.close().unwrap();
+
+                // Minimal workload for shuttle
+                let num_threads = 2;
+                let inserts_per_thread = 2;
+
+                let mut handles = vec![];
+                for thread_id in 0..num_threads {
+                    let db_clone = db.clone();
+                    let handle = thread::spawn(move || {
+                        let conn = db_clone.connect().unwrap();
+                        for i in 0..inserts_per_thread {
+                            let id = thread_id * 1000 + i;
+                            let sql =
+                                format!("INSERT INTO items (id, value) VALUES ({}, {})", id, i);
+                            let _ = conn.execute(&sql);
+                        }
+                        conn.close().unwrap();
+                    });
+                    handles.push(handle);
+                }
+
+                for handle in handles {
+                    handle.join().unwrap();
+                }
+            },
+            100, // Fewer iterations to avoid stack issues
+        );
+    }
+}
+
+/// Non-shuttle concurrent IVM tests that can run with standard `cargo test`.
+///
+/// These tests use std::thread directly and are useful for reproducing the
+/// IVM concurrency bug without the shuttle infrastructure.
+#[cfg(test)]
+mod concurrent_ivm_tests {
+    use crate::io::MemoryIO;
+    use crate::sync::Arc;
+    use crate::{Database, DatabaseOpts, OpenFlags};
+    use std::thread;
+
+    fn create_test_db_with_views() -> Arc<Database> {
+        let io = Arc::new(MemoryIO::new());
+        Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::default(),
+            DatabaseOpts::new().with_views(true),
+            None,
+            Arc::new(crate::dialect::SqliteDialect),
+        )
+        .unwrap()
+    }
+
+    /// Test concurrent INSERTs triggering IVM on the same materialized view.
+    ///
+    /// This test reproduces the bug described in IVM-CONCURRENCY-BUG.md.
+    /// Expected behavior:
+    /// - In debug builds: panics with "multiple overflow cells can only occur..."
+    /// - In release builds: may cause silent data corruption
+    ///
+    /// If this test passes without panic, the IVM concurrency bug has been fixed.
+    #[test]
+    #[ignore] // Enable when testing the bug - may panic or hang
+    fn test_concurrent_ivm_inserts() {
+        let db = create_test_db_with_views();
+
+        // Setup: create table and materialized view
+        let setup_conn = db.connect().unwrap();
+        setup_conn
+            .execute("CREATE TABLE events (id INTEGER PRIMARY KEY, data TEXT)")
+            .unwrap();
+        setup_conn
+            .execute("CREATE MATERIALIZED VIEW events_view AS SELECT id, data FROM events")
+            .unwrap();
+        setup_conn.close().unwrap();
+
+        // Spawn multiple threads doing concurrent inserts
+        let num_threads = 4;
+        let inserts_per_thread = 100;
+
+        let mut handles = vec![];
+        for thread_id in 0..num_threads {
+            let db_clone = db.clone();
+            let handle = thread::spawn(move || {
+                let conn = db_clone.connect().unwrap();
+                for i in 0..inserts_per_thread {
+                    let id = thread_id * 1000 + i;
+                    let sql = format!(
+                        "INSERT INTO events (id, data) VALUES ({id}, 'thread_{thread_id}_item_{i}')"
+                    );
+                    // Ignore BUSY errors - we're testing concurrent access
+                    let _ = conn.execute(&sql);
+                }
+                conn.close().unwrap();
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all threads
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Verify we can still query the view
+        let verify_conn = db.connect().unwrap();
+        let mut count = 0i64;
+        let mut stmt = verify_conn
+            .query("SELECT COUNT(*) FROM events_view")
+            .unwrap()
+            .unwrap();
+        stmt.run_with_row_callback(|row| {
+            count = row.get_value(0).as_int().unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert!(count > 0, "Should have inserted some rows, got {count}");
+    }
+
+    /// Stress test with more threads and aggregation to maximize IVM contention.
+    #[test]
+    #[ignore] // Enable when testing the bug
+    fn test_concurrent_ivm_stress() {
+        for iteration in 0..10 {
+            let db = create_test_db_with_views();
+
+            let setup_conn = db.connect().unwrap();
+            setup_conn
+                .execute(
+                    "CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER, category TEXT)",
+                )
+                .unwrap();
+            setup_conn
+                .execute(
+                    "CREATE MATERIALIZED VIEW items_summary AS \
+                     SELECT category, COUNT(*) as cnt FROM items GROUP BY category",
+                )
+                .unwrap();
+            setup_conn.close().unwrap();
+
+            let num_threads = 8;
+            let inserts_per_thread = 50;
+
+            let mut handles = vec![];
+            for thread_id in 0..num_threads {
+                let db_clone = db.clone();
+                let handle = thread::spawn(move || {
+                    let conn = db_clone.connect().unwrap();
+                    for i in 0..inserts_per_thread {
+                        let id = thread_id * 1000 + i;
+                        let category = format!("cat_{}", thread_id % 3);
+                        let value = i * 10;
+                        let sql = format!(
+                            "INSERT INTO items (id, value, category) VALUES ({id}, {value}, '{category}')"
+                        );
+                        let _ = conn.execute(&sql);
+                    }
+                    conn.close().unwrap();
+                });
+                handles.push(handle);
+            }
+
+            for handle in handles {
+                handle.join().unwrap();
+            }
+
+            println!("Iteration {iteration} completed successfully");
+        }
+    }
+}
+
+/// Resolve a SortedColumn expression to an output column index (0-based).
+/// Supports column references by name and column ordinals (e.g., `ORDER BY 2`).
+fn resolve_sorted_column_to_index(
+    sc: &ast::SortedColumn,
+    num_output_cols: usize,
+) -> std::result::Result<usize, String> {
+    use turso_parser::ast::Expr;
+
+    match sc.expr.as_ref() {
+        Expr::Literal(ast::Literal::Numeric(val)) => {
+            // Column ordinal: "ORDER BY 2"
+            if let Ok(n) = val.parse::<i64>() {
+                if n < 1 || n > num_output_cols as i64 {
+                    return Err(format!(
+                        "column ordinal {} is out of range (view has {} columns)",
+                        n, num_output_cols
+                    ));
+                }
+                Ok((n - 1) as usize)
+            } else {
+                Err(format!("unexpected ORDER BY expression: {val}"))
+            }
+        }
+        Expr::Id(name) => {
+            let col_name = crate::util::normalize_ident(name.as_str());
+            Err(format!(
+                "ORDER BY column reference '{col_name}' is not yet supported; use column ordinals (e.g., ORDER BY 1) instead"
+            ))
+        }
+        Expr::Collate(inner, _) => {
+            Err("COLLATE in ORDER BY is not yet supported for materialized views".to_string())
+        }
+        _ => Err(format!(
+            "ORDER BY expression '{}' is not yet supported in materialized views",
+            sc.expr
+        )),
+    }
+}
+
+/// Extract a constant integer from a parser expression, if it's a numeric literal.
+///
+/// Negative integer literals come through as `Unary(Negative, Literal::Numeric(N))`
+/// rather than a single signed literal — handle that explicitly so callers can
+/// see e.g. `-1` for the SQLite-compat "unlimited" LIMIT sentinel.
+fn extract_integer_literal(expr: &ast::Expr) -> Option<i64> {
+    use turso_parser::ast::{Expr, UnaryOperator};
+    match expr {
+        Expr::Literal(ast::Literal::Numeric(val)) => val.parse::<i64>().ok(),
+        Expr::Unary(UnaryOperator::Negative, inner) => {
+            if let Expr::Literal(ast::Literal::Numeric(val)) = inner.as_ref() {
+                val.parse::<i64>().ok().and_then(i64::checked_neg)
+            } else {
+                None
+            }
+        }
+        Expr::Unary(UnaryOperator::Positive, inner) => {
+            if let Expr::Literal(ast::Literal::Numeric(val)) = inner.as_ref() {
+                val.parse::<i64>().ok()
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }

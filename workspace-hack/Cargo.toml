@@ -1,0 +1,244 @@
+# Temporarily stubbed out — the hakari-managed original at
+# /tmp/workspace-hack-original.toml force-enables tokio full / mio /
+# hyper-server / pyo3 / rusqlite-bundled, which don't build on
+# wasm32-unknown-unknown. This empty stub lets turso_core compile for
+# the Holon browser-demo spike. Restore before running `cargo hakari`.
+[package]
+name = "workspace-hack"
+version = "0.1.0"
+edition = "2021"
+description = "workspace-hack package, managed by hakari"
+publish = false
+
+# The parts of the file between the BEGIN HAKARI SECTION and END HAKARI SECTION comments
+# are managed by hakari.
+
+### BEGIN HAKARI SECTION
+[dependencies]
+anstream = { version = "0.6" }
+bitflags = { version = "2", default-features = false, features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env", "unstable-ext", "wrap_help"] }
+clap_builder = { version = "4", default-features = false, features = ["color", "env", "std", "suggestions", "unstable-ext", "usage", "wrap_help"] }
+codspeed-criterion-compat = { version = "4", features = ["async_futures", "html_reports"] }
+codspeed-criterion-compat-walltime = { version = "4", default-features = false, features = ["async_futures", "cargo_bench_support", "html_reports", "plotters", "rayon"] }
+console = { version = "0.15", default-features = false, features = ["ansi-parsing", "unicode-width"] }
+criterion = { version = "0.5", features = ["async_futures", "html_reports"] }
+crossbeam-deque = { version = "0.8" }
+crossbeam-utils = { version = "0.8" }
+crypto-common = { version = "0.1", default-features = false, features = ["getrandom", "std"] }
+either = { version = "1", features = ["use_std"] }
+env_logger = { version = "0.11", default-features = false, features = ["auto-color"] }
+form_urlencoded = { version = "1" }
+futures = { version = "0.3" }
+futures-channel = { version = "0.3", features = ["sink"] }
+futures-core = { version = "0.3" }
+futures-sink = { version = "0.3" }
+futures-task = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["async-await-macro", "channel", "io", "sink"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
+getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
+hashbrown = { version = "0.15" }
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service"] }
+idna = { version = "1" }
+indexmap = { version = "1", default-features = false, features = ["serde-1"] }
+libc = { version = "0.2", features = ["extra_traits"] }
+lock_api = { version = "0.4", features = ["arc_lock"] }
+memchr = { version = "2" }
+miette = { version = "7", features = ["fancy"] }
+nu-ansi-term = { version = "0.50", default-features = false, features = ["derive_serde_style"] }
+num-traits = { version = "0.2", features = ["i128"] }
+once_cell = { version = "1" }
+parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
+percent-encoding = { version = "2" }
+rand = { version = "0.8", features = ["small_rng"] }
+rand_chacha = { version = "0.9" }
+rand_core-274715c4dabd11b0 = { package = "rand_core", version = "0.9", default-features = false, features = ["os_rng", "std"] }
+rand_core-3b31131e45eafb45 = { package = "rand_core", version = "0.6", default-features = false, features = ["std"] }
+regex = { version = "1" }
+regex-automata = { version = "0.4" }
+regex-syntax = { version = "0.8" }
+rusqlite = { version = "0.37", default-features = false, features = ["bundled", "series"] }
+serde = { version = "1", features = ["alloc", "derive", "rc"] }
+serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
+serde_json = { version = "1", features = ["alloc"] }
+similar = { version = "2", features = ["inline", "unicode"] }
+smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
+sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
+tokio = { version = "1", features = ["full", "test-util", "tracing"] }
+tracing = { version = "0.1", features = ["release_max_level_info"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[build-dependencies]
+anstream = { version = "0.6" }
+bitflags = { version = "2", default-features = false, features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env", "unstable-ext", "wrap_help"] }
+clap_builder = { version = "4", default-features = false, features = ["color", "env", "std", "suggestions", "unstable-ext", "usage", "wrap_help"] }
+codspeed-criterion-compat = { version = "4", features = ["async_futures", "html_reports"] }
+codspeed-criterion-compat-walltime = { version = "4", default-features = false, features = ["async_futures", "cargo_bench_support", "html_reports", "plotters", "rayon"] }
+console = { version = "0.15", default-features = false, features = ["ansi-parsing", "unicode-width"] }
+criterion = { version = "0.5", features = ["async_futures", "html_reports"] }
+crossbeam-deque = { version = "0.8" }
+crossbeam-utils = { version = "0.8" }
+crypto-common = { version = "0.1", default-features = false, features = ["getrandom", "std"] }
+darling = { version = "0.20" }
+darling_core = { version = "0.20", default-features = false, features = ["suggestions"] }
+either = { version = "1", features = ["use_std"] }
+env_logger = { version = "0.11", default-features = false, features = ["auto-color"] }
+form_urlencoded = { version = "1" }
+futures = { version = "0.3" }
+futures-channel = { version = "0.3", features = ["sink"] }
+futures-core = { version = "0.3" }
+futures-sink = { version = "0.3" }
+futures-task = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["async-await-macro", "channel", "io", "sink"] }
+getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
+getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
+hashbrown = { version = "0.15" }
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service"] }
+idna = { version = "1" }
+indexmap = { version = "1", default-features = false, features = ["serde-1"] }
+libc = { version = "0.2", features = ["extra_traits"] }
+lock_api = { version = "0.4", features = ["arc_lock"] }
+memchr = { version = "2" }
+miette = { version = "7", features = ["fancy"] }
+nu-ansi-term = { version = "0.50", default-features = false, features = ["derive_serde_style"] }
+num-traits = { version = "0.2", features = ["i128"] }
+once_cell = { version = "1" }
+parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
+percent-encoding = { version = "2" }
+rand = { version = "0.8", features = ["small_rng"] }
+rand_chacha = { version = "0.9" }
+rand_core-274715c4dabd11b0 = { package = "rand_core", version = "0.9", default-features = false, features = ["os_rng", "std"] }
+rand_core-3b31131e45eafb45 = { package = "rand_core", version = "0.6", default-features = false, features = ["std"] }
+regex = { version = "1" }
+regex-automata = { version = "0.4" }
+regex-syntax = { version = "0.8" }
+rusqlite = { version = "0.37", default-features = false, features = ["bundled", "series"] }
+serde = { version = "1", features = ["alloc", "derive", "rc"] }
+serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
+serde_json = { version = "1", features = ["alloc"] }
+similar = { version = "2", features = ["inline", "unicode"] }
+smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
+syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
+sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
+tokio = { version = "1", features = ["full", "test-util", "tracing"] }
+tracing = { version = "0.1", features = ["release_max_level_info"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[target.x86_64-unknown-linux-gnu.dependencies]
+aho-corasick = { version = "1" }
+bitflags = { version = "2", default-features = false, features = ["std"] }
+bytemuck = { version = "1", default-features = false, features = ["derive"] }
+deranged = { version = "0.4", default-features = false, features = ["powerfmt", "serde", "std"] }
+futures-util = { version = "0.3" }
+hyper-util = { version = "0.1", default-features = false, features = ["client-proxy", "client-proxy-system"] }
+linux-raw-sys = { version = "0.9", default-features = false, features = ["elf", "errno", "general", "if_ether", "io_uring", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
+log = { version = "0.4", default-features = false, features = ["std"] }
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+mio = { version = "1", features = ["net", "os-ext"] }
+num-traits = { version = "0.2", default-features = false, features = ["libm"] }
+rustix-d585fab2519d2d1 = { package = "rustix", version = "0.38", default-features = false, features = ["event", "fs", "pipe", "process", "std", "stdio", "termios", "time"] }
+rustix-dff4ba8e3ae991db = { package = "rustix", version = "1", features = ["io_uring", "stdio", "termios"] }
+stable_deref_trait = { version = "1" }
+time = { version = "0.3", default-features = false, features = ["serde-well-known"] }
+tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
+uuid = { version = "1", features = ["serde", "v4", "v5", "v7"] }
+
+[target.x86_64-unknown-linux-gnu.build-dependencies]
+aho-corasick = { version = "1" }
+bitflags = { version = "2", default-features = false, features = ["std"] }
+bytemuck = { version = "1", default-features = false, features = ["derive"] }
+cc = { version = "1", default-features = false, features = ["parallel"] }
+deranged = { version = "0.4", default-features = false, features = ["powerfmt", "serde", "std"] }
+futures-util = { version = "0.3" }
+hyper-util = { version = "0.1", default-features = false, features = ["client-proxy", "client-proxy-system"] }
+linux-raw-sys = { version = "0.9", default-features = false, features = ["elf", "errno", "general", "if_ether", "io_uring", "ioctl", "net", "netlink", "no_std", "prctl", "xdp"] }
+log = { version = "0.4", default-features = false, features = ["std"] }
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+mio = { version = "1", features = ["net", "os-ext"] }
+num-traits = { version = "0.2", default-features = false, features = ["libm"] }
+prettyplease = { version = "0.2", default-features = false, features = ["verbatim"] }
+rustix-d585fab2519d2d1 = { package = "rustix", version = "0.38", default-features = false, features = ["event", "fs", "pipe", "process", "std", "stdio", "termios", "time"] }
+rustix-dff4ba8e3ae991db = { package = "rustix", version = "1", features = ["io_uring", "stdio", "termios"] }
+stable_deref_trait = { version = "1" }
+time = { version = "0.3", default-features = false, features = ["serde-well-known"] }
+tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
+uuid = { version = "1", features = ["serde", "v4", "v5", "v7"] }
+
+[target.aarch64-apple-darwin.dependencies]
+aho-corasick = { version = "1" }
+bitflags = { version = "2", default-features = false, features = ["std"] }
+bytemuck = { version = "1", default-features = false, features = ["derive"] }
+deranged = { version = "0.4", default-features = false, features = ["powerfmt", "serde", "std"] }
+futures-util = { version = "0.3" }
+hyper-util = { version = "0.1", default-features = false, features = ["client-proxy", "client-proxy-system"] }
+log = { version = "0.4", default-features = false, features = ["std"] }
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+mio = { version = "1", features = ["net", "os-ext"] }
+num-traits = { version = "0.2", default-features = false, features = ["libm"] }
+rustix-d585fab2519d2d1 = { package = "rustix", version = "0.38", default-features = false, features = ["event", "fs", "pipe", "process", "std", "stdio", "termios", "time"] }
+rustix-dff4ba8e3ae991db = { package = "rustix", version = "1", features = ["io_uring", "stdio", "termios"] }
+stable_deref_trait = { version = "1" }
+time = { version = "0.3", default-features = false, features = ["serde-well-known"] }
+tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
+uuid = { version = "1", features = ["serde", "v4", "v5", "v7"] }
+
+[target.aarch64-apple-darwin.build-dependencies]
+aho-corasick = { version = "1" }
+bitflags = { version = "2", default-features = false, features = ["std"] }
+bytemuck = { version = "1", default-features = false, features = ["derive"] }
+cc = { version = "1", default-features = false, features = ["parallel"] }
+deranged = { version = "0.4", default-features = false, features = ["powerfmt", "serde", "std"] }
+futures-util = { version = "0.3" }
+hyper-util = { version = "0.1", default-features = false, features = ["client-proxy", "client-proxy-system"] }
+log = { version = "0.4", default-features = false, features = ["std"] }
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
+mio = { version = "1", features = ["net", "os-ext"] }
+num-traits = { version = "0.2", default-features = false, features = ["libm"] }
+prettyplease = { version = "0.2", default-features = false, features = ["verbatim"] }
+rustix-d585fab2519d2d1 = { package = "rustix", version = "0.38", default-features = false, features = ["event", "fs", "pipe", "process", "std", "stdio", "termios", "time"] }
+rustix-dff4ba8e3ae991db = { package = "rustix", version = "1", features = ["io_uring", "stdio", "termios"] }
+stable_deref_trait = { version = "1" }
+time = { version = "0.3", default-features = false, features = ["serde-well-known"] }
+tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
+uuid = { version = "1", features = ["serde", "v4", "v5", "v7"] }
+
+[target.x86_64-pc-windows-msvc.dependencies]
+aho-corasick = { version = "1" }
+deranged = { version = "0.4", default-features = false, features = ["powerfmt", "serde", "std"] }
+futures-util = { version = "0.3" }
+hyper-util = { version = "0.1", default-features = false, features = ["client-proxy", "client-proxy-system"] }
+num-traits = { version = "0.2", default-features = false, features = ["libm"] }
+stable_deref_trait = { version = "1" }
+time = { version = "0.3", default-features = false, features = ["serde-well-known"] }
+tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
+uuid = { version = "1", features = ["serde", "v4", "v5", "v7"] }
+winapi = { version = "0.3", default-features = false, features = ["consoleapi", "errhandlingapi", "fileapi", "handleapi", "impl-default", "minwinbase", "minwindef", "processenv", "processthreadsapi", "synchapi", "winbase", "winerror", "winnt", "winuser"] }
+windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Globalization", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
+windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_SystemInformation"] }
+
+[target.x86_64-pc-windows-msvc.build-dependencies]
+aho-corasick = { version = "1" }
+cc = { version = "1", default-features = false, features = ["parallel"] }
+deranged = { version = "0.4", default-features = false, features = ["powerfmt", "serde", "std"] }
+futures-util = { version = "0.3" }
+hyper-util = { version = "0.1", default-features = false, features = ["client-proxy", "client-proxy-system"] }
+num-traits = { version = "0.2", default-features = false, features = ["libm"] }
+prettyplease = { version = "0.2", default-features = false, features = ["verbatim"] }
+stable_deref_trait = { version = "1" }
+time = { version = "0.3", default-features = false, features = ["serde-well-known"] }
+tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
+uuid = { version = "1", features = ["serde", "v4", "v5", "v7"] }
+winapi = { version = "0.3", default-features = false, features = ["consoleapi", "errhandlingapi", "fileapi", "handleapi", "impl-default", "minwinbase", "minwindef", "processenv", "processthreadsapi", "synchapi", "winbase", "winerror", "winnt", "winuser"] }
+windows-sys-73dcd821b1037cfd = { package = "windows-sys", version = "0.59", features = ["Win32_Globalization", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Console", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
+windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Wdk_System_IO", "Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_SystemInformation"] }
+
+### END HAKARI SECTION

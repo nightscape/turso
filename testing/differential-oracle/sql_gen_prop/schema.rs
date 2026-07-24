@@ -225,6 +225,9 @@ pub struct View {
     pub name: String,
     /// The SELECT statement that defines the view.
     pub select_sql: String,
+    /// Known output columns (used for matview-to-matview references).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<ColumnDef>,
 }
 
 impl View {
@@ -232,7 +235,13 @@ impl View {
         Self {
             name: name.into(),
             select_sql: select_sql.into(),
+            columns: Vec::new(),
         }
+    }
+
+    pub fn with_columns(mut self, columns: Vec<ColumnDef>) -> Self {
+        self.columns = columns;
+        self
     }
 }
 
@@ -258,6 +267,7 @@ pub struct SchemaBuilder {
     tables: Vec<TableRef>,
     indexes: Vec<IndexRef>,
     views: Vec<ViewRef>,
+    materialized_views: Vec<ViewRef>,
     triggers: Vec<TriggerRef>,
     attached_databases: Vec<String>,
 }
@@ -282,6 +292,11 @@ impl SchemaBuilder {
         self
     }
 
+    pub fn add_materialized_view(mut self, view: View) -> Self {
+        self.materialized_views.push(Rc::new(view));
+        self
+    }
+
     pub fn add_trigger(mut self, trigger: Trigger) -> Self {
         self.triggers.push(Rc::new(trigger));
         self
@@ -299,6 +314,7 @@ impl SchemaBuilder {
             tables: Rc::new(self.tables),
             indexes: Rc::new(self.indexes),
             views: Rc::new(self.views),
+            materialized_views: Rc::new(self.materialized_views),
             triggers: Rc::new(self.triggers),
             attached_databases: self.attached_databases,
         }
@@ -314,6 +330,7 @@ pub struct Schema {
     pub tables: Rc<Vec<TableRef>>,
     pub indexes: Rc<Vec<IndexRef>>,
     pub views: Rc<Vec<ViewRef>>,
+    pub materialized_views: Rc<Vec<ViewRef>>,
     pub triggers: Rc<Vec<TriggerRef>>,
     /// Names of attached databases (e.g. ["aux"]).
     /// Empty means only the main database is available.
@@ -359,6 +376,14 @@ impl Schema {
         self.views.iter().map(|v| v.name.clone()).collect()
     }
 
+    /// Returns all materialized view names in the schema.
+    pub fn materialized_view_names(&self) -> HashSet<String> {
+        self.materialized_views
+            .iter()
+            .map(|v| v.name.clone())
+            .collect()
+    }
+
     /// Returns a table by name.
     pub fn get_table(&self, name: &str) -> Option<&TableRef> {
         self.tables.iter().find(|t| t.name == name)
@@ -387,6 +412,16 @@ impl Schema {
         self.triggers
             .iter()
             .filter(|t| t.table_name == table_name)
+            .collect()
+    }
+
+    /// Returns materialized views that have known columns as `TableRef`s,
+    /// so they can be used as query sources (e.g. for matview-to-matview references).
+    pub fn matviews_as_tables(&self) -> Vec<TableRef> {
+        self.materialized_views
+            .iter()
+            .filter(|v| !v.columns.is_empty())
+            .map(|v| Rc::new(Table::new(v.name.clone(), v.columns.clone())))
             .collect()
     }
 }

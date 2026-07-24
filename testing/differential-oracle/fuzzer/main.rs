@@ -58,6 +58,33 @@ struct Args {
     /// Enable experimental MVCC mode.
     #[arg(long)]
     mvcc: bool,
+
+    /// Enable materialized view fuzzing (Turso IVM vs SQLite regular views).
+    #[arg(long)]
+    matview: bool,
+
+    /// Probability (0.0–1.0) that a DML statement starts a batch transaction (2–10 stmts in BEGIN/COMMIT).
+    #[arg(long, default_value_t = 0.0)]
+    batch_probability: f64,
+
+    /// Maximum batch size for normal transactions (default: 10).
+    #[arg(long, default_value_t = 10)]
+    max_batch_size: usize,
+
+    /// Probability (0.0–1.0) that a batch is "large" (50–300 stmts). Exercises pager/freelist under IVM pressure.
+    #[arg(long, default_value_t = 0.0)]
+    large_batch_probability: f64,
+
+    /// Use real file I/O instead of in-memory I/O. Enables pager/freelist code paths
+    /// that only trigger with actual disk I/O (re-entrancy, cache eviction, WAL checkpointing).
+    #[arg(long)]
+    file_io: bool,
+
+    /// Probability (0.0–1.0) that a successful DML statement is immediately
+    /// re-executed verbatim. Catches IVM idempotency bugs (e.g., redundant
+    /// UPDATE-to-same-value drops null-padded LEFT JOIN rows).
+    #[arg(long, default_value_t = 0.0)]
+    redundant_dml_probability: f64,
 }
 
 #[derive(Subcommand, Debug)]
@@ -94,6 +121,7 @@ struct ConfigRecord {
     num_statements: usize,
     generator: String,
     mvcc: bool,
+    matview: bool,
 }
 
 /// Summary written to the JSON report file.
@@ -112,6 +140,7 @@ impl ConfigRecord {
             num_statements: args.num_statements,
             generator: format!("{:?}", args.generator),
             mvcc: args.mvcc,
+            matview: args.matview,
         }
     }
 }
@@ -240,11 +269,29 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
             TreeMode::Simplified
         },
         mvcc: args.mvcc,
+        matview: args.matview,
+        batch_dml_probability: if args.matview && args.batch_probability == 0.0 {
+            0.3
+        } else {
+            args.batch_probability
+        },
+        max_batch_size: args.max_batch_size,
+        large_batch_probability: if args.matview && args.large_batch_probability == 0.0 {
+            0.1
+        } else {
+            args.large_batch_probability
+        },
+        file_io: args.file_io,
+        redundant_dml_probability: if args.matview && args.redundant_dml_probability == 0.0 {
+            0.1
+        } else {
+            args.redundant_dml_probability
+        },
     };
 
     tracing::info!("Starting differential_fuzzer with config: {:?}", config);
 
-    let fuzzer = Fuzzer::new(config)?;
+    let mut fuzzer = Fuzzer::new(config)?;
     let stats = fuzzer.run()?;
 
     if args.keep_files {

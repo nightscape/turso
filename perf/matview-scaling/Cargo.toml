@@ -1,0 +1,8 @@
+[package]
+name = "matview-scaling"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+turso_core = { path = "../../core" }
+tempfile = "3"

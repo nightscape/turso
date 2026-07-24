@@ -1,0 +1,106 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@requires materialized_views "requires materialized view support"
+
+# HOLON-ONLY: recursive CTEs are rejected by upstream main
+# (core/translate/planner.rs bails with "Recursive CTEs are not yet supported").
+# The recursion-free coverage for the same defect lives in
+# ivm-filter-projection-column-collision.sqltest and IS upstream-portable.
+
+test ivm-recursive-reparent-outdent {
+    CREATE TABLE t8 (id TEXT PRIMARY KEY, pid TEXT);
+    CREATE MATERIALIZED VIEW mv8 AS
+      WITH RECURSIVE tree AS (
+        SELECT id, pid, 0 AS depth FROM t8 WHERE pid = 'root'
+        UNION ALL
+        SELECT c.id, c.pid, p.depth + 1 FROM t8 c JOIN tree p ON c.pid = p.id
+      ) SELECT * FROM tree;
+
+    INSERT INTO t8 VALUES ('a', 'root');
+    INSERT INTO t8 VALUES ('b', 'a');
+    INSERT INTO t8 VALUES ('c', 'b');
+
+    UPDATE t8 SET pid = 'root' WHERE id = 'b';
+    SELECT * FROM mv8 ORDER BY id, depth;
+}
+expect {
+    a|root|0
+    b|root|0
+    c|b|1
+}
+
+test ivm-recursive-reparent-outdent-visited-guard {
+    CREATE TABLE t9 (id TEXT PRIMARY KEY, pid TEXT);
+    CREATE MATERIALIZED VIEW mv9 AS
+      WITH RECURSIVE tree AS (
+        SELECT id, pid, 0 AS depth, CAST(id AS TEXT) AS visited FROM t9 WHERE pid = 'root'
+        UNION ALL
+        SELECT c.id, c.pid, p.depth + 1, p.visited || ',' || CAST(c.id AS TEXT)
+        FROM t9 c JOIN tree p ON c.pid = p.id
+        WHERE p.depth < 20
+          AND ',' || p.visited || ',' NOT LIKE '%,' || CAST(c.id AS TEXT) || ',%'
+      ) SELECT * FROM tree;
+
+    INSERT INTO t9 VALUES ('a', 'root');
+    INSERT INTO t9 VALUES ('b', 'a');
+    INSERT INTO t9 VALUES ('c', 'b');
+
+    UPDATE t9 SET pid = 'root' WHERE id = 'b';
+    SELECT * FROM mv9 ORDER BY id, depth;
+}
+expect {
+    a|root|0|a
+    b|root|0|b
+    c|b|1|b,c
+}
+
+test ivm-recursive-like-guard-freezes-column {
+    CREATE TABLE bl (id TEXT PRIMARY KEY, parent_id TEXT);
+    CREATE MATERIALIZED VIEW mvl AS
+      WITH RECURSIVE fd AS (
+        SELECT b.id AS node_id, b.parent_id, 0 AS depth
+        FROM bl b WHERE b.parent_id = 'focus'
+        UNION ALL
+        SELECT child.id, child.parent_id, fd.depth + 1
+        FROM fd JOIN bl child ON child.parent_id = fd.node_id
+        WHERE fd.node_id NOT LIKE '%zzz%'
+      ) SELECT * FROM fd;
+
+    INSERT INTO bl VALUES ('a', 'focus');
+    INSERT INTO bl VALUES ('b', 'a');
+    INSERT INTO bl VALUES ('c', 'b');
+
+    SELECT * FROM mvl ORDER BY node_id;
+}
+expect {
+    a|focus|0
+    b|a|1
+    c|b|2
+}
+
+test ivm-recursive-reparent-stale-parent-like-guard {
+    CREATE TABLE bl2 (id TEXT PRIMARY KEY, parent_id TEXT);
+    CREATE MATERIALIZED VIEW mvl2 AS
+      WITH RECURSIVE fd AS (
+        SELECT b.id AS node_id, b.parent_id, 0 AS depth
+        FROM bl2 b WHERE b.parent_id = 'focus'
+        UNION ALL
+        SELECT child.id, child.parent_id, fd.depth + 1
+        FROM fd JOIN bl2 child ON child.parent_id = fd.node_id
+        WHERE fd.node_id NOT LIKE '%zzz%'
+      ) SELECT * FROM fd;
+
+    INSERT INTO bl2 VALUES ('a', 'focus');
+    INSERT INTO bl2 VALUES ('b', 'a');
+    INSERT INTO bl2 VALUES ('c', 'b');
+    INSERT INTO bl2 VALUES ('d', 'c');
+
+    UPDATE bl2 SET parent_id = 'a' WHERE id = 'c';
+    SELECT * FROM mvl2 ORDER BY node_id;
+}
+expect {
+    a|focus|0
+    b|a|1
+    c|a|1
+    d|c|2
+}
