@@ -14,6 +14,7 @@ turso_core = { workspace = true, features = ["fs"] }
 sha1 = "0.10"
 clap = { workspace = true, features = ["derive"] }
 hex = { workspace = true }
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -1,0 +1,121 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@skip-file-if sqlite "materialized views are a turso-specific feature"
+@requires materialized_views "requires materialized view support"
+
+test recursive-cte-order-by-asc {
+    -- Recursive CTE matview with ORDER BY. Sort key = synthetic counter.
+    CREATE TABLE seed (id INTEGER PRIMARY KEY);
+    INSERT INTO seed VALUES (1);
+
+    CREATE MATERIALIZED VIEW mv AS
+      WITH RECURSIVE counter(n) AS (
+        SELECT 1 FROM seed
+        UNION ALL
+        SELECT n + 1 FROM counter WHERE n < 5
+      )
+      SELECT n FROM counter ORDER BY 1;
+
+    SELECT n FROM mv;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
+test recursive-cte-order-by-limit {
+    -- Recursive CTE matview with ORDER BY DESC + LIMIT. Storage holds all 10
+    -- rows; cursor stops at 3.
+    CREATE TABLE seed (id INTEGER PRIMARY KEY);
+    INSERT INTO seed VALUES (1);
+
+    CREATE MATERIALIZED VIEW mv AS
+      WITH RECURSIVE counter(n) AS (
+        SELECT 1 FROM seed
+        UNION ALL
+        SELECT n + 1 FROM counter WHERE n < 10
+      )
+      SELECT n FROM counter ORDER BY 1 DESC LIMIT 3;
+
+    SELECT n FROM mv;
+    SELECT COUNT(*) FROM mv;
+}
+expect {
+    10
+    9
+    8
+    3
+}
+
+test recursive-cte-order-by-no-limit-in-tx {
+    -- Reads inside an uncommitted tx use full-result mode for recursive
+    -- CTE matviews (re-execute SQL against parent connection). This test
+    -- exercises ORDER BY without LIMIT to avoid a pre-existing Turso bug
+    -- where `WITH RECURSIVE ... ORDER BY x LIMIT N` does not honor LIMIT
+    -- (returns all rows). When that bug is fixed, add a `... LIMIT 3` test.
+    CREATE TABLE seed (id INTEGER PRIMARY KEY, base INTEGER);
+    INSERT INTO seed VALUES (1, 1);
+
+    CREATE MATERIALIZED VIEW mv AS
+      WITH RECURSIVE counter(n) AS (
+        SELECT base FROM seed
+        UNION ALL
+        SELECT n + 1 FROM counter WHERE n < 5
+      )
+      SELECT n FROM counter ORDER BY 1;
+
+    BEGIN;
+    INSERT INTO seed VALUES (2, 7);
+    SELECT n FROM mv;
+    COMMIT;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+    7
+}
+
+test matview-on-matview-upstream-limit-rejected {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
+
+    CREATE MATERIALIZED VIEW upstream AS SELECT x FROM t ORDER BY 1 LIMIT 2;
+
+    CREATE MATERIALIZED VIEW downstream AS SELECT x FROM upstream;
+}
+expect error {
+    matview-on-matview is not yet supported
+}
+
+test matview-on-matview-upstream-order-by-rejected {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 1), (2, 2);
+
+    CREATE MATERIALIZED VIEW upstream AS SELECT x FROM t ORDER BY 1;
+
+    CREATE MATERIALIZED VIEW downstream AS SELECT x FROM upstream;
+}
+expect error {
+    matview-on-matview is not yet supported
+}
+
+test matview-on-matview-no-order-by-still-allowed {
+    -- Sanity: matview-on-matview without ORDER BY/LIMIT upstream still works.
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 1), (2, 2);
+
+    CREATE MATERIALIZED VIEW upstream AS SELECT x FROM t;
+
+    CREATE MATERIALIZED VIEW downstream AS SELECT x FROM upstream;
+
+    SELECT COUNT(*) FROM downstream;
+}
+expect {
+    2
+}

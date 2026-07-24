@@ -1,0 +1,45 @@
+@database :memory:
+@skip-file-if mvcc "CDC not supported in MVCC mode"
+
+# A turso_cdc table that already exists in the version 1 layout keeps CDC in
+# version 1 mode.
+
+test cdc-v1-multi-row-insert-keeps-every-row {
+    CREATE TABLE turso_cdc(change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB);
+    CREATE TABLE t(x);
+    PRAGMA capture_data_changes_conn('id');
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT x FROM t ORDER BY x;
+    SELECT count(*) FROM turso_cdc WHERE table_name = 't';
+}
+expect {
+    1
+    2
+    3
+    3
+}
+
+test cdc-v1-multi-row-update-changes-every-row {
+    CREATE TABLE turso_cdc(change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB);
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1), (2), (3);
+    PRAGMA capture_data_changes_conn('full');
+    UPDATE t SET x = x * 10;
+    SELECT x FROM t ORDER BY x;
+}
+expect {
+    10
+    20
+    30
+}
+
+test cdc-v1-created-table-is-usable {
+    CREATE TABLE turso_cdc(change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB);
+    PRAGMA capture_data_changes_conn('full');
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1);
+    SELECT x FROM t;
+}
+expect {
+    1
+}

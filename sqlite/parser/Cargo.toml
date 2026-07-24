@@ -28,9 +28,9 @@ serde = { workspace = true , optional = true, features = ["derive", "rc"] }
 thiserror = { workspace = true }
 turso_macros = { workspace = true }
 memchr = "2.7.6"
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
-fallible-iterator = { workspace = true }
 criterion = { workspace = true, features = ["html_reports" ] }
 codspeed-criterion-compat = { workspace = true }
 
