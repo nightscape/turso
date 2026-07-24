@@ -126,6 +126,19 @@ impl Connection {
         }
     }
 
+    /// Register a foreign data wrapper as a virtual table in this connection's schema.
+    ///
+    /// See [`turso_sdk_kit::foreign::ForeignDataWrapper`] for the trait definition.
+    pub fn register_foreign_table(
+        &self,
+        name: &str,
+        fdw: std::sync::Arc<dyn turso_sdk_kit::foreign::ForeignDataWrapper>,
+    ) -> Result<()> {
+        let conn = self.get_inner_connection()?;
+        conn.register_foreign_table(name, fdw)
+            .map_err(|e| Error::Misuse(e.to_string()))
+    }
+
     /// Execute a batch of SQL statements on the database.
     pub async fn execute_batch(&self, sql: impl AsRef<str>) -> Result<()> {
         self.maybe_handle_dangling_tx().await?;
@@ -240,6 +253,51 @@ impl Connection {
     pub fn busy_timeout(&self, duration: std::time::Duration) -> Result<()> {
         let conn = self.get_inner_connection()?;
         conn.set_busy_timeout(duration);
+        Ok(())
+    }
+
+    /// Register a callback for changes to any relation (tables or materialized views).
+    /// The callback fires when changes are committed or when CDC records are written.
+    /// Works in both auto-commit and explicit transaction modes.
+    /// Returns a callback ID that can be used to unregister.
+    ///
+    /// The callback receives a RelationChangeEvent containing:
+    /// - relation_name: The name of the table or view
+    /// - columns: Column names in order, matching the values in DatabaseChange records
+    /// - changes: The actual row changes (inserts, updates, deletes)
+    pub fn set_change_callback<F>(&self, callback: F) -> Result<turso_sdk_kit::rsapi::CallbackId>
+    where
+        F: Fn(&turso_sdk_kit::rsapi::RelationChangeEvent) + Send + Sync + 'static,
+    {
+        let conn = self.get_inner_connection()?;
+        Ok(conn.set_change_callback(callback))
+    }
+
+    /// Register a callback filtered to specific relations.
+    /// The callback only fires for changes to the specified tables/views.
+    pub fn set_change_callback_for<F>(
+        &self,
+        relations: &[&str],
+        callback: F,
+    ) -> Result<turso_sdk_kit::rsapi::CallbackId>
+    where
+        F: Fn(&turso_sdk_kit::rsapi::RelationChangeEvent) + Send + Sync + 'static,
+    {
+        let conn = self.get_inner_connection()?;
+        Ok(conn.set_change_callback_for(relations, callback))
+    }
+
+    /// Remove a specific change callback by ID
+    pub fn clear_change_callback(&self, id: turso_sdk_kit::rsapi::CallbackId) -> Result<()> {
+        let conn = self.get_inner_connection()?;
+        conn.clear_change_callback(id);
+        Ok(())
+    }
+
+    /// Clear all change callbacks (for cleanup/testing)
+    pub fn clear_all_change_callbacks(&self) -> Result<()> {
+        let conn = self.get_inner_connection()?;
+        conn.clear_all_change_callbacks();
         Ok(())
     }
 }

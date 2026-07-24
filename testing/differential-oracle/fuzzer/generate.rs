@@ -3,6 +3,8 @@
 //! Provides a trait-based interface to switch between different SQL generation
 //! backends (sql_gen and sql_gen_prop) via a config flag.
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::TestRunner;
@@ -16,6 +18,15 @@ pub struct GeneratedStatement {
     pub mutates_data: bool,
     pub has_unordered_limit: bool,
     pub unordered_limit_reason: Option<String>,
+    /// True for CREATE/DROP MATERIALIZED VIEW — needs split execution
+    /// (materialized on Turso, regular view on SQLite).
+    pub is_matview_ddl: bool,
+    /// For matview DDL: the equivalent regular view SQL to run on SQLite.
+    pub sqlite_sql: Option<String>,
+    /// For matview CREATE: the output columns of the view's SELECT.
+    pub matview_output_columns: Option<Vec<sql_gen_prop::ColumnDef>>,
+    /// True for ReopenDatabase — runner should close and reopen the Turso DB.
+    pub is_reopen: bool,
 }
 
 impl std::fmt::Display for GeneratedStatement {
@@ -37,7 +48,16 @@ pub enum GeneratorKind {
 /// Trait abstracting SQL generation backends.
 pub trait SqlGenerator {
     /// Generate the next SQL statement given the current schema.
-    fn generate(&mut self, schema: &sql_gen::Schema) -> Result<GeneratedStatement>;
+    fn generate(&mut self, schema: &sql_gen::Schema) -> Result<GeneratedStatement> {
+        self.generate_with_matviews(schema, &HashMap::new())
+    }
+
+    /// Generate the next SQL statement, with awareness of tracked matview info.
+    fn generate_with_matviews(
+        &mut self,
+        schema: &sql_gen::Schema,
+        matview_info: &HashMap<String, Vec<sql_gen_prop::ColumnDef>>,
+    ) -> Result<GeneratedStatement>;
 
     /// Take accumulated coverage data, if the backend supports it.
     fn take_coverage(&mut self) -> Option<sql_gen::Coverage> {
@@ -83,7 +103,12 @@ impl SqlGenBackend {
 }
 
 impl SqlGenerator for SqlGenBackend {
-    fn generate(&mut self, schema: &sql_gen::Schema) -> Result<GeneratedStatement> {
+    fn generate_with_matviews(
+        &mut self,
+        schema: &sql_gen::Schema,
+        _matview_info: &HashMap<String, Vec<sql_gen_prop::ColumnDef>>,
+    ) -> Result<GeneratedStatement> {
+        // sql_gen backend doesn't support matview generation
         let generator: SqlGen<Full> = SqlGen::new(schema.clone(), self.policy.clone());
         let stmt = generator
             .statement(&mut self.ctx)
@@ -107,6 +132,10 @@ impl SqlGenerator for SqlGenBackend {
             mutates_data,
             has_unordered_limit,
             unordered_limit_reason,
+            is_matview_ddl: false,
+            sqlite_sql: None,
+            matview_output_columns: None,
+            is_reopen: false,
         })
     }
 
@@ -122,7 +151,7 @@ pub struct PropTestBackend {
 }
 
 impl PropTestBackend {
-    pub fn new(seed_bytes: [u8; 32]) -> Self {
+    pub fn new(seed_bytes: [u8; 32], matview: bool) -> Self {
         let test_runner = TestRunner::new_with_rng(
             proptest::test_runner::Config::default(),
             proptest::test_runner::TestRng::from_seed(
@@ -136,6 +165,20 @@ impl PropTestBackend {
             .expression
             .base
             .order_by_allow_integer_positions = false;
+
+        if matview {
+            profile.create_materialized_view_weight = 8;
+            profile.drop_materialized_view_weight = 2;
+            profile.reopen_database_weight = 2;
+            // Matviews cannot reference attached databases, so any table
+            // created in `temp.*` or `aux.*` is dead weight (and the
+            // table-tracking divergence between Turso and SQLite for
+            // those schemas eats most of the iteration budget). Restrict
+            // CREATE TABLE to the main schema in matview mode.
+            profile.create_table.extra.target_schemas =
+                sql_gen_prop::SchemaTargetProfile::main_only();
+        }
+
         Self {
             test_runner,
             profile,
@@ -144,35 +187,85 @@ impl PropTestBackend {
 }
 
 impl SqlGenerator for PropTestBackend {
-    fn generate(&mut self, schema: &sql_gen::Schema) -> Result<GeneratedStatement> {
-        let prop_schema = to_prop_schema(schema);
+    fn generate_with_matviews(
+        &mut self,
+        schema: &sql_gen::Schema,
+        matview_info: &HashMap<String, Vec<sql_gen_prop::ColumnDef>>,
+    ) -> Result<GeneratedStatement> {
+        let prop_schema = to_prop_schema_with_matviews(schema, matview_info);
         let strategy = sql_gen_prop::strategies::statement_for_schema(&prop_schema, &self.profile);
         let value_tree = strategy
             .new_tree(&mut self.test_runner)
             .map_err(|e| anyhow::anyhow!("Failed to generate statement: {e}"))?;
         let stmt = value_tree.current();
+        let kind = sql_gen_prop::StatementKind::from(&stmt);
+
+        if matches!(kind, sql_gen_prop::StatementKind::ReopenDatabase) {
+            return Ok(GeneratedStatement {
+                sql: "-- REOPEN DATABASE".to_string(),
+                is_ddl: false,
+                mutates_data: false,
+                has_unordered_limit: false,
+                unordered_limit_reason: None,
+                is_matview_ddl: false,
+                sqlite_sql: None,
+                matview_output_columns: None,
+                is_reopen: true,
+            });
+        }
+
         let sql = stmt.to_string();
-        let stmt_kind = sql_gen_prop::StatementKind::from(&stmt);
-        let is_ddl = stmt_kind.is_ddl();
+        let is_ddl = kind.is_ddl();
         let mutates_data = matches!(
-            stmt_kind,
+            kind,
             sql_gen_prop::StatementKind::Insert
                 | sql_gen_prop::StatementKind::Update
                 | sql_gen_prop::StatementKind::Delete
         );
         let has_unordered_limit = stmt.has_unordered_limit();
+        let is_matview_ddl = matches!(
+            kind,
+            sql_gen_prop::StatementKind::CreateMaterializedView
+                | sql_gen_prop::StatementKind::DropMaterializedView
+        );
+
+        let sqlite_sql = match &stmt {
+            sql_gen_prop::SqlStatement::CreateMaterializedView(create) => {
+                Some(create.as_regular_view_sql())
+            }
+            sql_gen_prop::SqlStatement::DropMaterializedView(drop_stmt) => {
+                Some(drop_stmt.to_string())
+            }
+            _ => None,
+        };
+
+        let matview_output_columns = match &stmt {
+            sql_gen_prop::SqlStatement::CreateMaterializedView(create) => {
+                Some(create.output_columns.clone())
+            }
+            _ => None,
+        };
+
         Ok(GeneratedStatement {
             sql,
             is_ddl,
             mutates_data,
             has_unordered_limit,
             unordered_limit_reason: None,
+            is_matview_ddl,
+            sqlite_sql,
+            matview_output_columns,
+            is_reopen: false,
         })
     }
 }
 
-/// Convert a `sql_gen::Schema` to a `sql_gen_prop::Schema`.
-fn to_prop_schema(schema: &sql_gen::Schema) -> sql_gen_prop::Schema {
+/// Convert a `sql_gen::Schema` to a `sql_gen_prop::Schema`,
+/// including tracked materialized view info (names + output columns).
+fn to_prop_schema_with_matviews(
+    schema: &sql_gen::Schema,
+    matview_info: &HashMap<String, Vec<sql_gen_prop::ColumnDef>>,
+) -> sql_gen_prop::Schema {
     let mut builder = sql_gen_prop::SchemaBuilder::new();
     for db in &schema.attached_databases {
         builder = builder.add_database(db.clone());
@@ -233,6 +326,11 @@ fn to_prop_schema(schema: &sql_gen::Schema) -> sql_gen_prop::Schema {
             idx = idx.in_database(db.clone());
         }
         builder = builder.add_index(idx);
+    }
+    for (name, cols) in matview_info {
+        let view =
+            sql_gen_prop::View::new(name.clone(), "/* tracked */").with_columns(cols.clone());
+        builder = builder.add_materialized_view(view);
     }
     builder.build()
 }

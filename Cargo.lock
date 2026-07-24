@@ -1301,7 +1301,6 @@ name = "core_tester"
 version = "0.8.0-pre.2"
 dependencies = [
  "anyhow",
- "assert_cmd",
  "ctor 0.5.0",
  "env_logger",
  "log",
@@ -1324,6 +1323,7 @@ dependencies = [
  "turso_parser",
  "turso_sdk_kit",
  "twox-hash",
+ "workspace-hack",
  "zerocopy 0.8.26",
 ]
 
@@ -1741,6 +1741,16 @@ dependencies = [
 
 [[package]]
 name = "deranged"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c9e6a11ca8224451684bc0d7d5a7adbf8f2fd6887261a1cfc3c0432f9d4068e"
+dependencies = [
+ "powerfmt",
+ "serde",
+]
+
+[[package]]
+name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
@@ -1860,6 +1870,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "turso_core",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -2055,12 +2066,12 @@ name = "encryption-throughput"
 version = "0.1.0"
 dependencies = [
  "clap",
- "futures",
  "hex",
  "rand 0.9.4",
  "tokio",
  "tracing-subscriber",
  "turso",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -2220,18 +2231,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "filetime"
-version = "0.2.25"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35c0522e981e68cbfa8c3f978441a5f34b30b96e146b33cd3359176b50fe8586"
-dependencies = [
- "cfg-if",
- "libc",
- "libredox",
- "windows-sys 0.59.0",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2307,15 +2306,6 @@ name = "fs_extra"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
-
-[[package]]
-name = "fsevent-sys"
-version = "4.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76ee7a02da4d231650c7cea31349b889be2f45ddb3ef3032d2ec8185f6313fd2"
-dependencies = [
- "libc",
-]
 
 [[package]]
 name = "fslock"
@@ -3251,26 +3241,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "inotify"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f37dccff2791ab604f9babef0ba14fbe0be30bd368dc541e2b08d07c8aa908f3"
-dependencies = [
- "bitflags 2.9.4",
- "inotify-sys",
- "libc",
-]
-
-[[package]]
-name = "inotify-sys"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e05c02b5e89bff3b946cedeca278abc628fe811e604f027c45a8aa3cf793d0eb"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "inout"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3439,26 +3409,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kqueue"
-version = "1.0.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7447f1ca1b7b563588a205fe93dea8df60fd981423a768bc1c0ded35ed147d0c"
-dependencies = [
- "kqueue-sys",
- "libc",
-]
-
-[[package]]
-name = "kqueue-sys"
-version = "1.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed9625ffda8729b85e45cf04090035ac368927b8cebc34898e7c120f52e4838b"
-dependencies = [
- "bitflags 1.3.2",
- "libc",
-]
-
-[[package]]
 name = "lazy-regex"
 version = "3.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3556,7 +3506,6 @@ checksum = "c0ff37bd590ca25063e35af745c343cb7a0271906fb7b37e4813e8f79f00268d"
 dependencies = [
  "bitflags 2.9.4",
  "libc",
- "redox_syscall",
 ]
 
 [[package]]
@@ -3576,6 +3525,7 @@ version = "0.8.0-pre.2"
 dependencies = [
  "mimalloc",
  "turso_ext",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -3589,6 +3539,7 @@ dependencies = [
  "ring",
  "turso_ext",
  "urlencoding",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -3599,6 +3550,7 @@ dependencies = [
  "mimalloc",
  "tempfile",
  "turso_ext",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -3607,6 +3559,7 @@ version = "0.8.0-pre.2"
 dependencies = [
  "mimalloc",
  "turso_ext",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -3616,6 +3569,7 @@ dependencies = [
  "ipnetwork",
  "mimalloc",
  "turso_ext",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -3625,6 +3579,7 @@ dependencies = [
  "mimalloc",
  "regex",
  "turso_ext",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -3638,23 +3593,18 @@ dependencies = [
  "clap",
  "derive_builder",
  "dirs 6.0.0",
- "either",
  "garde",
- "hex",
  "indexmap 2.11.1",
  "itertools 0.14.0",
  "json5",
- "notify",
  "parking_lot",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "regex",
- "regex-syntax 0.8.5",
  "rusqlite",
  "schemars 1.0.4",
  "serde",
  "serde_json",
- "similar",
  "similar-asserts",
  "sql_generation",
  "strum",
@@ -3664,6 +3614,7 @@ dependencies = [
  "turso_core",
  "turso_macros",
  "turso_parser",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -3671,6 +3622,7 @@ name = "limbo_sqlite_test_ext"
 version = "0.8.0-pre.2"
 dependencies = [
  "cc",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -4140,31 +4092,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "notify"
-version = "8.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fee8403b3d66ac7b26aee6e40a897d85dc5ce26f44da36b8b73e987cc52e943"
-dependencies = [
- "bitflags 2.9.4",
- "filetime",
- "fsevent-sys",
- "inotify",
- "kqueue",
- "libc",
- "log",
- "mio",
- "notify-types",
- "walkdir",
- "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "notify-types"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e0826a989adedc2a244799e823aece04662b66609d96af8dff7ac6df9a8925d"
-
-[[package]]
 name = "nu-ansi-term"
 version = "0.50.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4222,6 +4149,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+ "libm",
 ]
 
 [[package]]
@@ -4902,12 +4830,12 @@ dependencies = [
 name = "py-turso"
 version = "0.8.0-pre.2"
 dependencies = [
- "anyhow",
  "pyo3",
  "pyo3-build-config",
  "turso_sdk_kit",
  "turso_sync_sdk_kit",
  "version_check",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6204,6 +6132,7 @@ dependencies = [
  "serde",
  "sql_gen_macros",
  "strum",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6213,6 +6142,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.100",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6230,7 +6160,6 @@ name = "sql_generation"
 version = "0.8.0-pre.2"
 dependencies = [
  "anarchist-readable-name-generator-lib",
- "anyhow",
  "garde",
  "hex",
  "indexmap 2.11.1",
@@ -6243,6 +6172,7 @@ dependencies = [
  "tracing",
  "turso_core",
  "turso_parser",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -6797,7 +6727,7 @@ version = "0.3.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743bd48c283afc0388f9b8827b976905fb217ad9e647fae3a379a9283c4def2c"
 dependencies = [
- "deranged",
+ "deranged 0.5.8",
  "itoa",
  "num-conv",
  "powerfmt",
@@ -7226,17 +7156,16 @@ dependencies = [
  "hyper-util",
  "mimalloc",
  "rand 0.9.4",
- "rand_chacha 0.9.0",
  "reqwest",
  "serde_json",
  "tempfile",
  "thiserror 2.0.16",
  "tokio",
- "tracing",
  "tracing-subscriber",
  "turso_core",
  "turso_sdk_kit",
  "turso_sync_sdk_kit",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7248,6 +7177,7 @@ dependencies = [
  "sha1",
  "tempfile",
  "turso_core",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7257,6 +7187,22 @@ dependencies = [
  "jni",
  "thiserror 2.0.16",
  "turso_core",
+ "workspace-hack",
+]
+
+[[package]]
+name = "turso-sql-replay"
+version = "0.8.0-pre.2"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "regex",
+ "tempfile",
+ "tokio",
+ "turso",
+ "turso_core",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7292,13 +7238,13 @@ dependencies = [
  "syntect",
  "termimad",
  "toml 0.8.22",
- "toml_edit 0.22.26",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
  "turso_core",
  "turso_sync_engine",
  "validator",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7306,7 +7252,6 @@ name = "turso_core"
 version = "0.8.0-pre.2"
 dependencies = [
  "aegis",
- "aes",
  "aes-gcm",
  "allocator-api2 0.4.0",
  "antithesis_sdk",
@@ -7328,7 +7273,6 @@ dependencies = [
  "crossbeam-utils",
  "either",
  "env_logger",
- "fallible-iterator 0.3.0",
  "fastbloom",
  "hex",
  "icu_collator",
@@ -7343,7 +7287,6 @@ dependencies = [
  "miette",
  "mimalloc",
  "num-bigint",
- "num-traits",
  "pack1",
  "parking_lot",
  "pastey",
@@ -7355,7 +7298,6 @@ dependencies = [
  "rand_chacha 0.9.0",
  "rapidhash",
  "regex",
- "regex-syntax 0.8.5",
  "roaring",
  "rstest",
  "rusqlite",
@@ -7384,6 +7326,7 @@ dependencies = [
  "uncased",
  "uuid",
  "windows-sys 0.61.2",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7393,6 +7336,7 @@ dependencies = [
  "chrono",
  "getrandom 0.4.2",
  "turso_macros",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7400,10 +7344,10 @@ name = "turso_ext_tests"
 version = "0.8.0-pre.2"
 dependencies = [
  "env_logger",
- "lazy_static",
  "log",
  "mimalloc",
  "turso_ext",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7413,13 +7357,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.100",
+ "workspace-hack",
 ]
 
 [[package]]
 name = "turso_node"
 version = "0.8.0-pre.2"
 dependencies = [
- "chrono",
  "napi",
  "napi-build",
  "napi-derive",
@@ -7427,6 +7371,7 @@ dependencies = [
  "tracing-subscriber",
  "turso_core",
  "turso_parser",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7436,7 +7381,6 @@ dependencies = [
  "bitflags 2.9.4",
  "codspeed-criterion-compat",
  "criterion",
- "fallible-iterator 0.3.0",
  "memchr",
  "miette",
  "pprof",
@@ -7445,6 +7389,7 @@ dependencies = [
  "strum_macros",
  "thiserror 2.0.16",
  "turso_macros",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7548,6 +7493,7 @@ dependencies = [
  "turso_core",
  "turso_ext",
  "turso_sdk_kit_macros",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7557,6 +7503,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.100",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7608,6 +7555,7 @@ dependencies = [
  "tracing-subscriber",
  "turso_core",
  "turso_ext",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7620,7 +7568,6 @@ dependencies = [
  "indicatif",
  "rand 0.9.4",
  "rusqlite",
- "serde_json",
  "shuttle",
  "tempfile",
  "tokio",
@@ -7629,6 +7576,7 @@ dependencies = [
  "turso",
  "turso_core",
  "turso_macros",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7639,13 +7587,10 @@ dependencies = [
  "bytes",
  "crc32c",
  "ctor 0.4.2",
- "futures",
  "genawaiter",
  "http",
  "libc",
  "prost 0.14.1",
- "rand 0.9.4",
- "rand_chacha 0.9.0",
  "roaring",
  "serde",
  "serde_json",
@@ -7657,6 +7602,7 @@ dependencies = [
  "turso_core",
  "turso_parser",
  "uuid",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7667,11 +7613,10 @@ dependencies = [
  "napi",
  "napi-build",
  "napi-derive",
- "tracing",
- "tracing-subscriber",
  "turso_core",
  "turso_node",
  "turso_sync_engine",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7683,12 +7628,11 @@ dependencies = [
  "genawaiter",
  "parking_lot",
  "tracing",
- "tracing-appender",
- "tracing-subscriber",
  "turso_core",
  "turso_sdk_kit",
  "turso_sdk_kit_macros",
  "turso_sync_engine",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -7709,6 +7653,7 @@ dependencies = [
  "turso_core",
  "turso_parser",
  "twox-hash",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -8618,6 +8563,88 @@ dependencies = [
 ]
 
 [[package]]
+name = "workspace-hack"
+version = "0.1.0"
+dependencies = [
+ "aho-corasick",
+ "anstream",
+ "bitflags 2.9.4",
+ "bytemuck",
+ "cc",
+ "chrono",
+ "clap",
+ "clap_builder",
+ "codspeed-criterion-compat",
+ "codspeed-criterion-compat-walltime",
+ "console",
+ "criterion",
+ "crossbeam-deque",
+ "crossbeam-utils",
+ "crypto-common 0.1.6",
+ "darling",
+ "darling_core",
+ "deranged 0.4.0",
+ "either",
+ "env_logger",
+ "form_urlencoded",
+ "futures",
+ "futures-channel",
+ "futures-core",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+ "getrandom 0.2.15",
+ "getrandom 0.3.2",
+ "hashbrown 0.15.2",
+ "hyper",
+ "hyper-util",
+ "idna",
+ "indexmap 1.9.3",
+ "libc",
+ "linux-raw-sys 0.9.3",
+ "lock_api",
+ "log",
+ "memchr",
+ "miette",
+ "miniz_oxide",
+ "mio",
+ "nu-ansi-term",
+ "num-traits",
+ "once_cell",
+ "parking_lot",
+ "percent-encoding",
+ "prettyplease",
+ "rand 0.8.6",
+ "rand_chacha 0.9.0",
+ "rand_core 0.6.4",
+ "rand_core 0.9.3",
+ "regex",
+ "regex-automata 0.4.13",
+ "regex-syntax 0.8.5",
+ "rusqlite",
+ "rustix 0.38.44",
+ "rustix 1.0.7",
+ "serde",
+ "serde_core",
+ "serde_json",
+ "similar",
+ "smallvec",
+ "stable_deref_trait",
+ "syn 2.0.100",
+ "sync_wrapper",
+ "time",
+ "tokio",
+ "tower 0.5.2",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "winapi",
+ "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "write-throughput"
 version = "0.1.0"
 dependencies = [
@@ -8627,6 +8654,7 @@ dependencies = [
  "tokio",
  "tracing-subscriber",
  "turso",
+ "workspace-hack",
 ]
 
 [[package]]
@@ -8635,6 +8663,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "rusqlite",
+ "workspace-hack",
 ]
 
 [[package]]

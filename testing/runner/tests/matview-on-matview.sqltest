@@ -1,0 +1,131 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@skip-file-if sqlite "materialized views are a turso-specific feature"
+@requires materialized_views "requires materialized view support"
+
+test matview-on-matview-propagation {
+    CREATE TABLE navigation_history (id INTEGER PRIMARY KEY AUTOINCREMENT, region TEXT NOT NULL, block_id TEXT, timestamp TEXT DEFAULT (datetime('now')));
+    CREATE TABLE navigation_cursor (region TEXT PRIMARY KEY, history_id INTEGER REFERENCES navigation_history(id));
+    CREATE TABLE block (id TEXT PRIMARY KEY, content TEXT NOT NULL DEFAULT '', parent_id TEXT NOT NULL DEFAULT '');
+
+    INSERT INTO block (id, content, parent_id) VALUES ('b1', 'parent', 'doc:root');
+    INSERT INTO navigation_history (id, region, block_id) VALUES (1, 'left_sidebar', 'b1');
+    INSERT INTO navigation_cursor (region, history_id) VALUES ('left_sidebar', 1);
+
+    CREATE MATERIALIZED VIEW current_focus AS
+      SELECT nc.region, nh.block_id, nh.timestamp
+      FROM navigation_cursor nc JOIN navigation_history nh ON nc.history_id = nh.id;
+
+    CREATE MATERIALIZED VIEW focus_roots AS
+      SELECT cf.region, cf.block_id, b.id AS root_id FROM current_focus AS cf JOIN block AS b ON b.parent_id = cf.block_id
+      UNION ALL
+      SELECT cf.region, cf.block_id, b.id AS root_id FROM current_focus AS cf JOIN block AS b ON b.id = cf.block_id;
+
+    CREATE MATERIALIZED VIEW mv_region_watch AS
+      SELECT fr.root_id AS id, b.content, b.parent_id
+      FROM focus_roots fr JOIN block b ON b.id = fr.root_id
+      WHERE fr.region = 'left_sidebar';
+
+    SELECT COUNT(*) FROM mv_region_watch;
+
+    INSERT INTO block (id, content, parent_id) VALUES ('b2', 'child', 'b1');
+
+    SELECT COUNT(*) FROM focus_roots;
+    SELECT COUNT(*) FROM mv_region_watch;
+    SELECT id FROM mv_region_watch ORDER BY id;
+}
+expect {
+    1
+    2
+    2
+    b1
+    b2
+}
+
+test simple-matview-on-matview {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t VALUES (1, 'a');
+
+    CREATE MATERIALIZED VIEW mv_base AS SELECT * FROM t;
+    CREATE MATERIALIZED VIEW mv_chain AS SELECT * FROM mv_base;
+
+    SELECT COUNT(*) FROM mv_chain;
+
+    INSERT INTO t VALUES (2, 'b');
+
+    SELECT COUNT(*) FROM mv_base;
+    SELECT COUNT(*) FROM mv_chain;
+    SELECT id, val FROM mv_chain ORDER BY id;
+}
+expect {
+    1
+    2
+    2
+    1|a
+    2|b
+}
+
+test chained-matview-uncommitted-insert-propagates {
+    CREATE TABLE base (k INTEGER PRIMARY KEY, v INTEGER);
+    INSERT INTO base VALUES (10, -100);
+
+    CREATE MATERIALIZED VIEW source_mv AS SELECT k, v FROM base WHERE v < 0;
+    CREATE MATERIALIZED VIEW chained AS
+      SELECT source_mv.k, source_mv.v FROM source_mv JOIN base ON source_mv.k = base.k;
+
+    SELECT COUNT(*) FROM chained;
+
+    BEGIN;
+    INSERT INTO base VALUES (20, -200);
+    SELECT COUNT(*) FROM source_mv;
+    SELECT COUNT(*) FROM chained;
+    SELECT k, v FROM chained ORDER BY k;
+    COMMIT;
+
+    SELECT k, v FROM chained ORDER BY k;
+}
+expect {
+    1
+    2
+    2
+    10|-100
+    20|-200
+    10|-100
+    20|-200
+}
+
+test chained-matview-uncommitted-holon-shape {
+    CREATE TABLE block_raw (id TEXT PRIMARY KEY, parent_id TEXT, content TEXT);
+    CREATE TABLE block_tags (block_id TEXT, tag TEXT, PRIMARY KEY (block_id, tag));
+    CREATE TABLE nav (region TEXT PRIMARY KEY, doc_id TEXT);
+    INSERT INTO block_raw VALUES ('block:doc', '', 'doc');
+    INSERT INTO nav VALUES ('main', 'block:doc');
+
+    CREATE MATERIALIZED VIEW block_mv AS
+      SELECT b.id, b.parent_id, b.content,
+        COALESCE(json_group_array(bt.tag) FILTER (WHERE bt.tag IS NOT NULL), '[]') AS tags
+      FROM block_raw b
+      LEFT OUTER JOIN block_tags bt ON bt.block_id = b.id
+      GROUP BY b.id, b.parent_id, b.content;
+
+    CREATE MATERIALIZED VIEW focus_roots AS
+      SELECT n.region, b.id AS root_id
+      FROM nav n JOIN block_mv b ON b.parent_id = n.doc_id;
+
+    SELECT COUNT(*) FROM focus_roots;
+
+    BEGIN;
+    INSERT INTO block_raw VALUES ('block:1-4', 'block:doc', 'aaaa');
+    SELECT id FROM block_mv ORDER BY id;
+    SELECT region, root_id FROM focus_roots ORDER BY root_id;
+    COMMIT;
+
+    SELECT region, root_id FROM focus_roots ORDER BY root_id;
+}
+expect {
+    0
+    block:1-4
+    block:doc
+    main|block:1-4
+    main|block:1-4
+}

@@ -59,6 +59,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::Poll;
 
+pub use turso_sdk_kit::rsapi::{
+    CallbackId, DatabaseChange, DatabaseChangeType, RelationChangeEvent,
+};
+
 // Re-exports rows
 pub use crate::rows::{Row, Rows};
 

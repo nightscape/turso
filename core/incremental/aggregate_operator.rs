@@ -3,6 +3,7 @@
 use crate::function::{AggFunc, Func};
 use crate::incremental::dbsp::Hash128;
 use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
+use crate::incremental::filter_operator::{FilterOperator, FilterPredicate};
 use crate::incremental::operator::{
     generate_storage_id, ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
 };
@@ -73,10 +74,17 @@ use std::fmt::{self, Display};
 // - **Commit state machine**: Persists updated state back to storage
 // - Each state represents a resumption point for when I/O operations yield
 
-/// Constants for aggregate type encoding in storage IDs (2 bits)
+/// Constants for storage-type encoding in storage IDs (2 bits).
+/// All four codes share the same `op_type` bits in `generate_storage_id`,
+/// so collisions between e.g. an aggregate's MINMAX store and a
+/// AntijoinOperator's count store can only happen if both operators
+/// share the same `operator_id` (which they don't — each operator gets
+/// its own id from the circuit's `next_id`). The tag is purely diagnostic
+/// — it lets `pragma_dbsp_state` traces self-explain the storage layout.
 pub const AGG_TYPE_REGULAR: u8 = 0b00; // COUNT/SUM/AVG
 pub const AGG_TYPE_MINMAX: u8 = 0b01; // MIN/MAX (BTree ordering gives both)
 pub const AGG_TYPE_DISTINCT: u8 = 0b10; // DISTINCT values tracking
+pub const JOIN_TYPE_BIT: u8 = 0b11; // AntijoinOperator (LEFT JOIN antijoin counter)
 
 /// Hash a Value to generate an element_id for DISTINCT storage
 /// Uses HashableRow with column_idx as rowid for consistent hashing
@@ -95,6 +103,10 @@ const AGG_FUNC_MAX: i64 = 4;
 const AGG_FUNC_COUNT_DISTINCT: i64 = 5;
 const AGG_FUNC_SUM_DISTINCT: i64 = 6;
 const AGG_FUNC_AVG_DISTINCT: i64 = 7;
+const AGG_FUNC_GROUP_CONCAT: i64 = 8;
+const AGG_FUNC_GROUP_CONCAT_DISTINCT: i64 = 9;
+const AGG_FUNC_JSON_GROUP_ARRAY: i64 = 10;
+const AGG_FUNC_JSON_GROUP_ARRAY_DISTINCT: i64 = 11;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AggregateFunction {
@@ -106,6 +118,12 @@ pub enum AggregateFunction {
     AvgDistinct(usize),   // AVG(DISTINCT column_index)
     Min(usize),           // Column index
     Max(usize),           // Column index
+    // GROUP_CONCAT and JSON_GROUP_ARRAY maintain a per-group multiset of values
+    // serialized inline in the aggregate state blob. See module docs for details.
+    GroupConcat { col: usize, separator: String },
+    GroupConcatDistinct { col: usize, separator: String },
+    JsonGroupArray(usize),
+    JsonGroupArrayDistinct(usize),
 }
 
 impl Display for AggregateFunction {
@@ -119,6 +137,16 @@ impl Display for AggregateFunction {
             AggregateFunction::AvgDistinct(idx) => write!(f, "AVG(DISTINCT col{idx})"),
             AggregateFunction::Min(idx) => write!(f, "MIN(col{idx})"),
             AggregateFunction::Max(idx) => write!(f, "MAX(col{idx})"),
+            AggregateFunction::GroupConcat { col, separator } => {
+                write!(f, "GROUP_CONCAT(col{col}, {separator:?})")
+            }
+            AggregateFunction::GroupConcatDistinct { col, separator } => {
+                write!(f, "GROUP_CONCAT(DISTINCT col{col}, {separator:?})")
+            }
+            AggregateFunction::JsonGroupArray(idx) => write!(f, "JSON_GROUP_ARRAY(col{idx})"),
+            AggregateFunction::JsonGroupArrayDistinct(idx) => {
+                write!(f, "JSON_GROUP_ARRAY(DISTINCT col{idx})")
+            }
         }
     }
 }
@@ -174,6 +202,32 @@ impl AggregateFunction {
             AggregateFunction::Max(idx) => {
                 vec![
                     Value::Numeric(Numeric::Integer(AGG_FUNC_MAX)),
+                    Value::from_i64(*idx as i64),
+                ]
+            }
+            AggregateFunction::GroupConcat { col, separator } => {
+                vec![
+                    Value::Numeric(Numeric::Integer(AGG_FUNC_GROUP_CONCAT)),
+                    Value::from_i64(*col as i64),
+                    Value::build_text(separator.clone()),
+                ]
+            }
+            AggregateFunction::GroupConcatDistinct { col, separator } => {
+                vec![
+                    Value::Numeric(Numeric::Integer(AGG_FUNC_GROUP_CONCAT_DISTINCT)),
+                    Value::from_i64(*col as i64),
+                    Value::build_text(separator.clone()),
+                ]
+            }
+            AggregateFunction::JsonGroupArray(idx) => {
+                vec![
+                    Value::Numeric(Numeric::Integer(AGG_FUNC_JSON_GROUP_ARRAY)),
+                    Value::from_i64(*idx as i64),
+                ]
+            }
+            AggregateFunction::JsonGroupArrayDistinct(idx) => {
+                vec![
+                    Value::Numeric(Numeric::Integer(AGG_FUNC_JSON_GROUP_ARRAY_DISTINCT)),
                     Value::from_i64(*idx as i64),
                 ]
             }
@@ -290,6 +344,67 @@ impl AggregateFunction {
                     )));
                 }
             }
+            Value::Numeric(Numeric::Integer(code))
+                if *code == AGG_FUNC_GROUP_CONCAT || *code == AGG_FUNC_GROUP_CONCAT_DISTINCT =>
+            {
+                let is_distinct = *code == AGG_FUNC_GROUP_CONCAT_DISTINCT;
+                *cursor += 1;
+                let idx = values.get(*cursor).ok_or_else(|| {
+                    LimboError::InternalError("Missing GROUP_CONCAT column index".into())
+                })?;
+                let col_idx = if let Value::Numeric(Numeric::Integer(idx)) = idx {
+                    *cursor += 1;
+                    *idx as usize
+                } else {
+                    return Err(LimboError::InternalError(format!(
+                        "Expected Integer for GROUP_CONCAT column index, got {idx:?}"
+                    )));
+                };
+                let sep = values.get(*cursor).ok_or_else(|| {
+                    LimboError::InternalError("Missing GROUP_CONCAT separator".into())
+                })?;
+                let separator = if let Value::Text(t) = sep {
+                    *cursor += 1;
+                    t.as_str().to_string()
+                } else {
+                    return Err(LimboError::InternalError(format!(
+                        "Expected Text for GROUP_CONCAT separator, got {sep:?}"
+                    )));
+                };
+                if is_distinct {
+                    AggregateFunction::GroupConcatDistinct {
+                        col: col_idx,
+                        separator,
+                    }
+                } else {
+                    AggregateFunction::GroupConcat {
+                        col: col_idx,
+                        separator,
+                    }
+                }
+            }
+            Value::Numeric(Numeric::Integer(code))
+                if *code == AGG_FUNC_JSON_GROUP_ARRAY
+                    || *code == AGG_FUNC_JSON_GROUP_ARRAY_DISTINCT =>
+            {
+                let is_distinct = *code == AGG_FUNC_JSON_GROUP_ARRAY_DISTINCT;
+                *cursor += 1;
+                let idx = values.get(*cursor).ok_or_else(|| {
+                    LimboError::InternalError("Missing JSON_GROUP_ARRAY column index".into())
+                })?;
+                if let Value::Numeric(Numeric::Integer(idx)) = idx {
+                    *cursor += 1;
+                    if is_distinct {
+                        AggregateFunction::JsonGroupArrayDistinct(*idx as usize)
+                    } else {
+                        AggregateFunction::JsonGroupArray(*idx as usize)
+                    }
+                } else {
+                    return Err(LimboError::InternalError(format!(
+                        "Expected Integer for JSON_GROUP_ARRAY column index, got {idx:?}"
+                    )));
+                }
+            }
             _ => {
                 return Err(LimboError::InternalError(format!(
                     "Unknown aggregate type code: {type_code:?}"
@@ -314,7 +429,10 @@ impl AggregateFunction {
                     AggFunc::Avg => input_column_idx.map(AggregateFunction::Avg),
                     AggFunc::Min => input_column_idx.map(AggregateFunction::Min),
                     AggFunc::Max => input_column_idx.map(AggregateFunction::Max),
-                    _ => None, // Other aggregate functions not yet supported in DBSP
+                    // GroupConcat / JsonGroupArray require constructor metadata
+                    // (separator / distinct) that this function cannot synthesize.
+                    // The compiler builds these directly via dedicated arms.
+                    _ => None,
                 }
             }
             _ => None, // Not an aggregate function
@@ -449,6 +567,11 @@ pub struct AggregateOperator {
     pub column_min_max: HashMap<usize, AggColumnInfo>,
     // Set of column indices that have distinct aggregates
     pub distinct_columns: ColumnMask,
+    // Optional FILTER predicate per aggregate, parallel to `aggregates`.
+    // None = no filter (always include); Some(p) = include only when p evaluates true.
+    // Filter expressions are NOT persisted — they are reconstructed from the
+    // matview SQL on reopen via the same path as `aggregates` itself.
+    pub aggregate_filters: Vec<Option<FilterPredicate>>,
     tracker: Option<Arc<Mutex<ComputationTracker>>>,
 
     // State machine for commit operation
@@ -480,6 +603,15 @@ pub struct AggregateState {
     // (column_index, value) -> weight
     // Populated during FetchKey for values mentioned in the delta
     pub(crate) distinct_value_weights: HashMap<(usize, HashableRow), i64>,
+
+    // Per-group multiset of values for GROUP_CONCAT (BTreeMap for stable iteration).
+    // column_index -> { value -> multiplicity }.
+    // Both DISTINCT and non-DISTINCT GROUP_CONCAT share this map; emission diverges.
+    pub group_concat_states: HashMap<usize, BTreeMap<Value, i64>>,
+
+    // Per-group multiset of values for JSON_GROUP_ARRAY.
+    // Both DISTINCT and non-DISTINCT variants share this map; emission diverges.
+    pub json_array_states: HashMap<usize, BTreeMap<Value, i64>>,
 }
 
 impl AggregateEvalState {
@@ -567,13 +699,25 @@ impl AggregateEvalState {
                             SeekOp::GE { eq_only: true }
                         ));
 
-                        let rowid = if matches!(seek_result, SeekResult::Found) {
-                            // Found in index, get the table rowid
-                            // The btree code handles extracting the rowid from the index record for has_rowid indexes
-                            return_if_io!(cursors.index_cursor.rowid())
-                        } else {
-                            // Not found in index, no existing state
-                            None
+                        // Even with eq_only:true, the btree may return TryAdvance when
+                        // the candidate entry sits past the current leaf page boundary —
+                        // we must advance the cursor and recheck before concluding the
+                        // entry is absent, otherwise the existing aggregate state is
+                        // silently dropped on the next delta and the multiset is
+                        // rebuilt from scratch, losing any FILTER-passing values.
+                        // Same bug class as the JoinOperator TryAdvance fix in
+                        // join_operator.rs:read_next_join_row.
+                        let rowid = match seek_result {
+                            SeekResult::Found => return_if_io!(cursors.index_cursor.rowid()),
+                            SeekResult::TryAdvance => {
+                                return_if_io!(cursors.index_cursor.next());
+                                if cursors.index_cursor.has_record() {
+                                    return_if_io!(cursors.index_cursor.rowid())
+                                } else {
+                                    None
+                                }
+                            }
+                            SeekResult::NotFound => None,
                         };
 
                         // Always transition to FetchAggregateState
@@ -620,7 +764,7 @@ impl AggregateEvalState {
                         // Process the fetched state
                         if let Some(state) = state {
                             let mut old_row = group_key.clone();
-                            old_row.extend(state.to_values(&operator.aggregates));
+                            old_row.extend(state.to_values(&operator.aggregates)?);
                             old_values.insert(group_key_str.clone(), old_row);
                             existing_groups.insert(group_key_str.clone(), state);
                             // Track that this group exists in storage
@@ -796,6 +940,30 @@ impl AggregateState {
                         values.push(max_val.clone());
                     } else {
                         values.push(Value::from_i64(0)); // No value
+                    }
+                }
+                AggregateFunction::GroupConcat { col, .. }
+                | AggregateFunction::GroupConcatDistinct { col, .. } => {
+                    let multiset = self.group_concat_states.get(col);
+                    let len = multiset.map_or(0, |m| m.len());
+                    values.push(Value::from_i64(len as i64));
+                    if let Some(m) = multiset {
+                        for (val, count) in m {
+                            values.push(val.clone());
+                            values.push(Value::from_i64(*count));
+                        }
+                    }
+                }
+                AggregateFunction::JsonGroupArray(col)
+                | AggregateFunction::JsonGroupArrayDistinct(col) => {
+                    let multiset = self.json_array_states.get(col);
+                    let len = multiset.map_or(0, |m| m.len());
+                    values.push(Value::from_i64(len as i64));
+                    if let Some(m) = multiset {
+                        for (val, count) in m {
+                            values.push(val.clone());
+                            values.push(Value::from_i64(*count));
+                        }
                     }
                 }
             }
@@ -995,6 +1163,88 @@ impl AggregateState {
                         )));
                     }
                 }
+                AggregateFunction::GroupConcat { col, .. }
+                | AggregateFunction::GroupConcatDistinct { col, .. } => {
+                    let len = values.get(cursor).ok_or_else(|| {
+                        LimboError::InternalError("Missing GROUP_CONCAT multiset length".into())
+                    })?;
+                    let len = match len {
+                        Value::Numeric(Numeric::Integer(n)) if *n >= 0 => *n as usize,
+                        _ => {
+                            return Err(LimboError::InternalError(format!(
+                                "Expected non-negative Integer for GROUP_CONCAT multiset length, got {len:?}"
+                            )));
+                        }
+                    };
+                    cursor += 1;
+                    let map = state.group_concat_states.entry(col).or_default();
+                    for _ in 0..len {
+                        let val = values
+                            .get(cursor)
+                            .ok_or_else(|| {
+                                LimboError::InternalError(
+                                    "Missing GROUP_CONCAT multiset value".into(),
+                                )
+                            })?
+                            .clone();
+                        cursor += 1;
+                        let count = values.get(cursor).ok_or_else(|| {
+                            LimboError::InternalError("Missing GROUP_CONCAT multiset count".into())
+                        })?;
+                        let count = match count {
+                            Value::Numeric(Numeric::Integer(n)) => *n,
+                            _ => {
+                                return Err(LimboError::InternalError(format!(
+                                    "Expected Integer for GROUP_CONCAT multiset count, got {count:?}"
+                                )));
+                            }
+                        };
+                        cursor += 1;
+                        map.insert(val, count);
+                    }
+                }
+                AggregateFunction::JsonGroupArray(col)
+                | AggregateFunction::JsonGroupArrayDistinct(col) => {
+                    let len = values.get(cursor).ok_or_else(|| {
+                        LimboError::InternalError("Missing JSON_GROUP_ARRAY multiset length".into())
+                    })?;
+                    let len = match len {
+                        Value::Numeric(Numeric::Integer(n)) if *n >= 0 => *n as usize,
+                        _ => {
+                            return Err(LimboError::InternalError(format!(
+                                "Expected non-negative Integer for JSON_GROUP_ARRAY multiset length, got {len:?}"
+                            )));
+                        }
+                    };
+                    cursor += 1;
+                    let map = state.json_array_states.entry(col).or_default();
+                    for _ in 0..len {
+                        let val = values
+                            .get(cursor)
+                            .ok_or_else(|| {
+                                LimboError::InternalError(
+                                    "Missing JSON_GROUP_ARRAY multiset value".into(),
+                                )
+                            })?
+                            .clone();
+                        cursor += 1;
+                        let count = values.get(cursor).ok_or_else(|| {
+                            LimboError::InternalError(
+                                "Missing JSON_GROUP_ARRAY multiset count".into(),
+                            )
+                        })?;
+                        let count = match count {
+                            Value::Numeric(Numeric::Integer(n)) => *n,
+                            _ => {
+                                return Err(LimboError::InternalError(format!(
+                                    "Expected Integer for JSON_GROUP_ARRAY multiset count, got {count:?}"
+                                )));
+                            }
+                        };
+                        cursor += 1;
+                        map.insert(val, count);
+                    }
+                }
             }
         }
 
@@ -1072,9 +1322,20 @@ impl AggregateState {
         aggregates: &[AggregateFunction],
         _column_names: &[String], // No longer needed
         distinct_transitions: &HashMap<usize, DistinctTransition>,
+        aggregate_filters: &[Option<FilterPredicate>],
     ) -> Result<()> {
-        // Update COUNT
+        // Update COUNT.
+        // FILTER intentionally does NOT gate this. `self.count` tracks group
+        // existence — i.e. "did any input row contribute to this group?" —
+        // independently of any per-aggregate filter. Group suppression
+        // (`if state.count > 0`) continues to use the unfiltered count.
         self.count += weight as i64;
+
+        debug_assert_eq!(
+            aggregate_filters.len(),
+            aggregates.len(),
+            "aggregate_filters length must match aggregates length in apply_delta"
+        );
 
         // Track which columns have had their distinct counts/sums updated
         // This prevents double-counting when multiple distinct aggregates
@@ -1083,7 +1344,17 @@ impl AggregateState {
         let mut processed_sums = ColumnMask::default();
 
         // Update distinct aggregate state
-        for agg in aggregates {
+        for (idx, agg) in aggregates.iter().enumerate() {
+            // Per-aggregate FILTER predicate, if any. Skip per-aggregate state
+            // updates when the predicate rejects this row. v1 only allows
+            // FILTER on Sum/Avg/GroupConcat/JsonGroupArray (compile-time
+            // rejection in core/incremental/compiler.rs ensures other
+            // variants always have None here), so the gate only matters for
+            // those four arms below.
+            let filter_passes = match aggregate_filters.get(idx).and_then(|f| f.as_ref()) {
+                Some(p) => FilterOperator::evaluate_static(p, values),
+                None => true,
+            };
             match agg {
                 AggregateFunction::Count => {
                     // Already handled above
@@ -1138,25 +1409,29 @@ impl AggregateState {
                     }
                 }
                 AggregateFunction::Sum(col_idx) => {
-                    if let Some(val) = values.get(*col_idx) {
-                        let num_val = match val {
-                            Value::Numeric(Numeric::Integer(i)) => *i as f64,
-                            Value::Numeric(Numeric::Float(f)) => f64::from(*f),
-                            _ => 0.0,
-                        };
-                        *self.sums.entry(*col_idx).or_insert(0.0) += num_val * weight as f64;
+                    if filter_passes {
+                        if let Some(val) = values.get(*col_idx) {
+                            let num_val = match val {
+                                Value::Numeric(Numeric::Integer(i)) => *i as f64,
+                                Value::Numeric(Numeric::Float(f)) => f64::from(*f),
+                                _ => 0.0,
+                            };
+                            *self.sums.entry(*col_idx).or_insert(0.0) += num_val * weight as f64;
+                        }
                     }
                 }
                 AggregateFunction::Avg(col_idx) => {
-                    if let Some(val) = values.get(*col_idx) {
-                        let num_val = match val {
-                            Value::Numeric(Numeric::Integer(i)) => *i as f64,
-                            Value::Numeric(Numeric::Float(f)) => f64::from(*f),
-                            _ => 0.0,
-                        };
-                        let (sum, count) = self.avgs.entry(*col_idx).or_insert((0.0, 0));
-                        *sum += num_val * weight as f64;
-                        *count += weight as i64;
+                    if filter_passes {
+                        if let Some(val) = values.get(*col_idx) {
+                            let num_val = match val {
+                                Value::Numeric(Numeric::Integer(i)) => *i as f64,
+                                Value::Numeric(Numeric::Float(f)) => f64::from(*f),
+                                _ => 0.0,
+                            };
+                            let (sum, count) = self.avgs.entry(*col_idx).or_insert((0.0, 0));
+                            *sum += num_val * weight as f64;
+                            *count += weight as i64;
+                        }
                     }
                 }
                 AggregateFunction::Min(_col_name) | AggregateFunction::Max(_col_name) => {
@@ -1185,6 +1460,46 @@ impl AggregateState {
                     // This ensures correctness for incremental computation at the cost of
                     // additional I/O for MIN/MAX operations.
                 }
+                AggregateFunction::GroupConcat { col, .. }
+                | AggregateFunction::GroupConcatDistinct { col, .. } => {
+                    if filter_passes {
+                        if let Some(val) = values.get(*col) {
+                            // group_concat skips NULL inputs (matches SQLite scalar behavior).
+                            if !matches!(val, Value::Null) {
+                                let map = self.group_concat_states.entry(*col).or_default();
+                                let entry = map.entry(val.clone()).or_insert(0);
+                                *entry += weight as i64;
+                                assert!(
+                                    *entry >= 0,
+                                    "group_concat multiset went negative for col {col} val {val:?} \
+                                     — delta consolidation invariant violated"
+                                );
+                                if *entry == 0 {
+                                    map.remove(val);
+                                }
+                            }
+                        }
+                    }
+                }
+                AggregateFunction::JsonGroupArray(col)
+                | AggregateFunction::JsonGroupArrayDistinct(col) => {
+                    if filter_passes {
+                        if let Some(val) = values.get(*col) {
+                            // json_group_array INCLUDES NULL inputs (matches SQLite scalar behavior).
+                            let map = self.json_array_states.entry(*col).or_default();
+                            let entry = map.entry(val.clone()).or_insert(0);
+                            *entry += weight as i64;
+                            assert!(
+                                *entry >= 0,
+                                "json_group_array multiset went negative for col {col} val {val:?} \
+                                 — delta consolidation invariant violated"
+                            );
+                            if *entry == 0 {
+                                map.remove(val);
+                            }
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -1199,7 +1514,7 @@ impl AggregateState {
     /// - After DELETE 30.5: SUM(10, 20) = 30 (SQLite returns INTEGER, but we only know the sum is 30.0)
     ///
     /// Therefore, we always return REAL for SUM operations.
-    pub fn to_values(&self, aggregates: &[AggregateFunction]) -> Vec<Value> {
+    pub fn to_values(&self, aggregates: &[AggregateFunction]) -> Result<Vec<Value>> {
         let mut result = Vec::new();
 
         for agg in aggregates {
@@ -1213,8 +1528,15 @@ impl AggregateState {
                     result.push(Value::from_i64(count));
                 }
                 AggregateFunction::Sum(col_idx) => {
-                    let sum = self.sums.get(col_idx).copied().unwrap_or(0.0);
-                    result.push(Value::from_f64(sum));
+                    // SQL semantics: SUM over zero rows returns NULL (not 0).
+                    // Without FILTER this branch is unreachable today (the
+                    // group is suppressed when count == 0). With FILTER, a
+                    // group can exist with no rows contributing to this sum,
+                    // so we must distinguish "no entry" from "entry == 0.0".
+                    match self.sums.get(col_idx) {
+                        Some(sum) => result.push(Value::from_f64(*sum)),
+                        None => result.push(Value::Null),
+                    }
                 }
                 AggregateFunction::SumDistinct(col_idx) => {
                     // Return the computed SUM(DISTINCT)
@@ -1252,10 +1574,85 @@ impl AggregateState {
                     // Return the MAX value from our state
                     result.push(self.maxs.get(col_idx).cloned().unwrap_or(Value::Null));
                 }
+                AggregateFunction::GroupConcat { col, separator } => {
+                    match self.group_concat_states.get(col) {
+                        Some(m) if !m.is_empty() => {
+                            let mut buf = String::new();
+                            let mut first = true;
+                            for (val, count) in m {
+                                for _ in 0..*count {
+                                    if !first {
+                                        buf.push_str(separator);
+                                    }
+                                    buf.push_str(&val.to_string());
+                                    first = false;
+                                }
+                            }
+                            result.push(Value::build_text(buf));
+                        }
+                        _ => result.push(Value::Null),
+                    }
+                }
+                AggregateFunction::GroupConcatDistinct { col, separator } => {
+                    match self.group_concat_states.get(col) {
+                        Some(m) if !m.is_empty() => {
+                            let mut buf = String::new();
+                            let mut first = true;
+                            // count > 0 is guaranteed by remove-on-zero in apply_delta.
+                            for val in m.keys() {
+                                if !first {
+                                    buf.push_str(separator);
+                                }
+                                buf.push_str(&val.to_string());
+                                first = false;
+                            }
+                            result.push(Value::build_text(buf));
+                        }
+                        _ => result.push(Value::Null),
+                    }
+                }
+                #[cfg(feature = "json")]
+                AggregateFunction::JsonGroupArray(col) => {
+                    use crate::json::{convert_dbtype_to_raw_jsonb, json_from_raw_bytes_agg, Conv};
+                    // Element-type byte; finalize_unsafe rewrites the header.
+                    let mut blob: Vec<u8> = vec![11];
+                    if let Some(multiset) = self.json_array_states.get(col) {
+                        for (val, count) in multiset {
+                            let raw = convert_dbtype_to_raw_jsonb(val, Conv::NotStrict)?;
+                            for _ in 0..*count {
+                                blob.extend_from_slice(&raw);
+                            }
+                        }
+                    }
+                    result.push(json_from_raw_bytes_agg(&blob, false)?);
+                }
+                #[cfg(feature = "json")]
+                AggregateFunction::JsonGroupArrayDistinct(col) => {
+                    use crate::json::{convert_dbtype_to_raw_jsonb, json_from_raw_bytes_agg, Conv};
+                    let mut blob: Vec<u8> = vec![11];
+                    if let Some(multiset) = self.json_array_states.get(col) {
+                        for val in multiset.keys() {
+                            blob.extend_from_slice(&convert_dbtype_to_raw_jsonb(
+                                val,
+                                Conv::NotStrict,
+                            )?);
+                        }
+                    }
+                    result.push(json_from_raw_bytes_agg(&blob, false)?);
+                }
+                #[cfg(not(feature = "json"))]
+                AggregateFunction::JsonGroupArray(_)
+                | AggregateFunction::JsonGroupArrayDistinct(_) => {
+                    debug_assert!(
+                        false,
+                        "json feature disabled but JsonGroupArray reached emission"
+                    );
+                    result.push(Value::Null);
+                }
             }
         }
 
-        result
+        Ok(result)
     }
 }
 
@@ -1355,10 +1752,25 @@ impl AggregateOperator {
         group_by: Vec<usize>,
         aggregates: Vec<AggregateFunction>,
         input_column_names: Vec<String>,
+        aggregate_filters: Vec<Option<FilterPredicate>>,
     ) -> Result<Self> {
         // Precompute flags for runtime efficiency
         // Plain DISTINCT is indicated by empty aggregates vector
         let is_distinct_only = aggregates.is_empty();
+        // `aggregate_filters` is a parallel vec, one per aggregate. As a
+        // convenience for callers (and existing tests) that don't use FILTER
+        // at all, an empty `aggregate_filters` is interpreted as "all None"
+        // and expanded here. Otherwise lengths must match exactly.
+        let aggregate_filters = if aggregate_filters.is_empty() {
+            vec![None; aggregates.len()]
+        } else {
+            assert_eq!(
+                aggregate_filters.len(),
+                aggregates.len(),
+                "aggregate_filters length must match aggregates length"
+            );
+            aggregate_filters
+        };
 
         // Build map of column indices to their MIN/MAX info
         let mut column_min_max = HashMap::default();
@@ -1432,6 +1844,7 @@ impl AggregateOperator {
             input_column_names,
             column_min_max,
             distinct_columns,
+            aggregate_filters,
             tracker: None,
             commit_state: AggregateCommitState::Idle,
             is_distinct_only,
@@ -1463,6 +1876,15 @@ impl AggregateOperator {
                     "AggregateOperator expects right_delta to be empty"
                 );
 
+                // Upstream LEFT JOIN circuits emit the three-way DBSP sum
+                // (δL⋈R + L⋈δR + δL⋈δR) which produces the same projected row
+                // multiple times with opposing weights for cells unaffected by
+                // the actual change. Without consolidation, processing those
+                // entries one at a time can drive a multiset-tracked aggregate
+                // (json_group_array / group_concat) below zero before the
+                // matching insert lands, tripping the apply_delta assertion.
+                deltas.left.consolidate();
+
                 if deltas.left.changes.is_empty() {
                     *state = EvalState::Done;
                     return Ok(IOResult::Done((Delta::new(), HashMap::default())));
@@ -1493,6 +1915,9 @@ impl AggregateOperator {
             }
             EvalState::Join(_) => {
                 panic!("Join state should not appear in aggregate operator");
+            }
+            EvalState::Antijoin(_) => {
+                panic!("Antijoin state should not appear in aggregate operator");
             }
         }
 
@@ -1569,6 +1994,7 @@ impl AggregateOperator {
                 &self.aggregates,
                 &self.input_column_names,
                 &distinct_transitions,
+                &self.aggregate_filters,
             )?;
         }
 
@@ -1629,7 +2055,7 @@ impl AggregateOperator {
                 if state.count > 0 {
                     // Build output row: group_by columns + aggregate values
                     let mut output_values = group_key.clone();
-                    let aggregate_values = state.to_values(&self.aggregates);
+                    let aggregate_values = state.to_values(&self.aggregates)?;
                     output_values.extend(aggregate_values);
 
                     let output_row = HashableRow::new(result_key, output_values.clone());
@@ -2008,6 +2434,14 @@ impl IncrementalOperator for AggregateOperator {
 
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
         self.tracker = Some(tracker);
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 
@@ -2737,8 +3171,19 @@ impl FetchDistinctState {
                         SeekOp::GE { eq_only: true }
                     ));
 
-                    // Early exit if not found in index
-                    if !matches!(seek_result, SeekResult::Found) {
+                    // eq_only:true seeks can still return TryAdvance when the
+                    // candidate sits past the current leaf page boundary; advance
+                    // and re-check before deciding the entry is absent. Same
+                    // pattern as FetchKey above.
+                    let found = match seek_result {
+                        SeekResult::Found => true,
+                        SeekResult::TryAdvance => {
+                            return_if_io!(cursors.index_cursor.next());
+                            cursors.index_cursor.has_record()
+                        }
+                        SeekResult::NotFound => false,
+                    };
+                    if !found {
                         let groups = std::mem::take(groups_to_fetch);
                         let values = std::mem::take(values_to_fetch);
                         *self = FetchDistinctState::FetchGroup {
@@ -2825,7 +3270,7 @@ impl FetchDistinctState {
                 FetchDistinctState::Done => {
                     // For plain DISTINCT, construct AggregateState from the weights we fetched
                     if is_plain_distinct {
-                        for (_group_key_str, state) in existing_groups.iter_mut() {
+                        for state in existing_groups.values_mut() {
                             // For plain DISTINCT, sum all the weights to get total count
                             // Each weight represents how many times the distinct value appears
                             let total_weight: i64 = state.distinct_value_weights.values().sum();

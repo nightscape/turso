@@ -17,3 +17,4 @@ turso_macros = { workspace = true }
 
 getrandom = "0.4.2"
 chrono = { workspace = true, default-features = true }
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }

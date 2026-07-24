@@ -1,5 +1,6 @@
 pub mod checkpoint;
 pub mod insert;
+pub mod matview_delta;
 pub mod mixed;
 pub mod read;
 pub mod scan;

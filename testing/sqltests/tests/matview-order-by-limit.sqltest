@@ -1,0 +1,160 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@skip-file-if sqlite "materialized views are a turso-specific feature"
+@requires materialized_views "requires materialized view support"
+
+test matview-limit-smaller-than-rows {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 5), (2, 1), (3, 3), (4, 2), (5, 4);
+
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t ORDER BY 1 LIMIT 3;
+
+    SELECT x FROM mv;
+}
+expect {
+    1
+    2
+    3
+}
+
+test matview-limit-larger-than-rows {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 1), (2, 2);
+
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t ORDER BY 1 LIMIT 100;
+
+    SELECT x FROM mv;
+}
+expect {
+    1
+    2
+}
+
+test matview-limit-equal-rows {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
+
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t ORDER BY 1 LIMIT 3;
+
+    SELECT x FROM mv;
+}
+expect {
+    1
+    2
+    3
+}
+
+test matview-limit-zero {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 1), (2, 2);
+
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t ORDER BY 1 LIMIT 0;
+
+    SELECT x FROM mv;
+    SELECT COUNT(*) FROM mv;
+}
+expect {
+    0
+}
+
+test matview-limit-minus-one-unlimited {
+    -- SQLite-compat: LIMIT -1 means unlimited.
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
+
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t ORDER BY 1 LIMIT -1;
+
+    SELECT x FROM mv;
+}
+expect {
+    1
+    2
+    3
+}
+
+test matview-count-honors-limit {
+    -- SELECT COUNT(*) must return min(actual, LIMIT). Catches H16: op_count
+    -- bypassing the matview cursor would return 5 here instead of 3.
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 5), (2, 1), (3, 3), (4, 2), (5, 4);
+
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t ORDER BY 1 LIMIT 3;
+
+    SELECT COUNT(*) FROM mv;
+}
+expect {
+    3
+}
+
+test matview-count-no-limit {
+    -- COUNT(*) on a matview WITHOUT LIMIT still works.
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
+
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t ORDER BY 1;
+
+    SELECT COUNT(*) FROM mv;
+}
+expect {
+    3
+}
+
+test matview-limit-after-insert {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 5), (2, 3);
+
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t ORDER BY 1 LIMIT 2;
+
+    INSERT INTO t VALUES (3, 1);
+
+    SELECT x FROM mv;
+    SELECT COUNT(*) FROM mv;
+}
+expect {
+    1
+    3
+    2
+}
+
+test matview-limit-after-delete {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 1), (2, 2), (3, 3), (4, 4);
+
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t ORDER BY 1 LIMIT 3;
+
+    DELETE FROM t WHERE id = 1;
+
+    SELECT x FROM mv;
+}
+expect {
+    2
+    3
+    4
+}
+
+test matview-limit-without-order-by-rejected {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 1);
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t LIMIT 5;
+}
+expect error {
+    LIMIT without ORDER BY
+}
+
+test matview-limit-offset-rejected {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 1);
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t ORDER BY 1 LIMIT 1 OFFSET 1;
+}
+expect error {
+    OFFSET
+}
+
+test matview-limit-negative-other-than-minus-one-rejected {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 1);
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t ORDER BY 1 LIMIT -2;
+}
+expect error {
+    LIMIT must be non-negative
+}

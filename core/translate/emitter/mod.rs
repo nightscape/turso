@@ -1422,6 +1422,20 @@ fn emit_cdc_insns_v1(
             .skip_statement_change_count(),
         table_name: "".to_string(),
     });
+
+    let change_type_i8 = match operation_mode {
+        OperationMode::INSERT => 1i8,
+        OperationMode::UPDATE { .. } | OperationMode::SELECT => 0i8,
+        OperationMode::DELETE => -1i8,
+    };
+    program.emit_insn(Insn::NotifyCdcChange {
+        table_name_reg: turso_cdc_registers + 3,
+        change_type: change_type_i8,
+        rowid_reg: turso_cdc_registers + 4,
+        before_record_reg: before_record_reg.unwrap_or(0),
+        after_record_reg: after_record_reg.unwrap_or(0),
+    });
+
     Ok(())
 }
 

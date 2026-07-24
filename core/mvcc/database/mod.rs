@@ -8278,6 +8278,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
         let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
         let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
+        let mut deferred_foreign_tables: Vec<(String, String)> = Vec::new();
         let syms = connection.syms.read();
         let mv_store = connection.db.get_mv_store().clone();
 
@@ -8356,14 +8357,24 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 &mut materialized_view_info,
                 &attached_resolver,
                 connection.dialect().as_ref(),
+                &mut deferred_foreign_tables,
             )?;
         }
+        let known_matview_names: HashSet<String> = materialized_view_info
+            .keys()
+            .map(|n| crate::util::normalize_ident(n))
+            .collect();
         fresh.populate_indices(
             &syms,
             from_sql_indexes,
             automatic_indices,
             mv_store.is_some(),
+            &known_matview_names,
         )?;
+        // Foreign tables before matviews — matviews may reference foreign tables
+        for (name, sql) in deferred_foreign_tables {
+            fresh.populate_foreign_table(&name, &sql, &syms)?;
+        }
         fresh.populate_materialized_views(
             materialized_view_info,
             dbsp_state_roots,
@@ -9230,6 +9241,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
         let mut dbsp_state_index_roots: HashMap<String, i64> = HashMap::default();
         let mut materialized_view_info: HashMap<String, (String, i64)> = HashMap::default();
+        let mut deferred_foreign_tables: Vec<(String, String)> = Vec::new();
         let syms = connection.syms.read();
         let mv_store = connection.db.get_mv_store().clone();
 
@@ -9308,14 +9320,24 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 &mut materialized_view_info,
                 &attached_resolver,
                 connection.dialect().as_ref(),
+                &mut deferred_foreign_tables,
             )?;
         }
+        let known_matview_names: HashSet<String> = materialized_view_info
+            .keys()
+            .map(|n| crate::util::normalize_ident(n))
+            .collect();
         fresh.populate_indices(
             &syms,
             from_sql_indexes,
             automatic_indices,
             mv_store.is_some(),
+            &known_matview_names,
         )?;
+        // Foreign tables before matviews — matviews may reference foreign tables
+        for (name, sql) in deferred_foreign_tables {
+            fresh.populate_foreign_table(&name, &sql, &syms)?;
+        }
         fresh.populate_materialized_views(
             materialized_view_info,
             dbsp_state_roots,

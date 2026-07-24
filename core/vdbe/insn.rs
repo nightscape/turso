@@ -1994,6 +1994,22 @@ pub enum Insn {
         version: crate::CdcVersion,
         cdc_mode: String,
     },
+
+    /// Notify registered change callbacks about a CDC change.
+    /// This fires callbacks for table changes when CDC is enabled.
+    /// The callbacks receive a RelationChangeEvent with the change details.
+    NotifyCdcChange {
+        /// Register containing the table name (as Text)
+        table_name_reg: usize,
+        /// The type of change: 1 = INSERT, 0 = UPDATE, -1 = DELETE
+        change_type: i8,
+        /// Register containing the row ID
+        rowid_reg: usize,
+        /// Register containing the before record (blob), or 0 if none
+        before_record_reg: usize,
+        /// Register containing the after record (blob), or 0 if none
+        after_record_reg: usize,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2227,6 +2243,7 @@ impl InsnVariants {
             InsnVariants::HashGraceAdvancePartition => execute::op_hash_grace_advance_partition,
             InsnVariants::VacuumInto => execute::op_vacuum_into,
             InsnVariants::Vacuum => execute::op_vacuum,
+            InsnVariants::NotifyCdcChange => execute::op_notify_cdc_change,
             InsnVariants::InitCdcVersion => execute::op_init_cdc_version,
         }
     }

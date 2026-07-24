@@ -15,9 +15,9 @@ static= [ "turso_ext/static" ]
 
 [dependencies]
 env_logger = { workspace = true }
-lazy_static = "1.5.0"
 turso_ext = { workspace = true, features = ["static", "vfs"] }
 log = "0.4.26"
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 mimalloc = { version = "0.1", default-features = false }

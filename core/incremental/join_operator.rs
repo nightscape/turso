@@ -12,6 +12,7 @@ use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::types::{IOResult, ImmutableRecord, ImmutableRecordRef, SeekKey, SeekOp, SeekResult};
 use crate::{return_and_restore_if_io, return_if_io, Result, Value};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum JoinType {
@@ -22,13 +23,24 @@ pub enum JoinType {
     Cross,
 }
 
-// Helper function to read the next row from the BTree for joins
-fn read_next_join_row(
+// Helper function to read the next row from the BTree for joins.
+//
+// Public so sibling operators (e.g. AntijoinOperator for LEFT JOIN
+// support) can iterate the same persisted state without duplicating the
+// I/O state machine. The TryAdvance handling below is load-bearing —
+// see MEMORY.md "IVM JoinOperator TryAdvance Seek Bug".
+pub fn read_next_join_row(
     storage_id: i64,
     join_key: &HashableRow,
     last_element_hash: Option<Hash128>,
     cursors: &mut DbspStateCursors,
 ) -> Result<IOResult<Option<(Hash128, HashableRow, isize)>>> {
+    // For one-shot queries without persistent storage, the btree root page is 0
+    // In this case, there's no stored state to join against - return None
+    if cursors.index_cursor.root_page() == 0 {
+        return Ok(IOResult::Done(None));
+    }
+
     // Build the index key: (storage_id, zset_id, element_id)
     // zset_id is the hash of the join key
     let zset_hash = join_key.cached_hash();
@@ -60,7 +72,18 @@ fn read_next_join_row(
         .index_cursor
         .seek(SeekKey::IndexKey(index_record.as_record_ref()), seek_op));
 
-    if !matches!(seek_result, SeekResult::Found) {
+    let found = match seek_result {
+        SeekResult::Found => true,
+        SeekResult::NotFound => false,
+        SeekResult::TryAdvance => {
+            // Cursor is at the leaf page boundary — the entry may be on the next page.
+            // Advance the cursor and check if it has a record.
+            return_if_io!(cursors.index_cursor.next());
+            cursors.index_cursor.has_record()
+        }
+    };
+
+    if !found {
         return Ok(IOResult::Done(None));
     }
 
@@ -173,15 +196,14 @@ impl JoinEvalState {
         output: &mut Delta,
     ) {
         // Combine the rows
-        let mut combined_values = left_row.values.clone();
-        combined_values.extend(right_row.values.clone());
+        let mut combined_values = left_row.values.to_vec();
+        combined_values.extend_from_slice(&right_row.values);
+        let combined_weight = left_weight * right_weight;
         // Use hash of combined values as synthetic rowid
+        let combined_values: super::dbsp::RowValues = combined_values.into();
         let temp_row = HashableRow::new(0, combined_values.clone());
         let joined_rowid = temp_row.cached_hash().as_i64();
         let joined_row = HashableRow::new(joined_rowid, combined_values);
-
-        // Add to output with combined weight
-        let combined_weight = left_weight * right_weight;
         output.changes.push((joined_row, combined_weight as isize));
     }
 
@@ -278,7 +300,7 @@ impl JoinEvalState {
                             .iter()
                             .map(|&idx| right_row.values.get(idx).cloned().unwrap_or(Value::Null))
                             .collect();
-                        let right_key = HashableRow::new(0, key_values);
+                        let right_key = HashableRow::new(0, key_values.clone());
 
                         let next_row = return_if_io!(read_next_join_row(
                             left_storage_id,
@@ -375,29 +397,43 @@ impl JoinOperator {
         left_columns: Vec<String>,
         right_columns: Vec<String>,
     ) -> Result<Self> {
-        // Check for unsupported join types
+        // Check for unsupported join types.
+        //
+        // Note: LEFT JOIN is no longer rejected here. The compiler dispatches
+        // LEFT JOIN to a 3-operator subgraph (this operator with JoinType::Inner
+        // for matched rows + AntijoinOperator for null-padded unmatched +
+        // MergeOperator UNION ALL'ing them). RIGHT/FULL/CROSS remain rejected
+        // until they get their own implementations (RIGHT can be expressed as
+        // input-swapped LEFT; FULL needs a second antijoin on the L side;
+        // CROSS is no-condition inner join).
         match join_type {
-            JoinType::Left => {
-                return Err(crate::LimboError::ParseError(
-                    "LEFT OUTER JOIN is not yet supported in incremental views".to_string(),
-                ))
-            }
             JoinType::Right => {
                 return Err(crate::LimboError::ParseError(
                     "RIGHT OUTER JOIN is not yet supported in incremental views".to_string(),
-                ))
+                ));
             }
             JoinType::Full => {
                 return Err(crate::LimboError::ParseError(
                     "FULL OUTER JOIN is not yet supported in incremental views".to_string(),
-                ))
+                ));
             }
             JoinType::Cross => {
                 return Err(crate::LimboError::ParseError(
                     "CROSS JOIN is not yet supported in incremental views".to_string(),
-                ))
+                ));
             }
-            JoinType::Inner => {} // Inner join is supported
+            JoinType::Inner => {}
+            JoinType::Left => {
+                // The LEFT JOIN compiler arm constructs `JoinOperator::new` with
+                // JoinType::Inner, never JoinType::Left. If we ever land here it's
+                // a programming error (caller should have routed through the 3-op
+                // subgraph). Panic rather than silently producing inner-only output.
+                return Err(crate::LimboError::InternalError(
+                    "JoinOperator::new called with JoinType::Left — caller must use \
+                     the 3-operator LEFT JOIN subgraph (Inner + Antijoin + Merge)"
+                        .to_string(),
+                ));
+            }
         }
 
         let result = Self {
@@ -491,34 +527,49 @@ impl JoinOperator {
                     let mut output = Delta::new();
 
                     // Component 3: δR ⋈ δS (left delta join right delta)
+                    // Hash join: build hash table on right delta, probe with left delta.
+                    let mut right_by_key: HashMap<Hash128, Vec<usize>> = HashMap::new();
+                    for (idx, (right_row, _)) in deltas.right.changes.iter().enumerate() {
+                        let right_key =
+                            self.extract_join_key(&right_row.values, &self.right_key_indices);
+                        if right_key.values.iter().any(|v| matches!(v, Value::Null)) {
+                            continue; // NULL never matches in SQL
+                        }
+                        right_by_key
+                            .entry(right_key.cached_hash())
+                            .or_default()
+                            .push(idx);
+                    }
+
                     for (left_row, left_weight) in &deltas.left.changes {
                         let left_key =
                             self.extract_join_key(&left_row.values, &self.left_key_indices);
+                        if left_key.values.iter().any(|v| matches!(v, Value::Null)) {
+                            continue;
+                        }
 
-                        for (right_row, right_weight) in &deltas.right.changes {
-                            let right_key =
-                                self.extract_join_key(&right_row.values, &self.right_key_indices);
+                        if let Some(right_indices) = right_by_key.get(&left_key.cached_hash()) {
+                            for &ri in right_indices {
+                                let (right_row, right_weight) = &deltas.right.changes[ri];
+                                let right_key = self
+                                    .extract_join_key(&right_row.values, &self.right_key_indices);
 
-                            if Self::sql_keys_equal(&left_key, &right_key) {
+                                // Verify match (hash collision guard)
+                                if !Self::sql_keys_equal(&left_key, &right_key) {
+                                    continue;
+                                }
+
                                 if let Some(tracker) = &self.tracker {
                                     tracker.lock().record_join_lookup();
                                 }
 
-                                // Combine the rows
-                                let mut combined_values = left_row.values.clone();
-                                combined_values.extend(right_row.values.clone());
-
-                                // Create the joined row with a unique rowid
-                                // Use hash of the combined values to ensure uniqueness
-                                // Use hash of combined values as synthetic rowid
-                                let temp_row = HashableRow::new(0, combined_values.clone());
-                                let joined_rowid = temp_row.cached_hash().as_i64();
-                                let joined_row =
-                                    HashableRow::new(joined_rowid, combined_values.clone());
-
-                                // Add to output with combined weight
-                                let combined_weight = left_weight * right_weight;
-                                output.changes.push((joined_row, combined_weight));
+                                JoinEvalState::combine_rows(
+                                    left_row,
+                                    (*left_weight) as i64,
+                                    right_row,
+                                    (*right_weight) as i64,
+                                    &mut output,
+                                );
                             }
                         }
                     }
@@ -538,6 +589,9 @@ impl JoinOperator {
                 }
                 EvalState::Aggregate(_) => {
                     panic!("Aggregate state should not appear in join operator");
+                }
+                EvalState::Antijoin(_) => {
+                    panic!("Antijoin state should not appear in join operator");
                 }
             }
         }
@@ -560,7 +614,7 @@ fn deserialize_hashable_row(blob: &[u8]) -> Result<HashableRow> {
         _ => {
             return Err(crate::LimboError::InternalError(
                 "First value must be rowid (integer)".to_string(),
-            ))
+            ));
         }
     };
 
@@ -598,10 +652,62 @@ impl IncrementalOperator for JoinOperator {
         deltas: DeltaPair,
         cursors: &mut DbspStateCursors,
     ) -> Result<IOResult<Delta>> {
+        // Consolidate before applying to persistent state. An upstream
+        // operator (e.g. a LEFT JOIN's merge feeding this join in a chained
+        // LEFT JOIN) can emit an unconsolidated delta containing both -1 and
+        // +1 for the SAME row (e.g. base-row update + junction insert in one
+        // transaction: L_state x dR yields +(old,x) while dL x dR yields
+        // -(old,x)). WriteRow treats a retraction of a non-existent row as a
+        // no-op, so applying [-r, +r] row-by-row nets a spurious +1 ghost in
+        // the join state, which later surfaces as a duplicate aggregated row.
+        // Antijoin/MatchCounter/Aggregate already consolidate in commit; the
+        // join operator must too. See test_ivm_left_join_aggregate_duplicate.
+        let mut deltas = deltas;
+        deltas.left.consolidate();
+        deltas.right.consolidate();
+        tracing::debug!(
+            "[JoinOperator::commit] Starting commit, left_changes={}, right_changes={}",
+            deltas.left.changes.len(),
+            deltas.right.changes.len()
+        );
         loop {
+            let state_name = match &self.commit_state {
+                JoinCommitState::Idle => "Idle",
+                JoinCommitState::Eval { .. } => "Eval",
+                JoinCommitState::CommitLeftDelta {
+                    current_idx,
+                    deltas,
+                    ..
+                } => {
+                    tracing::trace!(
+                        "[JoinOperator::commit] CommitLeftDelta: idx={}/{}",
+                        current_idx,
+                        deltas.left.changes.len()
+                    );
+                    "CommitLeftDelta"
+                }
+                JoinCommitState::CommitRightDelta {
+                    current_idx,
+                    deltas,
+                    ..
+                } => {
+                    tracing::trace!(
+                        "[JoinOperator::commit] CommitRightDelta: idx={}/{}",
+                        current_idx,
+                        deltas.right.changes.len()
+                    );
+                    "CommitRightDelta"
+                }
+                JoinCommitState::Invalid => "Invalid",
+            };
+            tracing::trace!("[JoinOperator::commit] Current state: {}", state_name);
+
+            // Capture state name BEFORE replace for error reporting
+            let previous_state_name = state_name;
             let mut state = std::mem::replace(&mut self.commit_state, JoinCommitState::Invalid);
             match &mut state {
                 JoinCommitState::Idle => {
+                    tracing::trace!("[JoinOperator::commit] Idle -> Eval");
                     self.commit_state = JoinCommitState::Eval {
                         eval_state: deltas.clone().into(),
                     }
@@ -636,11 +742,8 @@ impl IncrementalOperator for JoinOperator {
                     }
 
                     let (row, weight) = &deltas.left.changes[*current_idx];
-                    // Extract join key from the left row
                     let join_key = self.extract_join_key(&row.values, &self.left_key_indices);
 
-                    // The index key: (storage_id, zset_id, element_id)
-                    // zset_id is the hash of the join key, element_id is hash of the row
                     let storage_id = self.left_storage_id();
                     let zset_hash = join_key.cached_hash();
                     let element_hash = row.cached_hash();
@@ -650,7 +753,6 @@ impl IncrementalOperator for JoinOperator {
                         element_hash.to_value()?,
                     ];
 
-                    // The record values: we'll store the serialized row as a blob
                     let row_blob = serialize_hashable_row(row)?;
                     let record_values = vec![
                         Value::from_i64(self.left_storage_id()),
@@ -659,7 +761,7 @@ impl IncrementalOperator for JoinOperator {
                         Value::Blob(row_blob),
                     ];
 
-                    // Use return_and_restore_if_io to handle I/O properly
+                    let next_idx = *current_idx + 1;
                     return_and_restore_if_io!(
                         &mut self.commit_state,
                         state,
@@ -667,9 +769,9 @@ impl IncrementalOperator for JoinOperator {
                     );
 
                     self.commit_state = JoinCommitState::CommitLeftDelta {
-                        deltas: deltas.clone(),
-                        output: output.clone(),
-                        current_idx: *current_idx + 1,
+                        deltas: std::mem::take(deltas),
+                        output: std::mem::take(output),
+                        current_idx: next_idx,
                         write_row: WriteRow::new(),
                     };
                 }
@@ -680,16 +782,13 @@ impl IncrementalOperator for JoinOperator {
                     ref mut write_row,
                 } => {
                     if *current_idx >= deltas.right.changes.len() {
-                        // Reset to Idle state for next commit
                         self.commit_state = JoinCommitState::Idle;
-                        return Ok(IOResult::Done(output.clone()));
+                        return Ok(IOResult::Done(std::mem::take(output)));
                     }
 
                     let (row, weight) = &deltas.right.changes[*current_idx];
-                    // Extract join key from the right row
                     let join_key = self.extract_join_key(&row.values, &self.right_key_indices);
 
-                    // The index key: (storage_id, zset_id, element_id)
                     let zset_hash = join_key.cached_hash();
                     let element_hash = row.cached_hash();
                     let index_key = vec![
@@ -698,7 +797,6 @@ impl IncrementalOperator for JoinOperator {
                         element_hash.to_value()?,
                     ];
 
-                    // The record values: we'll store the serialized row as a blob
                     let row_blob = serialize_hashable_row(row)?;
                     let record_values = vec![
                         Value::from_i64(self.right_storage_id()),
@@ -707,7 +805,7 @@ impl IncrementalOperator for JoinOperator {
                         Value::Blob(row_blob),
                     ];
 
-                    // Use return_and_restore_if_io to handle I/O properly
+                    let next_idx = *current_idx + 1;
                     return_and_restore_if_io!(
                         &mut self.commit_state,
                         state,
@@ -717,12 +815,28 @@ impl IncrementalOperator for JoinOperator {
                     self.commit_state = JoinCommitState::CommitRightDelta {
                         deltas: std::mem::take(deltas),
                         output: std::mem::take(output),
-                        current_idx: *current_idx + 1,
+                        current_idx: next_idx,
                         write_row: WriteRow::new(),
                     };
                 }
                 JoinCommitState::Invalid => {
-                    panic!("Invalid join commit state");
+                    // A previous panic (e.g., BTree cursor corruption during chained
+                    // matview cascades) left the state as Invalid via the mem::replace
+                    // sentinel. Recover by resetting to Idle so subsequent IVM updates
+                    // can proceed instead of entering an infinite panic loop.
+                    tracing::warn!(
+                        "[JoinOperator::commit] Recovering from Invalid state \
+                        (previous panic during commit). previous_state={}, \
+                        left_storage_id={}, right_storage_id={}, \
+                        input_deltas: left_changes={}, right_changes={}. \
+                        Resetting to Idle.",
+                        previous_state_name,
+                        self.left_storage_id(),
+                        self.right_storage_id(),
+                        deltas.left.changes.len(),
+                        deltas.right.changes.len()
+                    );
+                    self.commit_state = JoinCommitState::Idle;
                 }
             }
         }
@@ -730,5 +844,13 @@ impl IncrementalOperator for JoinOperator {
 
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
         self.tracker = Some(tracker);
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }

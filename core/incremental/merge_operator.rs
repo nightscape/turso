@@ -1,17 +1,15 @@
 // Merge operator for DBSP - combines two delta streams
 // Used in recursive CTEs and UNION operations
 
-use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
+use crate::incremental::dbsp::{Delta, DeltaPair, Hash128, HashableRow};
 use crate::incremental::operator::{
     ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
 };
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::types::IOResult;
-use crate::Result;
-use std::collections::{hash_map::DefaultHasher, HashMap};
+use crate::{Result, Value};
 use std::fmt::{self, Display};
-use std::hash::{Hash, Hasher};
 
 /// How the merge operator should handle rowids when combining deltas
 #[derive(Debug, Clone)]
@@ -27,15 +25,21 @@ pub enum UnionMode {
 
 /// Merge operator that combines two input deltas into one output delta
 /// Handles both recursive CTEs and UNION/UNION ALL operations
+///
+/// Output rowids MUST be a pure function of the input row (and, for UNION
+/// ALL, its source), never of session history. Merge outputs feed matview
+/// btrees keyed by rowid, and those btrees outlive the process: a
+/// retraction issued after a database reopen must serialize to the exact
+/// rowid persisted before the reopen, or WriteRowView silently no-ops the
+/// delete (leaving a duplicate) or decrements a DIFFERENT row that happens
+/// to occupy the stale sequential rowid (losing it). The previous
+/// implementation assigned rowids from an in-memory `seen_rows` map plus a
+/// `next_rowid` counter, which reset on reopen and caused exactly that
+/// corruption (holon BugFunnel row 90).
 #[derive(Debug)]
 pub struct MergeOperator {
     operator_id: i64,
     union_mode: UnionMode,
-    /// For UNION: tracks seen value hashes with their assigned rowids
-    /// For UNION ALL: tracks (source_id, original_rowid) -> assigned_rowid mappings
-    seen_rows: HashMap<u64, i64>, // hash -> assigned_rowid
-    /// Next rowid to assign for new rows
-    next_rowid: i64,
 }
 
 impl MergeOperator {
@@ -44,36 +48,27 @@ impl MergeOperator {
         Self {
             operator_id,
             union_mode: mode,
-            seen_rows: HashMap::default(),
-            next_rowid: 1,
         }
     }
 
-    /// Transform a delta's rowids based on the union mode with state tracking
+    /// Transform a delta's rowids based on the union mode.
+    ///
+    /// Rowid derivation is stateless and deterministic (Hash128 is SHA-1
+    /// based, byte-stable across processes):
+    /// - UNION (distinct): rowid = hash of the row VALUES, so identical
+    ///   rows from either side collapse onto one rowid.
+    /// - UNION ALL: rowid = hash of (source table tag, original rowid), so
+    ///   equal rows from different sources (or distinct rows of one
+    ///   source) stay separate, while insert/retract pairs for the same
+    ///   source row always meet on the same output rowid.
     fn transform_delta(&mut self, delta: Delta, is_left: bool) -> Delta {
         match &self.union_mode {
             UnionMode::Distinct => {
-                // For UNION distinct, track seen values and deduplicate
                 let mut output = Delta::new();
                 for (row, weight) in delta.changes {
                     // Hash only the values (not rowid) for deduplication
                     let temp_row = HashableRow::new(0, row.values.clone());
-                    let value_hash = temp_row.cached_hash().as_i64() as u64;
-
-                    // Check if we've seen this value before
-                    let assigned_rowid =
-                        if let Some(&existing_rowid) = self.seen_rows.get(&value_hash) {
-                            // Value already seen - use existing rowid
-                            existing_rowid
-                        } else {
-                            // New value - assign new rowid and remember it
-                            let new_rowid = self.next_rowid;
-                            self.next_rowid += 1;
-                            self.seen_rows.insert(value_hash, new_rowid);
-                            new_rowid
-                        };
-
-                    // Output the row with the assigned rowid
+                    let assigned_rowid = temp_row.cached_hash().as_i64();
                     let final_row = HashableRow::new(assigned_rowid, temp_row.values);
                     output.changes.push((final_row, weight));
                 }
@@ -83,34 +78,14 @@ impl MergeOperator {
                 left_table,
                 right_table,
             } => {
-                // For UNION ALL, maintain consistent rowid mapping per source
                 let table = if is_left { left_table } else { right_table };
-                let mut source_hasher = DefaultHasher::new();
-                table.hash(&mut source_hasher);
-                let source_id = source_hasher.finish();
+                let source_tag = Value::from_text(table.clone());
 
                 let mut output = Delta::new();
                 for (row, weight) in delta.changes {
-                    // Create a unique key for this (source, rowid) pair
-                    let mut key_hasher = DefaultHasher::new();
-                    source_id.hash(&mut key_hasher);
-                    row.rowid.hash(&mut key_hasher);
-                    let key_hash = key_hasher.finish();
-
-                    // Check if we've seen this (source, rowid) before
                     let assigned_rowid =
-                        if let Some(&existing_rowid) = self.seen_rows.get(&key_hash) {
-                            // Use existing rowid for this (source, rowid) pair
-                            existing_rowid
-                        } else {
-                            // New row - assign new rowid
-                            let new_rowid = self.next_rowid;
-                            self.next_rowid += 1;
-                            self.seen_rows.insert(key_hash, new_rowid);
-                            new_rowid
-                        };
-
-                    // Create output row with consistent rowid
+                        Hash128::hash_values(&[source_tag.clone(), Value::from_i64(row.rowid)])
+                            .as_i64();
                     let final_row = HashableRow::new(assigned_rowid, row.values.clone());
                     output.changes.push((final_row, weight));
                 }
@@ -154,7 +129,10 @@ impl IncrementalOperator for MergeOperator {
 
                 Ok(IOResult::Done(output))
             }
-            EvalState::Aggregate(_) | EvalState::Join(_) | EvalState::Uninitialized => {
+            EvalState::Aggregate(_)
+            | EvalState::Join(_)
+            | EvalState::Antijoin(_)
+            | EvalState::Uninitialized => {
                 // Merge operator only handles Init state
                 unreachable!("MergeOperator only handles Init state")
             }
@@ -184,5 +162,13 @@ impl IncrementalOperator for MergeOperator {
 
     fn set_tracker(&mut self, _tracker: Arc<Mutex<ComputationTracker>>) {
         // Merge operator doesn't need tracking for now
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }

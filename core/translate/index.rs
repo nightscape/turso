@@ -143,6 +143,9 @@ pub fn translate_create_index(
     let Some(table) = table else {
         crate::bail_parse_error!("Error: table '{tbl_name}' does not exist.");
     };
+    if resolver.with_schema(database_id, |s| s.is_materialized_view(&tbl_name)) {
+        crate::bail_parse_error!("Error: cannot create index on materialized view '{tbl_name}'.");
+    }
     let Some(tbl) = table.btree() else {
         crate::bail_parse_error!("Error: table '{tbl_name}' is not a b-tree table.");
     };

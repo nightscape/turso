@@ -13,7 +13,7 @@ use crate::{Result, Value};
 use std::cmp::Ordering;
 
 /// Filter predicate for filtering rows
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FilterPredicate {
     /// Column = value (using column index)
     Equals { column_idx: usize, value: Value },
@@ -61,6 +61,14 @@ pub struct FilterOperator {
     tracker: Option<Arc<Mutex<ComputationTracker>>>,
 }
 
+/// SQL three-valued logic: NULL on either side yields NULL (`None`), which WHERE treats as not-true.
+fn sql_compare(left: &Value, right: &Value) -> Option<Ordering> {
+    if matches!(left, Value::Null) || matches!(right, Value::Null) {
+        return None;
+    }
+    Some(left.cmp(right))
+}
+
 impl FilterOperator {
     pub fn new(predicate: FilterPredicate) -> Self {
         Self {
@@ -75,92 +83,69 @@ impl FilterOperator {
     }
 
     pub fn evaluate_predicate(&self, values: &[Value]) -> bool {
-        match &self.predicate {
+        Self::evaluate_static(&self.predicate, values)
+    }
+
+    /// Evaluate a `FilterPredicate` against a row's values without
+    /// instantiating a `FilterOperator`. Used by `AggregateOperator`'s
+    /// per-row, per-aggregate FILTER gate.
+    pub fn evaluate_static(predicate: &FilterPredicate, values: &[Value]) -> bool {
+        match predicate {
             FilterPredicate::None => true,
             FilterPredicate::Equals { column_idx, value } => {
-                let v = &values[*column_idx];
-                v == value
+                sql_compare(&values[*column_idx], value).is_some_and(|o| o == Ordering::Equal)
             }
             FilterPredicate::NotEquals { column_idx, value } => {
-                let v = &values[*column_idx];
-                v != value
+                sql_compare(&values[*column_idx], value).is_some_and(|o| o != Ordering::Equal)
             }
             FilterPredicate::GreaterThan { column_idx, value } => {
-                let v = &values[*column_idx];
-                v.cmp(value) == Ordering::Greater
+                sql_compare(&values[*column_idx], value).is_some_and(|o| o == Ordering::Greater)
             }
             FilterPredicate::GreaterThanOrEqual { column_idx, value } => {
-                let v = &values[*column_idx];
-                v.cmp(value) != Ordering::Less
+                sql_compare(&values[*column_idx], value).is_some_and(|o| o != Ordering::Less)
             }
             FilterPredicate::LessThan { column_idx, value } => {
-                let v = &values[*column_idx];
-                v.cmp(value) == Ordering::Less
+                sql_compare(&values[*column_idx], value).is_some_and(|o| o == Ordering::Less)
             }
             FilterPredicate::LessThanOrEqual { column_idx, value } => {
-                let v = &values[*column_idx];
-                v.cmp(value) != Ordering::Greater
+                sql_compare(&values[*column_idx], value).is_some_and(|o| o != Ordering::Greater)
             }
             FilterPredicate::And(left, right) => {
-                // Temporarily create sub-filters to evaluate
-                let left_filter = FilterOperator::new((**left).clone());
-                let right_filter = FilterOperator::new((**right).clone());
-                left_filter.evaluate_predicate(values) && right_filter.evaluate_predicate(values)
+                Self::evaluate_static(left, values) && Self::evaluate_static(right, values)
             }
             FilterPredicate::Or(left, right) => {
-                let left_filter = FilterOperator::new((**left).clone());
-                let right_filter = FilterOperator::new((**right).clone());
-                left_filter.evaluate_predicate(values) || right_filter.evaluate_predicate(values)
+                Self::evaluate_static(left, values) || Self::evaluate_static(right, values)
             }
-
             FilterPredicate::ColumnEquals {
                 left_idx,
                 right_idx,
-            } => {
-                let left = &values[*left_idx];
-                let right = &values[*right_idx];
-                left == right
-            }
+            } => sql_compare(&values[*left_idx], &values[*right_idx])
+                .is_some_and(|o| o == Ordering::Equal),
             FilterPredicate::ColumnNotEquals {
                 left_idx,
                 right_idx,
-            } => {
-                let left = &values[*left_idx];
-                let right = &values[*right_idx];
-                left != right
-            }
+            } => sql_compare(&values[*left_idx], &values[*right_idx])
+                .is_some_and(|o| o != Ordering::Equal),
             FilterPredicate::ColumnGreaterThan {
                 left_idx,
                 right_idx,
-            } => {
-                let left = &values[*left_idx];
-                let right = &values[*right_idx];
-                left.cmp(right) == Ordering::Greater
-            }
+            } => sql_compare(&values[*left_idx], &values[*right_idx])
+                .is_some_and(|o| o == Ordering::Greater),
             FilterPredicate::ColumnGreaterThanOrEqual {
                 left_idx,
                 right_idx,
-            } => {
-                let left = &values[*left_idx];
-                let right = &values[*right_idx];
-                left.cmp(right) != Ordering::Less
-            }
+            } => sql_compare(&values[*left_idx], &values[*right_idx])
+                .is_some_and(|o| o != Ordering::Less),
             FilterPredicate::ColumnLessThan {
                 left_idx,
                 right_idx,
-            } => {
-                let left = &values[*left_idx];
-                let right = &values[*right_idx];
-                left.cmp(right) == Ordering::Less
-            }
+            } => sql_compare(&values[*left_idx], &values[*right_idx])
+                .is_some_and(|o| o == Ordering::Less),
             FilterPredicate::ColumnLessThanOrEqual {
                 left_idx,
                 right_idx,
-            } => {
-                let left = &values[*left_idx];
-                let right = &values[*right_idx];
-                left.cmp(right) != Ordering::Greater
-            }
+            } => sql_compare(&values[*left_idx], &values[*right_idx])
+                .is_some_and(|o| o != Ordering::Greater),
             FilterPredicate::IsNull { column_idx } => {
                 matches!(values[*column_idx], Value::Null)
             }
@@ -244,6 +229,14 @@ impl IncrementalOperator for FilterOperator {
 
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
         self.tracker = Some(tracker);
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 

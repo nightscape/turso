@@ -44,6 +44,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 hex = "0.4.3"
 twox-hash = { version = "2.1.1", optional = true }
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [features]
 checksum = ["turso_core/checksum", "twox-hash"]

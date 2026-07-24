@@ -16,21 +16,21 @@ use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
 use crate::{bail_parse_error, Connection, Result, MAIN_DB_ID};
 use turso_parser::ast;
 
+/// Returns Ok(true) if the view already exists and IF NOT EXISTS was specified — the caller
+/// should emit only the program epilogue and skip building the view.
 fn validate_materialized(
     connection: &Arc<crate::Connection>,
     database_id: usize,
     resolver: &Resolver,
     normalized_view_name: &str,
-) -> Result<()> {
-    // Check if experimental views are enabled
+    if_not_exists: bool,
+) -> Result<bool> {
     if !connection.experimental_views_enabled() {
         return Err(crate::LimboError::ParseError(
             "CREATE MATERIALIZED VIEW is an experimental feature. Enable with --experimental-views flag"
                 .to_string(),
         ));
     }
-    // The DBSP incremental maintenance runtime (populate_from_table, etc.) assumes
-    // the main database pager/schema. Block attached databases until that is fixed.
     if database_id != crate::MAIN_DB_ID {
         crate::bail_parse_error!("materialized views are not supported on attached databases");
     }
@@ -47,11 +47,14 @@ fn validate_materialized(
         s.get_materialized_view(normalized_view_name).is_some()
             || s.broken_views.contains(normalized_view_name)
     }) {
+        if if_not_exists {
+            return Ok(true);
+        }
         return Err(crate::LimboError::ParseError(format!(
             "View {normalized_view_name} already exists"
         )));
     }
-    Ok(())
+    Ok(false)
 }
 
 pub fn translate_create_materialized_view(
@@ -80,7 +83,16 @@ pub fn translate_create_materialized_view(
     // Validate the view can be created and extract its columns
     // This validation happens before updating sqlite_master to prevent
     // storing invalid view definitions
-    validate_materialized(&connection, database_id, resolver, &normalized_view_name)?;
+    if validate_materialized(
+        &connection,
+        database_id,
+        resolver,
+        &normalized_view_name,
+        if_not_exists,
+    )? {
+        program.epilogue(resolver.schema());
+        return Ok(());
+    }
 
     // Check for cross-database table references first
     crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
@@ -93,14 +105,21 @@ pub fn translate_create_materialized_view(
     // Reconstruct the SQL string for storage
     let sql = create_materialized_view_to_str(&view_name.name.as_ident(), select_stmt);
 
-    // Create a btree for storing the materialized view state
-    // This btree will hold the materialized rows (row_id -> values)
+    // Create a btree for storing the materialized view state.
+    // For ORDER BY views we use an index btree (composite-keyed by sort columns
+    // + rowid), so reads naturally walk in sort order; otherwise a table btree
+    // keyed by rowid.
     let view_root_reg = program.alloc_register();
 
+    let view_btree_flags = if !select_stmt.order_by.is_empty() {
+        CreateBTreeFlags::new_index()
+    } else {
+        CreateBTreeFlags::new_table()
+    };
     program.emit_insn(Insn::CreateBtree {
         db: database_id,
         root: view_root_reg,
-        flags: CreateBTreeFlags::new_table(),
+        flags: view_btree_flags,
     });
 
     // Create a second btree for DBSP operator state (e.g., aggregate state)
@@ -188,10 +207,194 @@ pub fn translate_create_materialized_view(
 
     // Add the DBSP state table to sqlite_master (required for materialized views)
     // Include the version number in the table name
-    let dbsp_table_name = ast::Name::exact(format!(
-        "{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}"
-    ));
+    let dbsp_table_name_str =
+        format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}");
+    let dbsp_table_name = ast::Name::exact(dbsp_table_name_str.clone());
     let dbsp_table_ident = dbsp_table_name.as_ident();
+
+    // Always emit cleanup code for DBSP state table (if it exists)
+    // We can't rely on resolver.schema during translation because it might be stale
+    // Instead, we check sqlite_schema during execution and clean up if needed
+    tracing::debug!(
+        "translate_create_materialized_view: Emitting cleanup code for DBSP table: {}",
+        dbsp_table_name_str
+    );
+
+    // Try to get table info from in-memory schema for btree root (if available)
+    // But we'll still emit runtime cleanup code regardless
+    let maybe_existing_dbsp_table = resolver.schema().get_table(&dbsp_table_name_str);
+
+    if maybe_existing_dbsp_table.is_some() {
+        tracing::warn!(
+            "translate_create_materialized_view: Found existing DBSP table {} in in-memory schema, will clean up",
+            dbsp_table_name_str
+        );
+    } else {
+        tracing::debug!(
+            "translate_create_materialized_view: DBSP table {} not in in-memory schema, but will check sqlite_schema at runtime",
+            dbsp_table_name_str
+        );
+    }
+
+    // Emit cleanup code that checks sqlite_schema at runtime
+    // This handles cases where the in-memory schema is stale
+
+    // If we have btree info from in-memory schema, destroy btrees first
+    // (This is optional - the sqlite_schema cleanup below will handle it if btree info is stale)
+    if let Some(existing_dbsp_table) = maybe_existing_dbsp_table {
+        // Destroy the DBSP table btree if it exists
+        if let Some(btree_table) = existing_dbsp_table.btree() {
+            program.emit_insn(Insn::Destroy {
+                db: 0,
+                root: btree_table.root_page,
+                former_root_reg: 0, // No autovacuum
+                is_temp: 0,
+            });
+        }
+
+        // Destroy DBSP indexes
+        let dbsp_indexes: Vec<_> = resolver
+            .schema()
+            .get_indices(&dbsp_table_name_str)
+            .collect();
+        for index in dbsp_indexes {
+            program.emit_insn(Insn::Destroy {
+                db: 0,
+                root: index.root_page,
+                former_root_reg: 0, // No autovacuum
+                is_temp: 0,
+            });
+        }
+    }
+
+    // Always emit cleanup code that checks sqlite_schema at runtime
+    // This ensures we clean up even if in-memory schema is stale
+    // Delete DBSP table and index entries from sqlite_schema
+    // We need to iterate through sqlite_schema and delete matching entries
+    let dbsp_table_name_reg = program.alloc_register();
+    program.emit_insn(Insn::String8 {
+        dest: dbsp_table_name_reg,
+        value: dbsp_table_name_str.clone(),
+    });
+    let dbsp_index_name_prefix = format!(
+        "{}{}_1",
+        PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX, &dbsp_table_name_str
+    );
+    let dbsp_index_name_reg = program.alloc_register();
+    program.emit_insn(Insn::String8 {
+        dest: dbsp_index_name_reg,
+        value: dbsp_index_name_prefix.clone(),
+    });
+    let table_type_reg = program.alloc_register();
+    program.emit_insn(Insn::String8 {
+        dest: table_type_reg,
+        value: "table".to_string(),
+    });
+    let index_type_reg = program.alloc_register();
+    program.emit_insn(Insn::String8 {
+        dest: index_type_reg,
+        value: "index".to_string(),
+    });
+
+    let dbsp_cleanup_end_label = program.allocate_label();
+    let dbsp_cleanup_loop_label = program.allocate_label();
+    let dbsp_rowid_reg = program.alloc_register();
+    let dbsp_col0_reg = program.alloc_register();
+    let dbsp_col1_reg = program.alloc_register();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_empty: dbsp_cleanup_end_label,
+    });
+    program.preassign_label_to_next_insn(dbsp_cleanup_loop_label);
+
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 0, dbsp_col0_reg);
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 1, dbsp_col1_reg);
+
+    let dbsp_skip_delete_label = program.allocate_label();
+    let dbsp_check_index_label = program.allocate_label();
+
+    // Check if this is the DBSP table entry
+    program.emit_insn(Insn::Ne {
+        lhs: dbsp_col0_reg,
+        rhs: table_type_reg,
+        target_pc: dbsp_check_index_label,
+        flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
+    });
+    program.emit_insn(Insn::Ne {
+        lhs: dbsp_col1_reg,
+        rhs: dbsp_table_name_reg,
+        target_pc: dbsp_check_index_label,
+        flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
+    });
+    // Matches DBSP table - delete it
+    program.emit_insn(Insn::RowId {
+        cursor_id: sqlite_schema_cursor_id,
+        dest: dbsp_rowid_reg,
+    });
+    program.emit_insn(Insn::Delete {
+        cursor_id: sqlite_schema_cursor_id,
+        table_name: "sqlite_schema".to_string(),
+        is_part_of_update: false,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: dbsp_skip_delete_label,
+    });
+
+    // Check if this is the DBSP index entry
+    program.preassign_label_to_next_insn(dbsp_check_index_label);
+    program.emit_insn(Insn::Ne {
+        lhs: dbsp_col0_reg,
+        rhs: index_type_reg,
+        target_pc: dbsp_skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
+    });
+    program.emit_insn(Insn::Ne {
+        lhs: dbsp_col1_reg,
+        rhs: dbsp_index_name_reg,
+        target_pc: dbsp_skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
+    });
+    // Matches DBSP index - delete it
+    program.emit_insn(Insn::RowId {
+        cursor_id: sqlite_schema_cursor_id,
+        dest: dbsp_rowid_reg,
+    });
+    program.emit_insn(Insn::Delete {
+        cursor_id: sqlite_schema_cursor_id,
+        table_name: "sqlite_schema".to_string(),
+        is_part_of_update: false,
+    });
+
+    program.preassign_label_to_next_insn(dbsp_skip_delete_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_next: dbsp_cleanup_loop_label,
+    });
+    program.preassign_label_to_next_insn(dbsp_cleanup_end_label);
+
+    // CRITICAL: Remove the DBSP table from the in-memory schema
+    // ParseSchema only loads entries, it doesn't remove them.
+    // We need DropTable to remove the table from the in-memory schema after
+    // deleting from sqlite_schema.
+    tracing::debug!(
+        "translate_create_materialized_view: Emitting DropTable to remove DBSP table {} from in-memory schema",
+        dbsp_table_name_str
+    );
+    program.emit_insn(Insn::DropTable {
+        db: 0,
+        _p2: 0,
+        _p3: 0,
+        table_name: dbsp_table_name_str.clone(),
+    });
+    tracing::debug!(
+        "translate_create_materialized_view: Emitted cleanup code and DropTable for DBSP table {}",
+        dbsp_table_name_str
+    );
     // The element_id column uses SQLite's dynamic typing system to store different value types:
     // - For hash-based operators (joins, filters): stores INTEGER hash values or rowids
     // - For future MIN/MAX operators: stores the actual values being compared (INTEGER, REAL, TEXT, BLOB)
@@ -207,6 +410,12 @@ pub fn translate_create_materialized_view(
         )"
     );
 
+    // Emit schema entry for DBSP table
+    // The cleanup code above ensures any existing entry is removed before we get here
+    tracing::debug!(
+        "translate_create_materialized_view: Emitting schema entry for DBSP table: {}",
+        dbsp_table_name_str
+    );
     emit_schema_entry(
         program,
         resolver,
@@ -218,6 +427,10 @@ pub fn translate_create_materialized_view(
         dbsp_state_root_reg, // Root for DBSP state table
         Some(dbsp_sql),
     )?;
+    tracing::debug!(
+        "translate_create_materialized_view: Successfully emitted schema entry for DBSP table: {}",
+        dbsp_table_name_str
+    );
 
     // Create automatic primary key index for the DBSP table
     // Since the table has PRIMARY KEY (operator_id, zset_id, element_id), we need an index
@@ -273,6 +486,117 @@ pub fn translate_create_materialized_view(
 
     program.epilogue(resolver.schema());
     Ok(())
+}
+
+pub fn translate_refresh_materialized_view(
+    view_name: &ast::QualifiedName,
+    resolver: &Resolver,
+    connection: Arc<Connection>,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    if !connection.experimental_views_enabled() {
+        return Err(crate::LimboError::ParseError(
+            "REFRESH MATERIALIZED VIEW is an experimental feature. Enable with --experimental-views flag"
+                .to_string(),
+        ));
+    }
+
+    let database_id = resolver.resolve_database_id(view_name)?;
+    let normalized_view_name = normalize_ident(view_name.name.as_str());
+
+    // Verify the matview exists
+    let table = resolver
+        .with_schema(database_id, |s| s.get_table(&normalized_view_name))
+        .ok_or_else(|| {
+            crate::LimboError::ParseError(format!(
+                "no such materialized view: {normalized_view_name}"
+            ))
+        })?;
+    let btree_table = table.btree().ok_or_else(|| {
+        crate::LimboError::ParseError(format!("{normalized_view_name} is not a materialized view"))
+    })?;
+
+    if !resolver.with_schema(database_id, |s| {
+        s.is_materialized_view(&normalized_view_name)
+    }) {
+        return Err(crate::LimboError::ParseError(format!(
+            "{normalized_view_name} is not a materialized view"
+        )));
+    }
+
+    // Open the matview's btree cursor.
+    //
+    // For ORDER BY views the underlying btree is leaf-index, so the cursor
+    // must be allocated as a MaterializedView cursor (which routes through
+    // OpOpenRead's view-aware branch and picks the right BTreeCursor type
+    // based on `view.has_order_by()`). For plain matviews we use a table
+    // cursor directly.
+    let root_page = btree_table.root_page;
+    let mv = resolver.with_schema(database_id, |s| {
+        s.get_materialized_view(&normalized_view_name)
+    });
+    let view_cursor_id = if let Some(view_arc) = mv {
+        program.alloc_cursor_id(CursorType::MaterializedView(btree_table, view_arc))
+    } else {
+        program.alloc_cursor_id(CursorType::BTreeTable(btree_table))
+    };
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: view_cursor_id,
+        root_page: root_page.into(),
+        db: database_id,
+    });
+
+    // Clear matview data
+    emit_clear_btree(program, view_cursor_id, &normalized_view_name);
+
+    // Clear DBSP operator state
+    use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+    let dbsp_table_name =
+        format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{normalized_view_name}");
+    if let Some(dbsp_table) =
+        resolver.with_schema(database_id, |s| s.get_btree_table(&dbsp_table_name))
+    {
+        let dbsp_root_page = dbsp_table.root_page;
+        let dbsp_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(dbsp_table));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: dbsp_cursor_id,
+            root_page: dbsp_root_page.into(),
+            db: database_id,
+        });
+        emit_clear_btree(program, dbsp_cursor_id, &dbsp_table_name);
+    }
+
+    // Repopulate
+    let cursor_info = vec![(normalized_view_name, view_cursor_id)];
+    program.emit_insn(Insn::PopulateMaterializedViews {
+        cursors: cursor_info,
+    });
+
+    program.epilogue(resolver.schema());
+    Ok(())
+}
+
+fn emit_clear_btree(program: &mut ProgramBuilder, cursor_id: usize, table_name: &str) {
+    let clear_loop_label = program.allocate_label();
+    let clear_done_label = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id,
+        pc_if_empty: clear_done_label,
+    });
+
+    program.preassign_label_to_next_insn(clear_loop_label);
+    program.emit_insn(Insn::Delete {
+        cursor_id,
+        table_name: table_name.to_string(),
+        is_part_of_update: false,
+    });
+    program.emit_insn(Insn::Next {
+        cursor_id,
+        pc_if_next: clear_loop_label,
+    });
+
+    program.preassign_label_to_next_insn(clear_done_label);
 }
 
 fn create_materialized_view_to_str(view_name: &str, select_stmt: &ast::Select) -> String {

@@ -19,6 +19,10 @@ use std::fmt::{self, Display, Formatter};
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast;
 
+/// Default maximum iterations for recursive CTEs.
+/// This prevents infinite loops in queries that don't converge.
+pub const DEFAULT_RECURSIVE_MAX_ITERATIONS: usize = 100;
+
 /// Result type for preprocessing aggregate expressions
 type PreprocessAggregateResult = (
     bool,             // needs_pre_projection
@@ -132,6 +136,10 @@ pub enum LogicalPlan {
     WithCTE(WithCTE),
     /// Reference to a CTE
     CTERef(CTERef),
+    /// Recursive CTE with fixed-point semantics
+    RecursiveCTE(RecursiveCTE),
+    /// Reference to a recursive CTE (used in the recursive step)
+    RecursiveCTERef(RecursiveCTERef),
 }
 
 impl LogicalPlan {
@@ -151,7 +159,219 @@ impl LogicalPlan {
             LogicalPlan::Values(v) => &v.schema,
             LogicalPlan::WithCTE(w) => w.body.schema(),
             LogicalPlan::CTERef(c) => &c.schema,
+            LogicalPlan::RecursiveCTE(r) => &r.schema,
+            LogicalPlan::RecursiveCTERef(r) => &r.schema,
         }
+    }
+
+    /// Inline all CTEs in the logical plan
+    pub fn inline_ctes(&self) -> Result<LogicalPlan> {
+        inline_ctes(self, &HashMap::default())
+    }
+}
+
+/// Helper function that attempts to inline CTEs but returns an error if a referenced CTE is not found.
+/// Used during fixed-point iteration to determine if a CTE can be resolved yet.
+fn try_inline_ctes(
+    plan: &LogicalPlan,
+    cte_map: &HashMap<String, Arc<LogicalPlan>>,
+) -> Result<LogicalPlan> {
+    match plan {
+        LogicalPlan::WithCTE(_with_cte) => {
+            // Nested WITH blocks need to be fully inlined
+            inline_ctes(plan, cte_map)
+        }
+        LogicalPlan::CTERef(cte_ref) => match cte_map.get(&cte_ref.name) {
+            Some(cte_plan) => Ok((**cte_plan).clone()),
+            None => Err(LimboError::ParseError(format!(
+                "CTE '{}' not found in scope",
+                cte_ref.name
+            ))),
+        },
+        LogicalPlan::Projection(proj) => Ok(LogicalPlan::Projection(Projection {
+            input: Arc::new(try_inline_ctes(&proj.input, cte_map)?),
+            exprs: proj.exprs.clone(),
+            schema: proj.schema.clone(),
+        })),
+        LogicalPlan::Filter(filter) => Ok(LogicalPlan::Filter(Filter {
+            input: Arc::new(try_inline_ctes(&filter.input, cte_map)?),
+            predicate: filter.predicate.clone(),
+        })),
+        LogicalPlan::Aggregate(agg) => Ok(LogicalPlan::Aggregate(Aggregate {
+            input: Arc::new(try_inline_ctes(&agg.input, cte_map)?),
+            group_expr: agg.group_expr.clone(),
+            aggr_expr: agg.aggr_expr.clone(),
+            schema: agg.schema.clone(),
+        })),
+        LogicalPlan::Join(join) => Ok(LogicalPlan::Join(Join {
+            left: Arc::new(try_inline_ctes(&join.left, cte_map)?),
+            right: Arc::new(try_inline_ctes(&join.right, cte_map)?),
+            join_type: join.join_type,
+            on: join.on.clone(),
+            filter: join.filter.clone(),
+            schema: join.schema.clone(),
+        })),
+        LogicalPlan::Sort(sort) => Ok(LogicalPlan::Sort(Sort {
+            input: Arc::new(try_inline_ctes(&sort.input, cte_map)?),
+            exprs: sort.exprs.clone(),
+        })),
+        LogicalPlan::Limit(limit) => Ok(LogicalPlan::Limit(Limit {
+            input: Arc::new(try_inline_ctes(&limit.input, cte_map)?),
+            skip: limit.skip,
+            fetch: limit.fetch,
+        })),
+        LogicalPlan::Union(union) => Ok(LogicalPlan::Union(Union {
+            inputs: union
+                .inputs
+                .iter()
+                .map(|input| try_inline_ctes(input, cte_map).map(Arc::new))
+                .collect::<Result<Vec<_>>>()?,
+            all: union.all,
+            schema: union.schema.clone(),
+        })),
+        LogicalPlan::Distinct(distinct) => Ok(LogicalPlan::Distinct(Distinct {
+            input: Arc::new(try_inline_ctes(&distinct.input, cte_map)?),
+        })),
+        LogicalPlan::TableScan(_) | LogicalPlan::EmptyRelation(_) | LogicalPlan::Values(_) => {
+            Ok(plan.clone())
+        }
+        // Recursive CTEs are not inlined - they are handled specially by the compiler
+        LogicalPlan::RecursiveCTE(recursive) => Ok(LogicalPlan::RecursiveCTE(RecursiveCTE {
+            name: recursive.name.clone(),
+            schema: recursive.schema.clone(),
+            base_case: Arc::new(try_inline_ctes(&recursive.base_case, cte_map)?),
+            recursive_step: Arc::new(try_inline_ctes(&recursive.recursive_step, cte_map)?),
+            union_all: recursive.union_all,
+            max_iterations: recursive.max_iterations,
+        })),
+        // Recursive CTE references are preserved - they are resolved during compilation
+        LogicalPlan::RecursiveCTERef(_) => Ok(plan.clone()),
+    }
+}
+
+/// Inline all CTEs in a logical plan, replacing CTERef nodes with their definitions.
+/// This transforms a plan with WithCTE/CTERef nodes into an equivalent plan without them.
+/// Uses fixed-point iteration to handle CTEs that reference other CTEs in the same WITH clause.
+fn inline_ctes(
+    plan: &LogicalPlan,
+    cte_map: &HashMap<String, Arc<LogicalPlan>>,
+) -> Result<LogicalPlan> {
+    match plan {
+        LogicalPlan::WithCTE(with_cte) => {
+            let mut expanded_ctes = cte_map.clone();
+            let mut unresolved: HashMap<String, Arc<LogicalPlan>> = HashMap::default();
+
+            // First pass: separate RecursiveCTEs (which don't need inlining) from regular CTEs
+            for (name, cte_plan) in &with_cte.ctes {
+                if matches!(cte_plan.as_ref(), LogicalPlan::RecursiveCTE(_)) {
+                    // RecursiveCTE nodes are already self-contained and will be compiled
+                    // by compile_recursive_cte - just add them directly
+                    expanded_ctes.insert(name.clone(), cte_plan.clone());
+                } else {
+                    unresolved.insert(name.clone(), cte_plan.clone());
+                }
+            }
+
+            // Fixed-point iteration: repeatedly try to resolve non-recursive CTEs until all are resolved
+            // or no progress can be made
+            loop {
+                let mut progress = false;
+                let keys: Vec<String> = unresolved.keys().cloned().collect();
+
+                for name in keys {
+                    if let Some(cte_plan) = unresolved.get(&name) {
+                        match try_inline_ctes(cte_plan, &expanded_ctes) {
+                            Ok(inlined) => {
+                                expanded_ctes.insert(name.clone(), Arc::new(inlined));
+                                unresolved.remove(&name);
+                                progress = true;
+                            }
+                            Err(_) => {
+                                // Still unresolved; leave it for a later iteration
+                            }
+                        }
+                    }
+                }
+
+                if unresolved.is_empty() {
+                    break;
+                }
+                if !progress {
+                    let names: Vec<String> = unresolved.keys().cloned().collect();
+                    return Err(LimboError::ParseError(format!(
+                        "Unable to resolve CTEs due to cyclic or missing references: {names:?}"
+                    )));
+                }
+            }
+
+            // Then inline the body with all CTEs available
+            inline_ctes(&with_cte.body, &expanded_ctes)
+        }
+        LogicalPlan::CTERef(cte_ref) => match cte_map.get(&cte_ref.name) {
+            Some(cte_plan) => Ok((**cte_plan).clone()),
+            None => Err(LimboError::ParseError(format!(
+                "CTE '{}' not found in scope",
+                cte_ref.name
+            ))),
+        },
+        LogicalPlan::Projection(proj) => Ok(LogicalPlan::Projection(Projection {
+            input: Arc::new(inline_ctes(&proj.input, cte_map)?),
+            exprs: proj.exprs.clone(),
+            schema: proj.schema.clone(),
+        })),
+        LogicalPlan::Filter(filter) => Ok(LogicalPlan::Filter(Filter {
+            input: Arc::new(inline_ctes(&filter.input, cte_map)?),
+            predicate: filter.predicate.clone(),
+        })),
+        LogicalPlan::Aggregate(agg) => Ok(LogicalPlan::Aggregate(Aggregate {
+            input: Arc::new(inline_ctes(&agg.input, cte_map)?),
+            group_expr: agg.group_expr.clone(),
+            aggr_expr: agg.aggr_expr.clone(),
+            schema: agg.schema.clone(),
+        })),
+        LogicalPlan::Join(join) => Ok(LogicalPlan::Join(Join {
+            left: Arc::new(inline_ctes(&join.left, cte_map)?),
+            right: Arc::new(inline_ctes(&join.right, cte_map)?),
+            join_type: join.join_type,
+            on: join.on.clone(),
+            filter: join.filter.clone(),
+            schema: join.schema.clone(),
+        })),
+        LogicalPlan::Sort(sort) => Ok(LogicalPlan::Sort(Sort {
+            input: Arc::new(inline_ctes(&sort.input, cte_map)?),
+            exprs: sort.exprs.clone(),
+        })),
+        LogicalPlan::Limit(limit) => Ok(LogicalPlan::Limit(Limit {
+            input: Arc::new(inline_ctes(&limit.input, cte_map)?),
+            skip: limit.skip,
+            fetch: limit.fetch,
+        })),
+        LogicalPlan::Union(union) => Ok(LogicalPlan::Union(Union {
+            inputs: union
+                .inputs
+                .iter()
+                .map(|input| inline_ctes(input, cte_map).map(Arc::new))
+                .collect::<Result<Vec<_>>>()?,
+            all: union.all,
+            schema: union.schema.clone(),
+        })),
+        LogicalPlan::Distinct(distinct) => Ok(LogicalPlan::Distinct(Distinct {
+            input: Arc::new(inline_ctes(&distinct.input, cte_map)?),
+        })),
+        LogicalPlan::TableScan(_) | LogicalPlan::EmptyRelation(_) | LogicalPlan::Values(_) => {
+            Ok(plan.clone())
+        }
+        // Recursive CTEs are not inlined - they are handled specially by the compiler
+        LogicalPlan::RecursiveCTE(recursive) => Ok(LogicalPlan::RecursiveCTE(RecursiveCTE {
+            name: recursive.name.clone(),
+            schema: recursive.schema.clone(),
+            base_case: Arc::new(inline_ctes(&recursive.base_case, cte_map)?),
+            recursive_step: Arc::new(inline_ctes(&recursive.recursive_step, cte_map)?),
+            union_all: recursive.union_all,
+            max_iterations: recursive.max_iterations,
+        })),
+        // Recursive CTE references are preserved - they are resolved during compilation
+        LogicalPlan::RecursiveCTERef(_) => Ok(plan.clone()),
     }
 }
 
@@ -274,6 +494,30 @@ pub struct CTERef {
     pub schema: SchemaRef,
 }
 
+/// Recursive CTE - represents a self-referential view with fixed-point semantics
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecursiveCTE {
+    /// Name of the recursive CTE
+    pub name: String,
+    /// Schema of the CTE output
+    pub schema: SchemaRef,
+    /// Base case (non-recursive part, e.g., SELECT from edges)
+    pub base_case: Arc<LogicalPlan>,
+    /// Recursive step (references the CTE itself)
+    pub recursive_step: Arc<LogicalPlan>,
+    /// Whether this is UNION ALL (true) or UNION DISTINCT (false)
+    pub union_all: bool,
+    /// Maximum iteration limit (None = use default of 100)
+    pub max_iterations: Option<usize>,
+}
+
+/// Reference to a recursive CTE (used in the recursive step)
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecursiveCTERef {
+    pub name: String,
+    pub schema: SchemaRef,
+}
+
 /// Logical expression representation
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalExpr {
@@ -297,6 +541,7 @@ pub enum LogicalExpr {
         fun: AggregateFunction,
         args: Vec<LogicalExpr>,
         distinct: bool,
+        filter: Option<Box<LogicalExpr>>,
     },
     /// Scalar function call
     ScalarFunction { fun: String, args: Vec<LogicalExpr> },
@@ -452,6 +697,11 @@ impl<'a> LogicalPlanBuilder<'a> {
 
     // Build WITH CTE
     fn build_with_cte(&mut self, with: &ast::With, select: &ast::Select) -> Result<LogicalPlan> {
+        // Handle recursive CTEs
+        if with.recursive {
+            return self.build_recursive_with_cte(with, select);
+        }
+
         let mut cte_plans = HashMap::default();
 
         // Build each CTE
@@ -477,6 +727,239 @@ impl<'a> LogicalPlanBuilder<'a> {
             ctes: cte_plans,
             body: Arc::new(body),
         }))
+    }
+
+    /// Build a recursive CTE (WITH RECURSIVE)
+    /// Supports linear recursion: base_case UNION [ALL] recursive_step
+    fn build_recursive_with_cte(
+        &mut self,
+        with: &ast::With,
+        select: &ast::Select,
+    ) -> Result<LogicalPlan> {
+        // For now, support only single recursive CTE
+        // TODO: Support multiple recursive CTEs. This would require:
+        // 1. Handling mutual recursion (CTEs that reference each other)
+        // 2. Building a dependency graph to determine evaluation order
+        // 3. Creating separate RecursiveOperator nodes for each CTE
+        // 4. Coordinating fixed-point iteration across multiple CTEs
+        if with.ctes.len() != 1 {
+            return Err(LimboError::ParseError(
+                "Multiple recursive CTEs are not yet supported".to_string(),
+            ));
+        }
+
+        let cte = &with.ctes[0];
+        let cte_name = Self::name_to_string(&cte.tbl_name);
+
+        // Analyze the CTE's SELECT to find base case and recursive step
+        // Typically: base_case UNION recursive_step
+        let (base_case, recursive_step, union_all) =
+            self.split_recursive_cte(&cte.select, &cte_name)?;
+
+        // Build the base case first (it shouldn't reference the CTE)
+        let base_case_plan = self.build_select_body(
+            &ast::SelectBody {
+                select: base_case,
+                compounds: vec![],
+            },
+            &[],
+            &None,
+        )?;
+
+        // Create a schema with table name set to the CTE name for column resolution
+        // If the CTE has explicit column names (e.g., `cte_name(col1, col2)`), use them
+        // Otherwise, use the column names from the base case
+        let base_schema = base_case_plan.schema();
+        let schema = Arc::new(LogicalSchema {
+            columns: if cte.columns.is_empty() {
+                // No explicit column names - use base case schema
+                base_schema
+                    .columns
+                    .iter()
+                    .map(|col| ColumnInfo {
+                        name: col.name.clone(),
+                        ty: col.ty,
+                        database: None,
+                        table: Some(cte_name.clone()),
+                        table_alias: None,
+                    })
+                    .collect()
+            } else {
+                // Use explicit CTE column names with types from base case
+                cte.columns
+                    .iter()
+                    .zip(base_schema.columns.iter())
+                    .map(|(cte_col, base_col)| ColumnInfo {
+                        name: Self::name_to_string(&cte_col.col_name),
+                        ty: base_col.ty,
+                        database: None,
+                        table: Some(cte_name.clone()),
+                        table_alias: None,
+                    })
+                    .collect()
+            },
+        });
+
+        // Register the CTE reference for the recursive step to use
+        // This creates a placeholder that will be resolved during circuit compilation
+        self.ctes.insert(
+            cte_name.clone(),
+            Arc::new(LogicalPlan::RecursiveCTERef(RecursiveCTERef {
+                name: cte_name.clone(),
+                schema: schema.clone(),
+            })),
+        );
+
+        // Now build the recursive step (it will use RecursiveCTERef when referencing the CTE)
+        let recursive_step_plan = self.build_select_body(
+            &ast::SelectBody {
+                select: recursive_step,
+                compounds: vec![],
+            },
+            &[],
+            &None,
+        )?;
+
+        // Clean up
+        self.ctes.remove(&cte_name);
+
+        // Create the RecursiveCTE node
+        let recursive_cte = LogicalPlan::RecursiveCTE(RecursiveCTE {
+            name: cte_name.clone(),
+            schema,
+            base_case: Arc::new(base_case_plan),
+            recursive_step: Arc::new(recursive_step_plan),
+            union_all,
+            max_iterations: Some(DEFAULT_RECURSIVE_MAX_ITERATIONS),
+        });
+
+        // Store the recursive CTE for the main body
+        self.ctes
+            .insert(cte_name.clone(), Arc::new(recursive_cte.clone()));
+
+        // Build the main body
+        let order_by = &select.order_by;
+        let limit = &select.limit;
+        let body = self.build_select_body(&select.body, order_by, limit)?;
+
+        // Clear CTEs
+        self.ctes.remove(&cte_name);
+
+        Ok(LogicalPlan::WithCTE(WithCTE {
+            ctes: std::iter::once((cte_name, Arc::new(recursive_cte))).collect(),
+            body: Arc::new(body),
+        }))
+    }
+
+    /// Split a recursive CTE into base case and recursive step
+    /// The CTE body should be: base_case UNION [ALL] recursive_step
+    fn split_recursive_cte(
+        &self,
+        select: &ast::Select,
+        cte_name: &str,
+    ) -> Result<(ast::OneSelect, ast::OneSelect, bool)> {
+        // Handle WITH clause inside the CTE if present
+        if select.with.is_some() {
+            return Err(LimboError::ParseError(
+                "Nested WITH clauses in recursive CTEs are not supported".to_string(),
+            ));
+        }
+
+        // The body must have exactly one compound (UNION)
+        if select.body.compounds.len() != 1 {
+            return Err(LimboError::ParseError(format!(
+                "Recursive CTE '{cte_name}' must have form: base_case UNION [ALL] recursive_step"
+            )));
+        }
+
+        let compound = &select.body.compounds[0];
+
+        // Check it's a UNION
+        let union_all = match compound.operator {
+            ast::CompoundOperator::Union => false,
+            ast::CompoundOperator::UnionAll => true,
+            _ => {
+                return Err(LimboError::ParseError(format!(
+                    "Recursive CTE '{cte_name}' must use UNION or UNION ALL, not INTERSECT or EXCEPT"
+                )));
+            }
+        };
+
+        // The first part (select.body.select) is the base case
+        // The second part (compound.select) is the recursive step
+        // We need to verify which one references the CTE
+        let base_case = select.body.select.clone();
+        let recursive_step = compound.select.clone();
+
+        // Verify that the recursive step references the CTE
+        // (This is a basic check - we just look for the name in FROM clause)
+        if !self.select_references_cte(&recursive_step, cte_name) {
+            return Err(LimboError::ParseError(format!(
+                "Recursive step of CTE '{cte_name}' must reference the CTE itself"
+            )));
+        }
+
+        // Verify that the base case does NOT reference the CTE
+        if self.select_references_cte(&base_case, cte_name) {
+            return Err(LimboError::ParseError(format!(
+                "Base case of recursive CTE '{cte_name}' must not reference the CTE itself"
+            )));
+        }
+
+        Ok((base_case, recursive_step, union_all))
+    }
+
+    /// Check if a SELECT references a CTE by name in its FROM clause
+    fn select_references_cte(&self, select: &ast::OneSelect, cte_name: &str) -> bool {
+        match select {
+            ast::OneSelect::Select { from, .. } => {
+                if let Some(from_clause) = from {
+                    self.references_cte_in_from_clause(from_clause, cte_name)
+                } else {
+                    false
+                }
+            }
+            ast::OneSelect::Values(_) => false,
+        }
+    }
+
+    /// Check if a FROM clause references a CTE by name
+    fn references_cte_in_from_clause(&self, from: &ast::FromClause, cte_name: &str) -> bool {
+        // Check the main table
+        if self.select_table_references_cte(&from.select, cte_name) {
+            return true;
+        }
+
+        // Check joined tables
+        for join in &from.joins {
+            if self.select_table_references_cte(&join.table, cte_name) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Check if a SelectTable references a CTE by name
+    fn select_table_references_cte(&self, table: &ast::SelectTable, cte_name: &str) -> bool {
+        match table {
+            ast::SelectTable::Table(qualified_name, _, _) => {
+                let table_name = Self::name_to_string(&qualified_name.name);
+                table_name.eq_ignore_ascii_case(cte_name)
+            }
+            ast::SelectTable::Select(select, _) => {
+                self.select_references_cte(&select.body.select, cte_name)
+                    || select
+                        .body
+                        .compounds
+                        .iter()
+                        .any(|c| self.select_references_cte(&c.select, cte_name))
+            }
+            ast::SelectTable::Sub(from_clause, _) => {
+                self.references_cte_in_from_clause(from_clause, cte_name)
+            }
+            ast::SelectTable::TableCall(_, _, _) => false,
+        }
     }
 
     // Build SELECT body
@@ -597,6 +1080,34 @@ impl<'a> LogicalPlanBuilder<'a> {
                 let table_name = Self::name_to_string(&name.name);
                 // Check if it's a CTE reference
                 if let Some(cte_plan) = self.ctes.get(&table_name) {
+                    // If the CTE is a RecursiveCTE or RecursiveCTERef, use it directly
+                    // This preserves the recursive structure for circuit compilation
+                    if let LogicalPlan::RecursiveCTERef(cte_ref) = cte_plan.as_ref() {
+                        // Apply the alias to the schema if present
+                        let table_alias = alias.as_ref().map(|a| Self::name_to_string(a.name()));
+                        let aliased_schema = Arc::new(LogicalSchema {
+                            columns: cte_ref
+                                .schema
+                                .columns
+                                .iter()
+                                .map(|col| ColumnInfo {
+                                    name: col.name.clone(),
+                                    ty: col.ty,
+                                    database: col.database.clone(),
+                                    table: col.table.clone(),
+                                    table_alias: table_alias.clone(),
+                                })
+                                .collect(),
+                        });
+                        return Ok(LogicalPlan::RecursiveCTERef(RecursiveCTERef {
+                            name: cte_ref.name.clone(),
+                            schema: aliased_schema,
+                        }));
+                    }
+                    if matches!(cte_plan.as_ref(), LogicalPlan::RecursiveCTE(_)) {
+                        return Ok((**cte_plan).clone());
+                    }
+                    // For regular CTEs, create a CTERef for later resolution
                     return Ok(LogicalPlan::CTERef(CTERef {
                         name: table_name.clone(),
                         schema: cte_plan.schema().clone(),
@@ -752,13 +1263,23 @@ impl<'a> LogicalPlanBuilder<'a> {
     ) -> Result<()> {
         match expr {
             ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) => {
-                // Check if this is an equijoin condition (left.col = right.col)
-                let left_expr = self.build_expr(lhs, left_schema)?;
-                let right_expr = self.build_expr(rhs, right_schema)?;
+                let combined_schema = self.combine_schemas(left_schema, right_schema)?;
+                let left_expr = self.build_expr(lhs, &combined_schema)?;
+                let right_expr = self.build_expr(rhs, &combined_schema)?;
 
-                // For simplicity, we'll check if one references left and one references right
-                // In a real implementation, we'd need more sophisticated column resolution
-                equijoins.push((left_expr, right_expr));
+                if matches!(
+                    (&left_expr, &right_expr),
+                    (LogicalExpr::Column(_), LogicalExpr::Column(_))
+                ) {
+                    equijoins.push((left_expr, right_expr));
+                } else {
+                    let filter_expr = LogicalExpr::BinaryExpr {
+                        left: Box::new(left_expr),
+                        op: BinaryOperator::Equals,
+                        right: Box::new(right_expr),
+                    };
+                    filters.push(filter_expr);
+                }
             }
             ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
                 // Recursively extract from AND conditions
@@ -960,15 +1481,21 @@ impl<'a> LogicalPlanBuilder<'a> {
                     }
                 }
                 ast::ResultColumn::TableStar(table) => {
-                    // Expand table.* to all columns from that table
                     let table_name = Self::name_to_string(table);
                     for col in &input_schema.columns {
-                        // Simple check - would need proper table tracking in real implementation
-                        proj_exprs.push(LogicalExpr::Column(Column::with_table(
-                            col.name.clone(),
-                            table_name.clone(),
-                        )));
-                        schema_columns.push(col.clone());
+                        let col_belongs_to_table =
+                            col.table.as_deref().map_or(false, |t| t == table_name)
+                                || col
+                                    .table_alias
+                                    .as_deref()
+                                    .map_or(false, |a| a == table_name);
+                        if col_belongs_to_table {
+                            proj_exprs.push(LogicalExpr::Column(Column::with_table(
+                                col.name.clone(),
+                                table_name.clone(),
+                            )));
+                            schema_columns.push(col.clone());
+                        }
                     }
                 }
             }
@@ -1044,11 +1571,12 @@ impl<'a> LogicalPlanBuilder<'a> {
                 fun,
                 args,
                 distinct,
+                filter,
             } = agg_expr
             {
                 let mut modified_args = Vec::new();
                 for arg in args {
-                    // Check if the argument is a simple column reference or a complex expression
+                    // Check if the argument is a simple column reference, a literal, or a complex expression
                     match arg {
                         LogicalExpr::Column(_) => {
                             // Simple column - just use it
@@ -1067,6 +1595,12 @@ impl<'a> LogicalPlanBuilder<'a> {
                                     });
                                 }
                             }
+                        }
+                        LogicalExpr::Literal(_) => {
+                            // Literals are constants — no per-row evaluation needed.
+                            // Pass through verbatim so downstream consumers (e.g. the
+                            // IVM compiler's group_concat separator) can recognize them.
+                            modified_args.push(arg.clone());
                         }
                         _ => {
                             // Complex expression - we need to project it first
@@ -1091,11 +1625,39 @@ impl<'a> LogicalPlanBuilder<'a> {
                     }
                 }
 
+                // Auto-lift simple Column references from the FILTER predicate
+                // into the pre-projection. Without this, a filter that
+                // references a column not in any aggregate arg would fail to
+                // resolve when a sibling complex aggregate triggers a
+                // pre-projection. The `filter` itself is passed through
+                // unchanged — `compile_filter_predicate` resolves column refs
+                // against the post-pre-projection schema.
+                if let Some(f) = filter {
+                    let mut filter_cols = Vec::new();
+                    Self::collect_filter_columns(f, &mut filter_cols);
+                    for col_expr in filter_cols {
+                        if !pre_projection_exprs.iter().any(|e| e == &col_expr) {
+                            let col_type = Self::infer_expr_type(&col_expr, input_schema)?;
+                            if let LogicalExpr::Column(col) = &col_expr {
+                                pre_projection_schema.push(ColumnInfo {
+                                    name: col.name.clone(),
+                                    ty: col_type,
+                                    database: None,
+                                    table: col.table.clone(),
+                                    table_alias: None,
+                                });
+                            }
+                            pre_projection_exprs.push(col_expr);
+                        }
+                    }
+                }
+
                 // Create the modified aggregate expression
                 modified_aggr_exprs.push(LogicalExpr::AggregateFunction {
                     fun: fun.clone(),
                     args: modified_args,
                     distinct: *distinct,
+                    filter: filter.clone(),
                 });
             } else {
                 modified_aggr_exprs.push(agg_expr.clone());
@@ -1689,10 +2251,17 @@ impl<'a> LogicalPlanBuilder<'a> {
                         .iter()
                         .map(|e| self.build_expr(e, _schema))
                         .collect::<Result<Vec<_>>>()?;
+                    let filter = filter_over
+                        .filter_clause
+                        .as_deref()
+                        .map(|e| self.build_expr(e, _schema))
+                        .transpose()?
+                        .map(Box::new);
                     Ok(LogicalExpr::AggregateFunction {
                         fun: agg_fun,
                         args: arg_exprs,
                         distinct,
+                        filter,
                     })
                 } else {
                     // Regular scalar function
@@ -1707,15 +2276,33 @@ impl<'a> LogicalPlanBuilder<'a> {
                 }
             }
 
-            ast::Expr::FunctionCallStar { name, .. } => {
-                // Handle COUNT(*) and similar
+            ast::Expr::FunctionCallStar { name, filter_over } => {
+                // Handle COUNT(*) and similar.
+                //
+                // Reject window functions (OVER clause). Pre-existing bug: this arm
+                // previously destructured `name, ..` and silently dropped both
+                // filter_clause AND over_clause, so `count(*) OVER (...)` was
+                // accepted by IVM. Now matches FunctionCall arm behavior.
+                if filter_over.over_clause.is_some() {
+                    return Err(LimboError::ParseError(
+                        "Unsupported expression type: window functions are not yet supported"
+                            .to_string(),
+                    ));
+                }
                 let func_name = Self::name_to_string(name);
                 // FunctionCallStar always has 0 args (it's the * form)
                 if let Some(agg_fun) = Self::parse_aggregate_function(&func_name, 0) {
+                    let filter = filter_over
+                        .filter_clause
+                        .as_deref()
+                        .map(|e| self.build_expr(e, _schema))
+                        .transpose()?
+                        .map(Box::new);
                     Ok(LogicalExpr::AggregateFunction {
                         fun: agg_fun,
                         args: std::vec![],
                         distinct: false,
+                        filter,
                     })
                 } else if let Ok(Some(func)) =
                     crate::function::Func::resolve_function(&func_name, 0)
@@ -1955,6 +2542,10 @@ impl<'a> LogicalPlanBuilder<'a> {
             b"STRING_AGG" => Some(AggFunc::StringAgg),
             b"TOTAL" => Some(AggFunc::Total),
             b"ARRAY_AGG" => Some(AggFunc::ArrayAgg),
+            #[cfg(feature = "json")]
+            b"JSON_GROUP_ARRAY" => Some(AggFunc::JsonGroupArray),
+            #[cfg(feature = "json")]
+            b"JSONB_GROUP_ARRAY" => Some(AggFunc::JsonbGroupArray),
             _ => None,
         })
     }
@@ -2303,6 +2894,27 @@ impl<'a> LogicalPlanBuilder<'a> {
         }
 
         Ok(Arc::new(LogicalSchema::new(columns)))
+    }
+
+    // Walk a FILTER predicate and collect every simple `Column` reference it
+    // contains. Used by `preprocess_aggregate_expressions` to auto-lift filter
+    // columns into the aggregate's pre-projection.
+    fn collect_filter_columns(expr: &LogicalExpr, out: &mut Vec<LogicalExpr>) {
+        match expr {
+            LogicalExpr::Column(_) => out.push(expr.clone()),
+            LogicalExpr::Literal(_) => {}
+            LogicalExpr::BinaryExpr { left, right, .. } => {
+                Self::collect_filter_columns(left, out);
+                Self::collect_filter_columns(right, out);
+            }
+            LogicalExpr::UnaryExpr { expr, .. } => Self::collect_filter_columns(expr, out),
+            LogicalExpr::IsNull { expr, .. } => Self::collect_filter_columns(expr, out),
+            // Other expression shapes (function calls, CASE, IN, subquery, ...)
+            // are unsupported in v1 FILTER predicates and rejected at compile
+            // time by `compile_filter_predicate`. No need to walk into them
+            // here; the rejection produces a clear error.
+            _ => {}
+        }
     }
 
     // Infer expression type
@@ -3611,6 +4223,7 @@ mod tests {
                                 fun,
                                 args,
                                 distinct,
+                                filter: _,
                             } => {
                                 assert_eq!(*fun, crate::function::AggFunc::Sum, "Should be SUM");
                                 assert!(!distinct, "Should not be DISTINCT");
@@ -3966,6 +4579,34 @@ mod tests {
     }
 
     #[test]
+    fn test_table_star_in_join_filters_columns() {
+        let schema = create_test_schema();
+        let sql = "SELECT u.* FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount > 100";
+        let plan = parse_and_build(sql, &schema).unwrap();
+
+        match plan {
+            LogicalPlan::Projection(proj) => {
+                // users has 4 columns (id, name, age, email) — NOT 8 (all joined)
+                assert_eq!(
+                    proj.exprs.len(),
+                    4,
+                    "TableStar should only include columns from the starred table"
+                );
+                assert_eq!(proj.schema.columns.len(), 4);
+                for col_info in &proj.schema.columns {
+                    assert_eq!(
+                        col_info.table.as_deref(),
+                        Some("users"),
+                        "All projected columns should belong to 'users', got {:?}",
+                        col_info.table
+                    );
+                }
+            }
+            _ => panic!("Expected Projection at top level"),
+        }
+    }
+
+    #[test]
     fn test_join_with_aggregation() {
         let schema = create_test_schema();
         let sql = "SELECT u.name, SUM(o.amount)
@@ -4160,6 +4801,7 @@ mod tests {
             fun: AggFunc::Sum,
             args: std::vec![LogicalExpr::Column(Column::new("amount"))],
             distinct: false,
+            filter: None,
         };
         let stripped = strip_alias(&expr);
         assert_eq!(stripped, &expr);
