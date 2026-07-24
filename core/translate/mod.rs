@@ -63,7 +63,10 @@ use analyze::translate_analyze;
 use index::{translate_create_index, translate_drop_index, translate_optimize, translate_reindex};
 use insert::translate_insert;
 use rollback::{translate_release, translate_rollback, translate_savepoint};
-use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
+use schema::{
+    translate_create_foreign_table, translate_create_server, translate_create_table,
+    translate_create_virtual_table, translate_drop_server, translate_drop_table,
+};
 use select::translate_select;
 use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
@@ -182,6 +185,10 @@ pub fn translate_inner(
             | ast::Stmt::Insert { .. }
             | ast::Stmt::CreateSequence { .. }
             | ast::Stmt::DropSequence { .. }
+            | ast::Stmt::CreateServer(_)
+            | ast::Stmt::CreateForeignTable(_)
+            | ast::Stmt::DropServer { .. }
+            | ast::Stmt::RefreshMaterializedView { .. }
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
@@ -310,6 +317,14 @@ pub fn translate_inner(
             connection.clone(),
             program,
         )?,
+        ast::Stmt::RefreshMaterializedView { view_name } => {
+            view::translate_refresh_materialized_view(
+                &view_name,
+                resolver,
+                connection.clone(),
+                program,
+            )?
+        }
         ast::Stmt::CreateVirtualTable(vtab) => {
             translate_create_virtual_table(vtab, resolver, program, connection)?
         }
@@ -483,6 +498,16 @@ pub fn translate_inner(
         } => {
             sequence::translate_drop_sequence(&seq_name, if_exists, resolver, program)?;
         }
+        ast::Stmt::CreateServer(server) => {
+            translate_create_server(server, resolver, program, connection)?
+        }
+        ast::Stmt::CreateForeignTable(ft) => {
+            translate_create_foreign_table(ft, resolver, program, connection)?
+        }
+        ast::Stmt::DropServer {
+            if_exists,
+            server_name,
+        } => translate_drop_server(&server_name, resolver, if_exists, program)?,
     };
 
     if is_write {
@@ -551,6 +576,10 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::Optimize { .. } => "optimize",
         ast::Stmt::CreateSequence { .. } => "create_sequence",
         ast::Stmt::DropSequence { .. } => "drop_sequence",
+        ast::Stmt::RefreshMaterializedView { .. } => "refresh_materialized_view",
+        ast::Stmt::CreateServer(_) => "create_server",
+        ast::Stmt::CreateForeignTable(_) => "create_foreign_table",
+        ast::Stmt::DropServer { .. } => "drop_server",
     }
 }
 

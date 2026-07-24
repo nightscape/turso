@@ -1,0 +1,179 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@requires materialized_views "requires materialized view support"
+
+test ivm-recursive-union-all-update {
+    CREATE TABLE t (id TEXT PRIMARY KEY, pid TEXT, val TEXT);
+    CREATE MATERIALIZED VIEW mv AS
+      WITH RECURSIVE tree AS (
+        SELECT id, pid, val FROM t WHERE pid = 'root'
+        UNION ALL
+        SELECT c.id, c.pid, c.val FROM t c JOIN tree p ON c.pid = p.id
+      ) SELECT * FROM tree;
+
+    INSERT INTO t VALUES ('a', 'root', 'v1');
+    INSERT INTO t VALUES ('b', 'a', 'child');
+    SELECT COUNT(*) FROM mv;
+}
+expect {
+    2
+}
+
+test ivm-recursive-union-all-update-leaf {
+    CREATE TABLE t1 (id TEXT PRIMARY KEY, pid TEXT, val TEXT);
+    CREATE MATERIALIZED VIEW mv1 AS
+      WITH RECURSIVE tree AS (
+        SELECT id, pid, val FROM t1 WHERE pid = 'root'
+        UNION ALL
+        SELECT c.id, c.pid, c.val FROM t1 c JOIN tree p ON c.pid = p.id
+      ) SELECT * FROM tree;
+
+    INSERT INTO t1 VALUES ('a', 'root', 'v1');
+    INSERT INTO t1 VALUES ('b', 'a', 'child');
+
+    UPDATE t1 SET val = 'v2' WHERE id = 'b';
+    SELECT COUNT(*) FROM mv1;
+}
+expect {
+    2
+}
+
+test ivm-recursive-union-all-update-root {
+    CREATE TABLE t2 (id TEXT PRIMARY KEY, pid TEXT, val TEXT);
+    CREATE MATERIALIZED VIEW mv2 AS
+      WITH RECURSIVE tree AS (
+        SELECT id, pid, val FROM t2 WHERE pid = 'root'
+        UNION ALL
+        SELECT c.id, c.pid, c.val FROM t2 c JOIN tree p ON c.pid = p.id
+      ) SELECT * FROM tree;
+
+    INSERT INTO t2 VALUES ('a', 'root', 'v1');
+    INSERT INTO t2 VALUES ('b', 'a', 'child');
+
+    UPDATE t2 SET val = 'v2' WHERE id = 'a';
+    SELECT * FROM mv2 ORDER BY id;
+}
+expect {
+    a|root|v2
+    b|a|child
+}
+
+test ivm-recursive-union-all-delete {
+    CREATE TABLE t3 (id TEXT PRIMARY KEY, pid TEXT, val TEXT);
+    CREATE MATERIALIZED VIEW mv3 AS
+      WITH RECURSIVE tree AS (
+        SELECT id, pid, val FROM t3 WHERE pid = 'root'
+        UNION ALL
+        SELECT c.id, c.pid, c.val FROM t3 c JOIN tree p ON c.pid = p.id
+      ) SELECT * FROM tree;
+
+    INSERT INTO t3 VALUES ('a', 'root', 'v1');
+    INSERT INTO t3 VALUES ('b', 'a', 'child');
+    INSERT INTO t3 VALUES ('c', 'b', 'grandchild');
+
+    DELETE FROM t3 WHERE id = 'c';
+    SELECT COUNT(*) FROM mv3;
+}
+expect {
+    2
+}
+
+test ivm-recursive-union-all-insert-or-replace {
+    CREATE TABLE t4 (id TEXT PRIMARY KEY, pid TEXT, val TEXT);
+    CREATE MATERIALIZED VIEW mv4 AS
+      WITH RECURSIVE tree AS (
+        SELECT id, pid, val FROM t4 WHERE pid = 'root'
+        UNION ALL
+        SELECT c.id, c.pid, c.val FROM t4 c JOIN tree p ON c.pid = p.id
+      ) SELECT * FROM tree;
+
+    INSERT INTO t4 VALUES ('a', 'root', 'v1');
+    INSERT INTO t4 VALUES ('b', 'a', 'child');
+
+    INSERT OR REPLACE INTO t4 VALUES ('a', 'root', 'v2');
+    SELECT * FROM mv4 ORDER BY id;
+}
+expect {
+    a|root|v2
+    b|a|child
+}
+
+test ivm-recursive-multi-upsert-in-tx {
+    CREATE TABLE t6 (id TEXT PRIMARY KEY, pid TEXT, val TEXT);
+    CREATE MATERIALIZED VIEW mv6 AS
+      WITH RECURSIVE tree AS (
+        SELECT id, pid, val, '/' || id as path FROM t6 WHERE pid LIKE 'doc:%'
+        UNION ALL
+        SELECT c.id, c.pid, c.val, p.path || '/' || c.id FROM t6 c JOIN tree p ON c.pid = p.id
+      ) SELECT * FROM tree;
+
+    INSERT INTO t6 VALUES ('r', 'doc:d1', 'root');
+    INSERT INTO t6 VALUES ('a', 'r', 'child-a');
+    INSERT INTO t6 VALUES ('c', 'a', 'grandchild');
+
+    SELECT COUNT(*) FROM mv6;
+
+    BEGIN;
+    INSERT INTO t6 VALUES ('r', 'doc:d1', 'root-v2') ON CONFLICT(id) DO UPDATE SET val = excluded.val;
+    INSERT INTO t6 VALUES ('a', 'r', 'child-a-v2') ON CONFLICT(id) DO UPDATE SET val = excluded.val;
+    COMMIT;
+
+    SELECT * FROM mv6 ORDER BY id;
+}
+expect {
+    3
+    a|r|child-a-v2|/r/a
+    c|a|grandchild|/r/a/c
+    r|doc:d1|root-v2|/r
+}
+
+test ivm-recursive-multi-upsert-deep-tree {
+    CREATE TABLE t7 (id TEXT PRIMARY KEY, pid TEXT, val TEXT);
+    CREATE MATERIALIZED VIEW mv7 AS
+      WITH RECURSIVE tree AS (
+        SELECT id, pid, val FROM t7 WHERE pid LIKE 'doc:%'
+        UNION ALL
+        SELECT c.id, c.pid, c.val FROM t7 c JOIN tree p ON c.pid = p.id
+      ) SELECT * FROM tree;
+
+    INSERT INTO t7 VALUES ('r', 'doc:d1', 'root');
+    INSERT INTO t7 VALUES ('a', 'r', 'child-a');
+    INSERT INTO t7 VALUES ('b', 'r', 'child-b');
+    INSERT INTO t7 VALUES ('c', 'a', 'gc-c');
+    INSERT INTO t7 VALUES ('d', 'a', 'gc-d');
+    INSERT INTO t7 VALUES ('e', 'b', 'gc-e');
+
+    SELECT COUNT(*) FROM mv7;
+
+    BEGIN;
+    INSERT INTO t7 VALUES ('r', 'doc:d1', 'root-v2') ON CONFLICT(id) DO UPDATE SET val = excluded.val;
+    INSERT INTO t7 VALUES ('a', 'r', 'child-a-v2') ON CONFLICT(id) DO UPDATE SET val = excluded.val;
+    INSERT INTO t7 VALUES ('b', 'r', 'child-b-v2') ON CONFLICT(id) DO UPDATE SET val = excluded.val;
+    COMMIT;
+
+    SELECT COUNT(*) FROM mv7;
+}
+expect {
+    6
+    6
+}
+
+test ivm-recursive-union-distinct-update-ok {
+    CREATE TABLE t5 (id TEXT PRIMARY KEY, pid TEXT, val TEXT);
+    CREATE MATERIALIZED VIEW mv5 AS
+      WITH RECURSIVE tree AS (
+        SELECT id, pid, val FROM t5 WHERE pid = 'root'
+        UNION
+        SELECT c.id, c.pid, c.val FROM t5 c JOIN tree p ON c.pid = p.id
+      ) SELECT * FROM tree;
+
+    INSERT INTO t5 VALUES ('a', 'root', 'v1');
+    INSERT INTO t5 VALUES ('b', 'a', 'child');
+
+    UPDATE t5 SET val = 'v2' WHERE id = 'a';
+    SELECT * FROM mv5 ORDER BY id;
+}
+expect {
+    a|root|v2
+    b|a|child
+}

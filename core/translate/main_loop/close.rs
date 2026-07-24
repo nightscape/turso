@@ -111,6 +111,7 @@ impl CloseLoop {
                                 pc_if_next: loop_labels.loop_start,
                             });
                         }
+                        Scan::RecursiveCteInput => {}
                         Scan::Subquery { iter_dir } => {
                             // Check if this is a materialized CTE (EphemeralTable) or coroutine
                             if let Table::FromClauseSubquery(subquery) = &table.table {

@@ -4,7 +4,7 @@ use crate::sync::Mutex;
 use crate::{
     incremental::{
         compiler::{DeltaSet, ExecuteState},
-        dbsp::{Delta, HashableRow, RowKeyZSet},
+        dbsp::{Delta, HashableRow, RowKeyZSet, RowValues},
         view::{IncrementalView, ViewTransactionState},
     },
     return_if_io,
@@ -23,12 +23,20 @@ enum SeekState {
     Seek {
         /// The row we are trying to find
         target: i64,
+        /// The user's original target rowid; survives IO yields so the
+        /// resume path can reconstruct it instead of using a sentinel.
+        /// Required by `process_btree_changes`'s `zset.seek(target_rowid)`
+        /// to filter matches against the user's intent — separate from
+        /// `target`, which advances each iteration.
+        original_target_rowid: i64,
     },
 
     /// Btree seek returned TryAdvance, now advancing with next()/prev()
     Advancing {
         /// The row we are trying to find
         target: i64,
+        /// User's original target rowid (see Seek::original_target_rowid).
+        original_target_rowid: i64,
         /// The seek operation (determines direction of advance)
         op: SeekOp,
     },
@@ -48,6 +56,7 @@ pub struct MaterializedViewCursor {
     btree_cursor: Box<dyn CursorTrait>,
     view: Arc<Mutex<IncrementalView>>,
     pager: Arc<Pager>,
+    conn: crate::sync::Arc<crate::Connection>,
 
     // Current changes that are uncommitted
     uncommitted: RowKeyZSet,
@@ -61,13 +70,37 @@ pub struct MaterializedViewCursor {
     last_tx_state_len: usize,
 
     // Current row cache - only cache the current row we're looking at
-    current_row: Option<(i64, Vec<Value>)>,
+    current_row: Option<(i64, RowValues)>,
 
     // Execution state for circuit processing
     execute_state: ExecuteState,
 
     // State machine for seek operations
     seek_state: SeekState,
+
+    // When true, `uncommitted` contains the COMPLETE matview result (not a delta).
+    // The cursor reads only from `uncommitted`, ignoring the btree.
+    // Used for recursive CTE matviews during uncommitted transaction reads.
+    full_result_mode: bool,
+
+    /// LIMIT from the matview's defining SELECT, applied at cursor level.
+    limit: Option<i64>,
+    /// Rows returned so far (for LIMIT enforcement).
+    rows_returned: i64,
+
+    /// True if the matview has ORDER BY (uses an index btree with composite keys).
+    is_index_organized: bool,
+    /// Cached copy of the matview's ORDER BY metadata. Empty for non-ORDER-BY views.
+    order_by: super::view::MatviewOrderBy,
+
+    /// In-tx materialized snapshot for ORDER BY views with a non-empty
+    /// uncommitted overlay. Populated lazily by `materialize_index_snapshot`
+    /// and consumed by `rewind`/`next`. Each entry is `(rowid, logical_values)`,
+    /// in composite-key sort order. None means we should walk the btree directly
+    /// (autocommit / empty overlay path).
+    sorted_index_snapshot: Option<Vec<(i64, RowValues)>>,
+    /// Position into `sorted_index_snapshot` for the current iteration.
+    sorted_index_pos: usize,
 }
 
 impl MaterializedViewCursor {
@@ -76,72 +109,323 @@ impl MaterializedViewCursor {
         view: Arc<Mutex<IncrementalView>>,
         pager: Arc<Pager>,
         tx_state: Arc<ViewTransactionState>,
+        conn: crate::sync::Arc<crate::Connection>,
     ) -> Result<Self> {
+        let (limit, order_by, is_index_organized) = {
+            let view_guard = view.lock();
+            (
+                view_guard.limit,
+                view_guard.order_by.clone(),
+                !view_guard.order_by.is_empty(),
+            )
+        };
         Ok(Self {
             btree_cursor,
             view,
             pager,
+            conn,
             uncommitted: RowKeyZSet::new(),
             tx_state,
             last_tx_state_len: 0,
             current_row: None,
             execute_state: ExecuteState::Uninitialized,
             seek_state: SeekState::Init,
+            full_result_mode: false,
+            limit,
+            rows_returned: 0,
+            is_index_organized,
+            order_by,
+            sorted_index_snapshot: None,
+            sorted_index_pos: 0,
         })
     }
 
-    /// Compute transaction changes lazily on first access
+    /// Get mutable access to the underlying btree cursor.
+    /// Used for operations like count() that need direct btree access.
+    /// Note: This returns the committed btree data only, not uncommitted changes.
+    pub fn btree_cursor_mut(&mut self) -> &mut dyn CursorTrait {
+        self.btree_cursor.as_mut()
+    }
+
+    /// Compute transaction changes lazily on first access.
+    ///
+    /// For chained matviews (matview reading from another matview) we must also
+    /// recompute upstream matviews' uncommitted output deltas and feed them as
+    /// inputs to our circuit — otherwise reads inside an open transaction miss
+    /// changes that flowed in through an upstream matview but have not yet been
+    /// committed (the COMMIT-time `apply_view_deltas` cascade hasn't run yet).
     fn ensure_tx_changes_computed(&mut self) -> Result<IOResult<()>> {
-        // Check if we've already processed the current state
-        let current_len = self.tx_state.len();
+        let current_len = self.total_relevant_tx_len();
         if current_len == self.last_tx_state_len {
             return Ok(IOResult::Done(()));
         }
 
-        // Get the view and the current transaction state
-        let mut view_guard = self.view.lock();
-        let table_deltas = self.tx_state.get_table_deltas();
+        let upstream_outputs = return_if_io!(self.compute_upstream_outputs());
 
-        // Process the deltas through the circuit to get materialized changes
         let mut uncommitted = DeltaSet::new();
-        for (table_name, delta) in table_deltas {
+        for (table_name, delta) in self.tx_state.get_table_deltas() {
             uncommitted.insert(table_name, delta);
         }
+        let our_refs: Vec<String> = {
+            let view_guard = self.view.lock();
+            view_guard
+                .get_referenced_tables()
+                .iter()
+                .map(|t| t.name.clone())
+                .collect()
+        };
+        for ref_name in &our_refs {
+            if let Some(out_delta) = upstream_outputs.get(ref_name) {
+                uncommitted.insert(ref_name.clone(), out_delta.clone());
+            }
+        }
 
-        let processed_delta = return_if_io!(view_guard.execute_with_uncommitted(
+        let mut view_guard = self.view.lock();
+        let (processed_delta, is_full_result) = return_if_io!(view_guard.execute_with_uncommitted(
             uncommitted,
             self.pager.clone(),
-            &mut self.execute_state
+            &mut self.execute_state,
+            &self.conn,
         ));
+        drop(view_guard);
 
         self.uncommitted = RowKeyZSet::from_delta(&processed_delta);
+        self.full_result_mode = is_full_result;
         self.last_tx_state_len = current_len;
+        // Snapshot is now stale; the next read for an ORDER BY view with
+        // overlay will rebuild it.
+        self.sorted_index_snapshot = None;
+        self.sorted_index_pos = 0;
         Ok(IOResult::Done(()))
     }
 
-    // Read the current btree entry as a vector (empty if no current position)
-    fn read_btree_delta_entry(&mut self) -> Result<IOResult<Vec<(HashableRow, isize)>>> {
-        let btree_rowid = return_if_io!(self.btree_cursor.rowid());
-        let rowid = match btree_rowid {
-            None => return Ok(IOResult::Done(Vec::new())),
-            Some(rowid) => rowid,
-        };
+    /// Total size of tx state across this view and every transitively-upstream
+    /// matview. Drives the change-detection cache; if any upstream's tx_state
+    /// grew since the last call we must recompute.
+    fn total_relevant_tx_len(&self) -> usize {
+        let mut total = self.tx_state.len();
+        for name in self.collect_upstream_view_names() {
+            if let Some(state) = self.conn.view_transaction_states.get(&name) {
+                total += state.len();
+            }
+        }
+        total
+    }
 
-        let btree_record = return_if_io!(self.btree_cursor.record()).ok_or_else(|| {
-            crate::LimboError::InternalError(
-                "Invalid data in materialized view: found a rowid, but not the row!".to_string(),
-            )
-        })?;
+    /// Collect upstream matview names in topological order (deepest first),
+    /// excluding self. Empty for non-chained matviews — the common case.
+    fn collect_upstream_view_names(&self) -> Vec<String> {
+        let direct_refs: Vec<String> = {
+            let view_guard = self.view.lock();
+            view_guard
+                .get_referenced_tables()
+                .iter()
+                .map(|t| t.name.clone())
+                .collect()
+        };
+        let schema = self.conn.schema.read();
+        let mut visited = std::collections::HashSet::<String>::new();
+        let mut order: Vec<String> = Vec::new();
+        // DFS each direct reference; only matview references contribute.
+        for name in &direct_refs {
+            Self::dfs_upstream(&schema, name, &mut visited, &mut order);
+        }
+        order
+    }
+
+    fn dfs_upstream(
+        schema: &crate::schema::Schema,
+        name: &str,
+        visited: &mut std::collections::HashSet<String>,
+        order: &mut Vec<String>,
+    ) {
+        if visited.contains(name) {
+            return;
+        }
+        let Some(view_arc) = schema.get_materialized_view(name) else {
+            return;
+        };
+        visited.insert(name.to_string());
+        let upstream_refs: Vec<String> = {
+            let upstream = view_arc.lock();
+            upstream
+                .get_referenced_tables()
+                .iter()
+                .map(|t| t.name.clone())
+                .collect()
+        };
+        for upstream_name in &upstream_refs {
+            Self::dfs_upstream(schema, upstream_name, visited, order);
+        }
+        order.push(name.to_string());
+    }
+
+    /// Compute the uncommitted output delta for each transitively-upstream
+    /// matview, in topological order. Each upstream's circuit is fed both its
+    /// own base-table deltas and the output deltas of its already-processed
+    /// upstreams. Returns a map from matview name to that view's uncommitted
+    /// output delta.
+    fn compute_upstream_outputs(
+        &mut self,
+    ) -> Result<IOResult<rustc_hash::FxHashMap<String, Delta>>> {
+        let upstream_names = self.collect_upstream_view_names();
+        let mut outputs: rustc_hash::FxHashMap<String, Delta> = rustc_hash::FxHashMap::default();
+        if upstream_names.is_empty() {
+            return Ok(IOResult::Done(outputs));
+        }
+        for upstream_name in &upstream_names {
+            let upstream_arc = {
+                let schema = self.conn.schema.read();
+                let Some(arc) = schema.get_materialized_view(upstream_name) else {
+                    continue;
+                };
+                arc
+            };
+            let upstream_refs: Vec<String> = {
+                let upstream = upstream_arc.lock();
+                upstream
+                    .get_referenced_tables()
+                    .iter()
+                    .map(|t| t.name.clone())
+                    .collect()
+            };
+            let mut sub_input = DeltaSet::new();
+            if let Some(up_tx_state) = self.conn.view_transaction_states.get(upstream_name) {
+                for (table_name, delta) in up_tx_state.get_table_deltas() {
+                    sub_input.insert(table_name, delta);
+                }
+            }
+            for ref_name in &upstream_refs {
+                if let Some(out_delta) = outputs.get(ref_name) {
+                    sub_input.insert(ref_name.clone(), out_delta.clone());
+                }
+            }
+            let mut upstream_guard = upstream_arc.lock();
+            let (output_delta, _is_full_result) = return_if_io!(upstream_guard
+                .execute_with_uncommitted(
+                    sub_input,
+                    self.pager.clone(),
+                    &mut self.execute_state,
+                    &self.conn,
+                ));
+            drop(upstream_guard);
+            outputs.insert(upstream_name.clone(), output_delta);
+        }
+        Ok(IOResult::Done(outputs))
+    }
+
+    /// Build the in-tx merged-and-sorted snapshot for an ORDER BY view.
+    ///
+    /// Walks the entire btree, sums weights with the uncommitted overlay
+    /// keyed by `HashableRow` (rowid + values), filters to positive weights,
+    /// and sorts by composite key using the matview's `IndexInfo.key_info`.
+    ///
+    /// Slice-1 implementation: O(committed_rows) memory. Future optimization
+    /// (Slice 4) can stream-merge instead. Skipped entirely when the overlay
+    /// is empty — in that case the cursor walks the btree directly.
+    ///
+    /// In `full_result_mode` (recursive-CTE matviews under uncommitted reads)
+    /// the overlay IS the full result; the btree is ignored to avoid double
+    /// counting. The `select_stmt.to_string()` re-execution in
+    /// `view::execute_with_uncommitted` already applied the matview's ORDER
+    /// BY and LIMIT, so we just sort defensively and let the cursor emit.
+    fn materialize_index_snapshot(&mut self) -> Result<IOResult<()>> {
+        use rustc_hash::FxHashMap as HashMap;
+        use std::cmp::Ordering;
+
+        let mut zset: HashMap<HashableRow, isize> = HashMap::default();
+
+        if !self.full_result_mode {
+            // Walk the entire btree; insert each row into the weighted map.
+            return_if_io!(self.btree_cursor.rewind());
+            loop {
+                let entry = return_if_io!(self.read_btree_delta_entry());
+                if entry.is_empty() {
+                    break;
+                }
+                for (row, w) in entry {
+                    *zset.entry(row).or_insert(0) += w;
+                }
+                return_if_io!(self.btree_cursor.next());
+            }
+        }
+
+        // Layer the overlay on top.
+        for (row, w) in self.uncommitted.iter() {
+            *zset.entry(row.clone()).or_insert(0) += w;
+        }
+
+        // Filter to positive weights and explode multiset entries (weight > 1)
+        // into individual rows.
+        let mut rows: Vec<(HashableRow, isize)> =
+            zset.into_iter().filter(|(_, w)| *w > 0).collect();
+
+        // Sort by composite key using the synthetic IndexInfo's comparators.
+        let index_info = self.order_by.to_index_info();
+        let key_info = &index_info.key_info[..self.order_by.len()];
+        let order_by_cols = &self.order_by.columns;
+        rows.sort_by(|(a_row, _), (b_row, _)| {
+            // Build comparator inputs: just the sort columns, in user-specified order.
+            for (i, (logical_pos, _, _)) in order_by_cols.iter().enumerate() {
+                let av = a_row
+                    .values
+                    .get(*logical_pos)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let bv = b_row
+                    .values
+                    .get(*logical_pos)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let cmp = crate::types::compare_immutable_single(&av, &bv, key_info[i].collation);
+                if cmp != Ordering::Equal {
+                    let directed = match key_info[i].sort_order {
+                        turso_parser::ast::SortOrder::Asc => cmp,
+                        turso_parser::ast::SortOrder::Desc => cmp.reverse(),
+                    };
+                    return directed;
+                }
+            }
+            // Tiebreak by rowid (always ASC, matches the synthetic IndexInfo).
+            a_row.rowid.cmp(&b_row.rowid)
+        });
+
+        // Materialize: expand multiset weights and store (rowid, values).
+        let mut snapshot = Vec::with_capacity(rows.len());
+        for (row, w) in rows {
+            for _ in 0..w {
+                snapshot.push((row.rowid, row.values.clone()));
+            }
+        }
+        self.sorted_index_snapshot = Some(snapshot);
+        self.sorted_index_pos = 0;
+        Ok(IOResult::Done(()))
+    }
+
+    // Read the current btree entry as a vector (empty if no current position).
+    //
+    // For ORDER BY (index-organized) views, the on-disk record layout is
+    // `[sort_v_1, ..., sort_v_N, rowid, non_sort_data..., weight]`. We MUST
+    // NOT use `btree_cursor.rowid()` here because the matview's IndexInfo has
+    // `has_rowid: false` (the last record value is `weight`, not rowid). We
+    // detect "no record" via `record()` returning `None` instead.
+    //
+    // The returned `HashableRow.values` is always in **logical** column
+    // order so that downstream merge-with-uncommitted-overlay works on
+    // matching value tuples regardless of storage layout.
+    fn read_btree_delta_entry(&mut self) -> Result<IOResult<Vec<(HashableRow, isize)>>> {
+        let btree_record = return_if_io!(self.btree_cursor.record());
+        let Some(btree_record) = btree_record else {
+            return Ok(IOResult::Done(Vec::new()));
+        };
         let mut btree_values = btree_record.get_values_owned()?;
 
-        // The last column should be the weight
+        // The last column is the weight (both layouts).
         let weight_value = btree_values.pop().ok_or_else(|| {
             crate::LimboError::InternalError(
                 "Invalid data in materialized view: no weight column found".to_string(),
             )
         })?;
-
-        // Convert the Value to isize weight
         let weight = match weight_value {
             Value::Numeric(Numeric::Integer(w)) => w as isize,
             _ => {
@@ -150,7 +434,6 @@ impl MaterializedViewCursor {
                 )))
             }
         };
-
         if weight <= 0 {
             return Err(crate::LimboError::InternalError(format!(
                 "Invalid data in materialized view: expected a positive weight, found {weight}"
@@ -159,8 +442,42 @@ impl MaterializedViewCursor {
 
         // TODO: std boundary conversion; adjust once incremental uses the
         // allocator with fallible allocations everywhere.
+        let (rowid, logical_values) = if self.is_index_organized {
+            // Index layout: [sort_v..N, rowid, non_sort_data...].
+            // After popping `weight`, `btree_values` has length num_data_cols.
+            let num_sort_cols = self.order_by.len();
+            if btree_values.len() <= num_sort_cols {
+                return Err(crate::LimboError::InternalError(format!(
+                    "Invalid data in materialized view: expected at least {} columns + rowid, got {}",
+                    num_sort_cols,
+                    btree_values.len()
+                )));
+            }
+            let rowid_val = btree_values.remove(num_sort_cols);
+            let rowid = match rowid_val {
+                Value::Numeric(Numeric::Integer(r)) => r,
+                _ => {
+                    return Err(crate::LimboError::InternalError(format!(
+                        "Invalid data in materialized view: expected integer rowid in index record at position {num_sort_cols}, found {rowid_val:?}"
+                    )))
+                }
+            };
+            // Permute storage order → logical order.
+            let logical = self.order_by.permute_storage_to_logical(&btree_values);
+            (rowid, logical)
+        } else {
+            // Table layout: rowid is the btree key.
+            let btree_rowid = return_if_io!(self.btree_cursor.rowid());
+            let rowid = btree_rowid.ok_or_else(|| {
+                crate::LimboError::InternalError(
+                    "Invalid data in materialized view: found a record, but no rowid!".to_string(),
+                )
+            })?;
+            (rowid, btree_values)
+        };
+
         Ok(IOResult::Done(vec![(
-            HashableRow::new(rowid, btree_values.into_iter().collect()),
+            HashableRow::new(rowid, logical_values),
             weight,
         )]))
     }
@@ -219,14 +536,23 @@ impl MaterializedViewCursor {
         };
 
         if let Some(target) = new_target {
-            self.seek_state = SeekState::Seek { target };
+            self.seek_state = SeekState::Seek {
+                target,
+                original_target_rowid: target_rowid,
+            };
         } else {
             self.seek_state = SeekState::Done;
         }
         Ok(IOResult::Done(()))
     }
 
-    /// Internal seek implementation that doesn't check preconditions
+    /// Internal seek implementation that doesn't check preconditions.
+    ///
+    /// `target_rowid` is the user's original GT/GE/LT/LE bound. It is
+    /// captured into `seek_state` on the Init→Seek transition so it
+    /// survives IO yields and resumes — callers that resume must NOT
+    /// rely on the parameter being meaningful (it is only read when we
+    /// transition out of Init).
     fn do_seek(&mut self, target_rowid: i64, op: SeekOp) -> Result<IOResult<SeekResult>> {
         loop {
             // Process state machine - need to handle mutable borrow carefully
@@ -235,10 +561,15 @@ impl MaterializedViewCursor {
                     self.current_row = None;
                     self.seek_state = SeekState::Seek {
                         target: target_rowid,
+                        original_target_rowid: target_rowid,
                     };
                 }
-                SeekState::Seek { target } => {
+                SeekState::Seek {
+                    target,
+                    original_target_rowid,
+                } => {
                     let target = *target;
+                    let original_target_rowid = *original_target_rowid;
                     let btree_result =
                         return_if_io!(self.btree_cursor.seek(SeekKey::TableRowId(target), op));
 
@@ -248,13 +579,22 @@ impl MaterializedViewCursor {
                             // Transition to Advancing state before calling next/prev.
                             // This ensures that if next/prev returns IO, we resume in
                             // Advancing state and don't redundantly call seek again.
-                            self.seek_state = SeekState::Advancing { target, op };
+                            self.seek_state = SeekState::Advancing {
+                                target,
+                                original_target_rowid,
+                                op,
+                            };
                             continue;
                         }
                         SeekResult::NotFound => Vec::new(),
                     };
 
-                    return_if_io!(self.process_btree_changes(target, target_rowid, op, changes));
+                    return_if_io!(self.process_btree_changes(
+                        target,
+                        original_target_rowid,
+                        op,
+                        changes
+                    ));
 
                     // Check if we're done or need to continue seeking
                     if matches!(self.seek_state, SeekState::Done) {
@@ -267,8 +607,13 @@ impl MaterializedViewCursor {
                     }
                     // Otherwise state is Seek with new target, loop continues
                 }
-                SeekState::Advancing { target, op } => {
+                SeekState::Advancing {
+                    target,
+                    original_target_rowid,
+                    op,
+                } => {
                     let target = *target;
+                    let original_target_rowid = *original_target_rowid;
                     let op = *op;
 
                     // Cursor is positioned at the leaf but current entry doesn't match.
@@ -284,7 +629,12 @@ impl MaterializedViewCursor {
                     // read_btree_delta_entry handles the case where cursor is at end
                     let changes = return_if_io!(self.read_btree_delta_entry());
 
-                    return_if_io!(self.process_btree_changes(target, target_rowid, op, changes));
+                    return_if_io!(self.process_btree_changes(
+                        target,
+                        original_target_rowid,
+                        op,
+                        changes
+                    ));
 
                     // Check if we're done or need to continue seeking
                     if matches!(self.seek_state, SeekState::Done) {
@@ -310,6 +660,15 @@ impl MaterializedViewCursor {
         // Ensure transaction changes are computed
         return_if_io!(self.ensure_tx_changes_computed());
 
+        // ORDER BY views are stored in an index btree keyed by composite
+        // (sort_cols + rowid). Rowid-keyed seeks against them don't make
+        // sense — bail clearly so a buggy planner emission surfaces.
+        if self.is_index_organized {
+            return Err(LimboError::ParseError(
+                "Rowid-keyed seek is not supported on materialized views with ORDER BY".to_string(),
+            ));
+        }
+
         let target_rowid = match &key {
             SeekKey::TableRowId(rowid) => *rowid,
             SeekKey::IndexKey(_) => {
@@ -323,6 +682,29 @@ impl MaterializedViewCursor {
     }
 
     pub fn next(&mut self) -> Result<IOResult<bool>> {
+        // LIMIT is enforced at the cursor: stop after `limit` rows have been
+        // emitted. `full_result_mode` already has LIMIT baked into its SQL
+        // string (see `view::execute_with_uncommitted` for recursive CTEs),
+        // so we don't apply it twice.
+        if !self.full_result_mode {
+            if let Some(limit) = self.limit {
+                if self.rows_returned >= limit {
+                    self.current_row = None;
+                    return Ok(IOResult::Done(false));
+                }
+            }
+        }
+        // ORDER BY (index-organized) views walk the btree in composite-key
+        // order. With a non-empty uncommitted overlay we consume from a
+        // pre-materialized snapshot; otherwise stream the btree directly.
+        if self.is_index_organized {
+            let advanced = return_if_io!(self.next_index_organized());
+            if advanced {
+                self.rows_returned += 1;
+            }
+            return Ok(IOResult::Done(advanced));
+        }
+
         // If there's a pending seek operation (due to IO), complete it first.
         // SeekState::Seek or SeekState::Advancing means IO was interrupted mid-seek and we need to resume.
         // SeekState::Init means cursor was never positioned - don't resume, fall through to check current_row.
@@ -330,7 +712,10 @@ impl MaterializedViewCursor {
             self.seek_state,
             SeekState::Seek { .. } | SeekState::Advancing { .. }
         ) {
-            // target is ignored when resuming
+            // The `target_rowid` argument is ignored on resume — the
+            // do_seek state machine reads its target from `seek_state`
+            // (both the iteration target and the user's original
+            // `original_target_rowid`).
             let result = return_if_io!(self.do_seek(0, SeekOp::GT));
             return Ok(IOResult::Done(result == SeekResult::Found));
         }
@@ -344,6 +729,30 @@ impl MaterializedViewCursor {
         // Use GT to find the next row after current position
         let result = return_if_io!(self.do_seek(*current_rowid, SeekOp::GT));
         Ok(IOResult::Done(result == SeekResult::Found))
+    }
+
+    /// Cursor advance for ORDER BY views.
+    /// - With overlay: consume from the materialized snapshot.
+    /// - Without overlay: walk the btree in composite-key order.
+    fn next_index_organized(&mut self) -> Result<IOResult<bool>> {
+        if let Some(snapshot) = &self.sorted_index_snapshot {
+            if self.sorted_index_pos >= snapshot.len() {
+                self.current_row = None;
+                return Ok(IOResult::Done(false));
+            }
+            self.current_row = Some(snapshot[self.sorted_index_pos].clone());
+            self.sorted_index_pos += 1;
+            return Ok(IOResult::Done(true));
+        }
+        return_if_io!(self.btree_cursor.next());
+        let entry = return_if_io!(self.read_btree_delta_entry());
+        if let Some((row, _weight)) = entry.into_iter().next() {
+            self.current_row = Some((row.rowid, row.values));
+            Ok(IOResult::Done(true))
+        } else {
+            self.current_row = None;
+            Ok(IOResult::Done(false))
+        }
     }
 
     pub fn column(&mut self, col: usize) -> Result<IOResult<Value>> {
@@ -361,9 +770,51 @@ impl MaterializedViewCursor {
     }
 
     pub fn rewind(&mut self) -> Result<IOResult<()>> {
-        return_if_io!(self.ensure_tx_changes_computed());
-        // Seek GT from i64::MIN to find the first row using internal do_seek
-        let _result = return_if_io!(self.do_seek(i64::MIN, SeekOp::GT));
+        // Reset LIMIT counter; rewind is a fresh iteration.
+        self.rows_returned = 0;
+
+        if self.is_index_organized {
+            return_if_io!(self.ensure_tx_changes_computed());
+            if !self.uncommitted.is_empty() {
+                // In-tx with overlay: materialize merged sorted snapshot.
+                if self.sorted_index_snapshot.is_none() {
+                    return_if_io!(self.materialize_index_snapshot());
+                }
+                self.sorted_index_pos = 0;
+                self.current_row = self
+                    .sorted_index_snapshot
+                    .as_ref()
+                    .and_then(|s| s.first().cloned());
+                if self.current_row.is_some() {
+                    self.sorted_index_pos = 1;
+                }
+            } else {
+                // Autocommit / empty overlay: walk the btree directly.
+                return_if_io!(self.btree_cursor.rewind());
+                let entry = return_if_io!(self.read_btree_delta_entry());
+                self.current_row = entry
+                    .into_iter()
+                    .next()
+                    .map(|(row, _)| (row.rowid, row.values));
+            }
+        } else {
+            return_if_io!(self.ensure_tx_changes_computed());
+            // Seek GT from i64::MIN to find the first row using internal do_seek
+            let _result = return_if_io!(self.do_seek(i64::MIN, SeekOp::GT));
+        }
+
+        // Apply LIMIT to the first row (LIMIT 0 → no rows; LIMIT >0 → consume one).
+        if !self.full_result_mode {
+            if let Some(limit) = self.limit {
+                if limit <= 0 {
+                    self.current_row = None;
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
+        if self.current_row.is_some() {
+            self.rows_returned = 1;
+        }
         Ok(IOResult::Done(()))
     }
 
@@ -457,6 +908,7 @@ mod tests {
             view_mutex.clone(),
             pager.clone(),
             tx_state.clone(),
+            conn.clone(),
         )?;
 
         Ok((cursor, tx_state, pager))
@@ -1937,7 +2389,7 @@ mod tests {
             let mock_ptr = mock_cursor_box.as_ref() as *const dyn CursorTrait;
 
             let mut cursor =
-                MaterializedViewCursor::new(mock_cursor_box, view_mutex, pager, tx_state)?;
+                MaterializedViewCursor::new(mock_cursor_box, view_mutex, pager, tx_state, conn)?;
 
             // Use LE so that rowid=1 satisfies the condition (1 <= 5)
             let seek_op = SeekOp::LE { eq_only: false };

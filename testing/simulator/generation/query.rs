@@ -14,7 +14,8 @@ use sql_generation::{
     generation::{Arbitrary, ArbitraryFrom, GenerationContext, query::SelectFree},
     model::{
         query::{
-            Create, CreateIndex, Delete, DropIndex, Insert, Select,
+            Create, CreateIndex, CreateMaterializedView, Delete, DropIndex, DropMaterializedView,
+            Insert, Select,
             alter_table::AlterTable,
             pragma::{Pragma, VacuumMode},
             update::Update,
@@ -61,7 +62,9 @@ fn random_update<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationC
 
 fn random_drop<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
     assert!(!conn_ctx.tables().is_empty());
-    Query::Drop(sql_generation::model::query::Drop::arbitrary(rng, conn_ctx))
+    Query::DropTable(sql_generation::model::query::DropTable::arbitrary(
+        rng, conn_ctx,
+    ))
 }
 
 fn random_create_index<R: rand::Rng + ?Sized>(
@@ -87,20 +90,147 @@ fn random_create_index<R: rand::Rng + ?Sized>(
 }
 
 fn random_pragma<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
-    if !conn_ctx.tables().is_empty() && rng.random_bool(0.5) {
-        let table = conn_ctx.tables().choose(rng).unwrap();
-        return Query::Pragma(Pragma::ForeignKeyList(table.name.clone()));
+    use sql_generation::model::query::pragma::CdcMode;
+
+    // 50% chance of generating a CDC pragma, 50% chance of vacuum pragma
+    if rng.random_bool(0.5) {
+        Query::Pragma(Pragma::CaptureDataChanges(CdcMode::Full))
+    } else {
+        if !conn_ctx.tables().is_empty() && rng.random_bool(0.5) {
+            let table = conn_ctx.tables().choose(rng).unwrap();
+            return Query::Pragma(Pragma::ForeignKeyList(table.name.clone()));
+        }
+
+        const ALL_MODES: [VacuumMode; 2] = [
+            VacuumMode::None,
+            // VacuumMode::Incremental, not implemented yet
+            VacuumMode::Full,
+        ];
+        let mode = ALL_MODES.choose(rng).unwrap();
+        Query::Pragma(Pragma::AutoVacuumMode(mode.clone()))
+    }
+}
+
+fn random_create_materialized_view<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    conn_ctx: &impl GenerationContext,
+) -> Query {
+    assert!(!conn_ctx.tables().is_empty());
+    let name = format!("matview_{}", rng.random_range(1000..9999u32));
+
+    // 30% chance to generate a recursive CTE matview if we can find a suitable table
+    if rng.random_bool(0.3) {
+        if let Some(select) = try_generate_recursive_cte_select(rng, conn_ctx, &name) {
+            return Query::CreateMaterializedView(CreateMaterializedView { name, select });
+        }
     }
 
-    const ALL_MODES: [VacuumMode; 2] = [
-        VacuumMode::None,
-        // VacuumMode::Incremental, not implemented yet
-        VacuumMode::Full,
-    ];
+    // 20% chance to generate a chained matview (JOIN base table with existing matview)
+    if rng.random_bool(0.2) {
+        if let Some(select) = try_generate_chained_matview_select(rng, conn_ctx) {
+            return Query::CreateMaterializedView(CreateMaterializedView { name, select });
+        }
+    }
 
-    let mode = ALL_MODES.choose(rng).unwrap();
+    // Default: simple SELECT * FROM table
+    let table = conn_ctx.tables().choose(rng).unwrap();
+    let select = Select::simple(
+        table.name.clone(),
+        sql_generation::model::query::predicate::Predicate::true_(),
+    );
+    Query::CreateMaterializedView(CreateMaterializedView { name, select })
+}
 
-    Query::Pragma(Pragma::AutoVacuumMode(mode.clone()))
+fn random_drop_materialized_view<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    conn_ctx: &impl GenerationContext,
+) -> Query {
+    // Try to find a materialized view to drop from the context
+    let matviews: Vec<_> = conn_ctx.views().iter().filter(|v| v.materialized).collect();
+    if let Some(view) = matviews.choose(rng) {
+        Query::DropMaterializedView(DropMaterializedView {
+            name: view.name.clone(),
+        })
+    } else {
+        // No matviews in context - generate a random name in the expected range
+        // This handles the case where matviews were created earlier in the same plan
+        // but shadow state hasn't been updated yet
+        let name = format!("matview_{}", rng.random_range(1000..9999u32));
+        Query::DropMaterializedView(DropMaterializedView { name })
+    }
+}
+
+/// Try to generate a recursive CTE SELECT for a hierarchical matview.
+/// Returns None if no suitable table is found (needs at least 2 INTEGER columns).
+fn try_generate_recursive_cte_select<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    conn_ctx: &impl GenerationContext,
+    cte_name: &str,
+) -> Option<Select> {
+    use sql_generation::model::table::ColumnType;
+
+    // Find tables with at least 2 INTEGER columns (for id and parent_id pattern)
+    let suitable_tables: Vec<_> = conn_ctx
+        .tables()
+        .iter()
+        .filter(|t| {
+            let int_cols: Vec<_> = t
+                .columns
+                .iter()
+                .filter(|c| matches!(c.column_type, ColumnType::Integer))
+                .collect();
+            int_cols.len() >= 2
+        })
+        .collect();
+
+    if suitable_tables.is_empty() {
+        return None;
+    }
+
+    let table = suitable_tables.choose(rng).unwrap();
+    let int_columns: Vec<_> = table
+        .columns
+        .iter()
+        .filter(|c| matches!(c.column_type, ColumnType::Integer))
+        .collect();
+
+    // Pick first INTEGER column as id, second as parent_id
+    let id_column = int_columns[0].name.clone();
+    let parent_column = int_columns[1].name.clone();
+
+    // Collect remaining columns as content columns
+    let content_columns: Vec<String> = table
+        .columns
+        .iter()
+        .filter(|c| c.name != id_column && c.name != parent_column)
+        .map(|c| c.name.clone())
+        .collect();
+
+    Some(Select::recursive_hierarchy_cte(
+        cte_name.to_string(),
+        table.name.clone(),
+        id_column,
+        parent_column,
+        content_columns,
+        10, // max_depth (unused but required by API)
+    ))
+}
+
+/// Try to generate a chained matview SELECT that references an existing matview.
+/// Returns None if no materialized views exist.
+fn try_generate_chained_matview_select<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    conn_ctx: &impl GenerationContext,
+) -> Option<Select> {
+    use sql_generation::model::query::predicate::Predicate;
+
+    let matviews: Vec<_> = conn_ctx.views().iter().filter(|v| v.materialized).collect();
+    if matviews.is_empty() {
+        return None;
+    }
+
+    let matview = matviews.choose(rng).unwrap();
+    Some(Select::simple(matview.name.clone(), Predicate::true_()))
 }
 
 fn random_alter_table<R: rand::Rng + ?Sized>(
@@ -199,7 +329,7 @@ impl QueryDiscriminants {
             QueryDiscriminants::Insert => Some(random_insert),
             QueryDiscriminants::Delete => Some(random_delete),
             QueryDiscriminants::Update => Some(random_update),
-            QueryDiscriminants::Drop => Some(random_drop),
+            QueryDiscriminants::DropTable => Some(random_drop),
             QueryDiscriminants::CreateIndex => Some(random_create_index),
             QueryDiscriminants::AlterTable => Some(random_alter_table),
             QueryDiscriminants::DropIndex => Some(random_drop_index),
@@ -220,6 +350,11 @@ impl QueryDiscriminants {
             QueryDiscriminants::Placeholder => {
                 unreachable!("Query Placeholders should not be generated")
             }
+            QueryDiscriminants::CreateMaterializedView => Some(random_create_materialized_view),
+            QueryDiscriminants::DropMaterializedView => Some(random_drop_materialized_view),
+            QueryDiscriminants::CreateView | QueryDiscriminants::DropView => {
+                unreachable!("regular view queries not yet implemented in generation")
+            }
         }
     }
 
@@ -232,11 +367,10 @@ impl QueryDiscriminants {
             QueryDiscriminants::Insert => remaining.insert,
             QueryDiscriminants::Delete => remaining.delete,
             QueryDiscriminants::Update => remaining.update,
-            QueryDiscriminants::Drop => remaining.drop,
+            QueryDiscriminants::DropTable => remaining.drop,
             QueryDiscriminants::CreateIndex => remaining.create_index,
             QueryDiscriminants::AlterTable => remaining.alter_table,
             QueryDiscriminants::DropIndex => remaining.drop_index,
-            QueryDiscriminants::Pragma => remaining.pragma_count,
             QueryDiscriminants::CreateSequence => remaining.create_sequence,
             QueryDiscriminants::DropSequence => remaining.drop_sequence,
             QueryDiscriminants::Nextval => remaining.nextval,
@@ -251,6 +385,12 @@ impl QueryDiscriminants {
             }
             QueryDiscriminants::Placeholder => {
                 unreachable!("Query Placeholders should not be generated")
+            }
+            QueryDiscriminants::Pragma => remaining.pragma_count + remaining.enable_cdc,
+            QueryDiscriminants::CreateMaterializedView => remaining.create_matview,
+            QueryDiscriminants::DropMaterializedView => remaining.drop_matview,
+            QueryDiscriminants::CreateView | QueryDiscriminants::DropView => {
+                0 // regular view queries not yet implemented in generation
             }
         }
     }

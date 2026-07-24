@@ -39,6 +39,24 @@ pub struct QueryProfile {
     pub nextval_weight: u32,
     #[garde(skip)]
     pub setval_weight: u32,
+    #[garde(skip)]
+    pub create_matview_weight: u32,
+    #[garde(skip)]
+    pub drop_matview_weight: u32,
+    #[garde(skip)]
+    pub enable_cdc_weight: u32,
+    /// Enable plan-level transaction batching (groups multiple DML ops in transactions)
+    #[garde(skip)]
+    pub enable_transaction_batching: bool,
+    /// Probability of starting a batch transaction (0.0-1.0)
+    #[garde(skip)]
+    pub transaction_batch_start_probability: f64,
+    /// Probability of committing when in transaction (0.0-1.0)
+    #[garde(skip)]
+    pub transaction_batch_commit_probability: f64,
+    /// Enable coordinated materialized view scenario (setup base tables + matviews first)
+    #[garde(skip)]
+    pub enable_coordinated_matview_scenario: bool,
 }
 
 impl Default for QueryProfile {
@@ -60,6 +78,13 @@ impl Default for QueryProfile {
             drop_sequence_weight: 1,
             nextval_weight: 10,
             setval_weight: 2,
+            create_matview_weight: 0,
+            drop_matview_weight: 0,
+            enable_cdc_weight: 0,
+            enable_transaction_batching: true,
+            transaction_batch_start_probability: 0.3,
+            transaction_batch_commit_probability: 0.3,
+            enable_coordinated_matview_scenario: false,
         }
     }
 }
@@ -81,6 +106,9 @@ impl QueryProfile {
             + self.drop_sequence_weight
             + self.nextval_weight
             + self.setval_weight
+            + self.create_matview_weight
+            + self.drop_matview_weight
+            + self.enable_cdc_weight
     }
 }
 

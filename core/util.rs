@@ -226,6 +226,7 @@ struct ParseSchemaRowsInner {
     dbsp_state_roots: HashMap<String, i64>,
     dbsp_state_index_roots: HashMap<String, i64>,
     materialized_view_info: HashMap<String, (String, i64)>,
+    deferred_foreign_tables: Vec<(String, String)>,
 }
 
 impl ParseSchemaRowsState {
@@ -241,6 +242,7 @@ impl ParseSchemaRowsState {
                 dbsp_state_roots: HashMap::default(),
                 dbsp_state_index_roots: HashMap::default(),
                 materialized_view_info: HashMap::default(),
+                deferred_foreign_tables: Vec::new(),
             }),
         }
     }
@@ -272,6 +274,7 @@ pub fn parse_schema_rows(
             dbsp_state_roots,
             dbsp_state_index_roots,
             materialized_view_info,
+            deferred_foreign_tables,
         } = inner;
         crate::return_if_io!(rows.run_with_row_callback_nonblock(|row| {
             let ty = row.get::<&str>(0)?;
@@ -293,6 +296,7 @@ pub fn parse_schema_rows(
                 materialized_view_info,
                 resolve_attached_db,
                 dialect,
+                deferred_foreign_tables,
             )
         }));
     }
@@ -303,12 +307,23 @@ pub fn parse_schema_rows(
         .take()
         .expect("ParseSchemaRowsState not initialized");
     let has_mv_store = inner.rows.mv_store().is_some();
+    let known_matview_names: HashSet<String> = inner
+        .materialized_view_info
+        .keys()
+        .map(|n| normalize_ident(n))
+        .collect();
     schema.populate_indices(
         syms,
         inner.from_sql_indexes,
         inner.automatic_indices,
         has_mv_store,
+        &known_matview_names,
     )?;
+    // Process deferred foreign tables before matviews — matviews may reference foreign tables
+    for (name, sql) in inner.deferred_foreign_tables {
+        schema.populate_foreign_table(&name, &sql, syms)?;
+    }
+
     schema.populate_materialized_views(
         inner.materialized_view_info,
         inner.dbsp_state_roots,
@@ -430,14 +445,10 @@ pub fn module_args_from_sql(sql: &str) -> Result<Vec<turso_ext::Value>> {
                     in_quotes = true;
                 }
             }
-            ',' => {
-                if !in_quotes {
-                    if !current_arg.trim().is_empty() {
-                        args.push(turso_ext::Value::from_text(current_arg.trim().to_string()));
-                        current_arg.clear();
-                    }
-                } else {
-                    current_arg.push(c);
+            ',' if !in_quotes => {
+                if !current_arg.trim().is_empty() {
+                    args.push(turso_ext::Value::from_text(current_arg.trim().to_string()));
+                    current_arg.clear();
                 }
             }
             _ => {
@@ -2306,11 +2317,11 @@ pub fn check_expr_references_column(expr: &ast::Expr, col_name_normalized: &str)
                     return Ok(WalkControl::SkipChildren);
                 }
             }
-            ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col) => {
-                if col.as_str().eq_ignore_ascii_case(col_name_normalized) {
-                    found = true;
-                    return Ok(WalkControl::SkipChildren);
-                }
+            ast::Expr::Qualified(_, col) | ast::Expr::DoublyQualified(_, _, col)
+                if col.as_str().eq_ignore_ascii_case(col_name_normalized) =>
+            {
+                found = true;
+                return Ok(WalkControl::SkipChildren);
             }
             _ => {}
         }
@@ -3511,10 +3522,8 @@ pub fn rewrite_check_expr_table_refs(expr: &mut ast::Expr, from: &str, to: &str)
                 ast::Expr::InSelect { rhs, .. } => {
                     rewrite_select_table_refs(rhs, from, to);
                 }
-                ast::Expr::InTable { rhs, .. } => {
-                    if rhs.name.as_str().eq_ignore_ascii_case(from) {
-                        rhs.name = ast::Name::exact(to.to_owned());
-                    }
+                ast::Expr::InTable { rhs, .. } if rhs.name.as_str().eq_ignore_ascii_case(from) => {
+                    rhs.name = ast::Name::exact(to.to_owned());
                 }
                 _ => {}
             }
@@ -4227,10 +4236,10 @@ fn expr_still_references_renamed_column(
                     }
                 }
             }
-            ast::Expr::Id(name) | ast::Expr::Name(name) => {
-                if rename_unqualified && name.as_str().eq_ignore_ascii_case(old_col) {
-                    found = true;
-                }
+            ast::Expr::Id(name) | ast::Expr::Name(name)
+                if rename_unqualified && name.as_str().eq_ignore_ascii_case(old_col) =>
+            {
+                found = true;
             }
             _ => {}
         }

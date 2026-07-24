@@ -20,6 +20,7 @@ sql_gen_macros = { path = "../sql_gen_macros" }
 strum = { workspace = true }
 anarchist-readable-name-generator-lib = "0.2.0"
 serde = { workspace = true, features = ["derive"], optional = true }
+workspace-hack = { version = "0.1", path = "../../../workspace-hack" }
 
 [dev-dependencies]
 proptest = "1.9"

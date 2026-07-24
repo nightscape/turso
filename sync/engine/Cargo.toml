@@ -22,6 +22,7 @@ base64 = "0.22.1"
 prost = "0.14.1"
 roaring = "0.11.2"
 crc32c = "0.6.8"
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { version = "0.2.172" }
@@ -36,6 +37,3 @@ tokio = { workspace = true, features = [
     "test-util",
 ] }
 uuid = "1.17.0"
-rand = { workspace = true }
-rand_chacha = { workspace = true }
-futures = { workspace = true }

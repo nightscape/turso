@@ -3,7 +3,7 @@ use super::plan::{
     select_star, Distinctness, InSeekSource, JoinOrderMember, NamedWindowBound, NamedWindowDef,
     Operation, OuterQueryReference, QueryDestination, Search, TableReferences, Window,
 };
-use crate::schema::Table;
+use crate::schema::{Column, Table};
 use crate::stack::trace_stack;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
@@ -26,9 +26,8 @@ use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
 use crate::{vdbe::builder::ProgramBuilder, Result};
 use std::borrow::Cow;
-use turso_parser::ast::ResultColumn;
 use turso_parser::ast::SortOrder;
-use turso_parser::ast::{self, CompoundSelect, Expr};
+use turso_parser::ast::{self, CompoundSelect, Expr, ResultColumn};
 
 /// Maximum number of columns in a result set.
 /// SQLite's default SQLITE_MAX_COLUMN is 2000, with a hard upper limit of 32767.
@@ -160,6 +159,7 @@ fn select_plan_first_virtual_table_name(select_plan: &SelectPlan) -> Option<Stri
     None
 }
 
+#[turso_macros::trace_stack]
 pub fn prepare_select_plan(
     select: ast::Select,
     resolver: &Resolver,

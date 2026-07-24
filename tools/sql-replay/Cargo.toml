@@ -1,0 +1,21 @@
+[package]
+name = "turso-sql-replay"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+description = "Replay .sql trace files against Turso with CDC callback support and matview consistency checking"
+
+[[bin]]
+name = "turso-sql-replay"
+path = "src/main.rs"
+
+[dependencies]
+turso = { workspace = true }
+turso_core = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+anyhow = { workspace = true }
+clap = { version = "4.5.47", features = ["derive"] }
+chrono = { version = "0.4.42", default-features = false, features = ["std"] }
+regex = "1.11.1"
+tempfile = "3"
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }

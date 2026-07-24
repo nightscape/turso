@@ -510,6 +510,12 @@ pub(crate) static DATABASE_MANAGER: LazyLock<
 pub fn clear_database_registry() {
     DATABASE_MANAGER.lock().clear();
 }
+/// Type alias for change callback entries to reduce type complexity.
+type ChangeCallbackEntry = (
+    types::CallbackId,
+    Option<std::collections::HashSet<String>>, // relation filter (None = all)
+    Arc<dyn Fn(&types::RelationChangeEvent) + Send + Sync>,
+);
 
 /// The `Database` object contains per database file state that is shared
 /// between multiple connections.
@@ -560,6 +566,9 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
     page_codec_id: Option<PageCodecId>,
+    /// Callbacks for relation changes (tables and materialized views).
+    /// Each callback has an optional filter - if Some, only fires for those relations.
+    pub(crate) change_callbacks: RwLock<Vec<types::ChangeCallbackEntry>>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -713,6 +722,8 @@ impl Database {
             page_codec_id,
 
             durable_storage: None,
+
+            change_callbacks: RwLock::new(Vec::new()),
         };
 
         db.register_global_builtin_extensions()

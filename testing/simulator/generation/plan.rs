@@ -3,7 +3,7 @@ use std::{num::NonZeroUsize, vec};
 use sql_generation::{
     generation::{Arbitrary, ArbitraryFrom, GenerationContext, frequency},
     model::query::{
-        Create,
+        Create, CreateMaterializedView, Insert,
         transaction::{Begin, Commit},
     },
 };
@@ -47,7 +47,38 @@ impl InteractionPlan {
         rng: &mut impl rand::Rng,
         env: &mut SimulatorEnv,
     ) -> Option<Interactions> {
-        // First interaction
+        // First interaction or continue scenario initialization
+        if self.len_properties() == 0 {
+            // Check if coordinated matview scenario is enabled
+            if env.profile.query.enable_coordinated_matview_scenario {
+                // Generate coordinated matview scenario
+                let scenario = CoordinatedMatviewScenario::generate();
+
+                // Build all setup queries: CREATE TABLEs, CREATE INDEXes, initial INSERTs, CREATE MATERIALIZED VIEWs
+                let mut setup_queries = Vec::new();
+                setup_queries.extend(scenario.create_table_queries());
+                setup_queries.extend(scenario.create_index_queries());
+                setup_queries.extend(scenario.initial_insert_queries());
+                setup_queries.extend(scenario.create_matview_queries());
+
+                // Store remaining queries for subsequent interactions
+                self.coordinated_matview_scenario_queries = Some(setup_queries);
+            }
+        }
+
+        // If we have pending scenario queries, generate them first
+        if let Some(ref mut queries) = self.coordinated_matview_scenario_queries {
+            if !queries.is_empty() {
+                let query = queries.remove(0);
+                let interactions = Interactions::new(0, InteractionsType::Query(query));
+                return Some(interactions);
+            } else {
+                // All scenario queries generated, clear the flag
+                self.coordinated_matview_scenario_queries = None;
+            }
+        }
+
+        // First interaction (if scenario not enabled or completed)
         if self.len_properties() == 0 {
             // First create at least one table
             let create_query = Create::arbitrary(&mut env.rng.clone(), &env.connection_context(0));
@@ -97,18 +128,60 @@ impl InteractionPlan {
         }
 
         if self.len_properties() < num_interactions {
-            let conn_index = env.choose_conn(rng);
-            let interactions = if self.mvcc && !env.conn_in_transaction(conn_index) {
-                let query = Query::Begin(Begin::Concurrent);
-                Interactions::new(conn_index, InteractionsType::Query(query))
-            } else if self.mvcc
-                && env.conn_in_transaction(conn_index)
-                && env.has_conn_executed_query_after_transaction(conn_index)
-                && rng.random_bool(0.4)
-            {
-                let query = Query::Commit(Commit);
-                Interactions::new(conn_index, InteractionsType::Query(query))
+            // For non-MVCC mode, if any connection has an exclusive lock (BEGIN IMMEDIATE),
+            // we must use that connection to avoid "Database is busy" errors.
+            // Check both executed transactions (env) and pending generated transactions (plan).
+            let conn_index = if !self.mvcc {
+                if let Some(txn_conn) = self.pending_txn_conn() {
+                    // Use the connection with pending generated transaction
+                    txn_conn
+                } else if let Some(txn_conn) =
+                    (0..env.connections.len()).find(|idx| env.conn_in_transaction(*idx))
+                {
+                    // Use the connection that has an executed transaction
+                    txn_conn
+                } else {
+                    env.choose_conn(rng)
+                }
             } else {
+                env.choose_conn(rng)
+            };
+
+            // Check both executed and pending transaction state
+            let in_txn =
+                env.conn_in_transaction(conn_index) || self.pending_txn_conn() == Some(conn_index);
+            let batch_enabled = env.profile.query.enable_transaction_batching;
+
+            // For non-MVCC mode, check if ANY connection is in a transaction (executed or pending)
+            // (BEGIN IMMEDIATE takes exclusive write lock, so only one txn at a time)
+            let any_conn_in_txn = !self.mvcc
+                && (self.pending_txn_conn().is_some()
+                    || (0..env.connections.len()).any(|idx| env.conn_in_transaction(idx)));
+
+            // Plan-level transaction batching (both MVCC and non-MVCC modes)
+            let interactions = if !in_txn
+                && batch_enabled
+                && !any_conn_in_txn  // Don't start new txn if another conn has exclusive lock
+                && rng.random_bool(env.profile.query.transaction_batch_start_probability)
+            {
+                // Start a batch transaction (CONCURRENT for MVCC, IMMEDIATE for non-MVCC)
+                let begin = if self.mvcc {
+                    Begin::Concurrent
+                } else {
+                    Begin::Immediate
+                };
+                // Track the pending transaction
+                self.set_pending_txn_conn(Some(conn_index));
+                Interactions::new(conn_index, InteractionsType::Query(Query::Begin(begin)))
+            } else if in_txn
+                && env.has_conn_executed_query_after_transaction(conn_index)
+                && rng.random_bool(env.profile.query.transaction_batch_commit_probability)
+            {
+                // Randomly commit the batch - clear pending transaction state
+                self.set_pending_txn_conn(None);
+                Interactions::new(conn_index, InteractionsType::Query(Query::Commit(Commit)))
+            } else {
+                // Generate property/query
                 let conn_ctx = &env.connection_context(conn_index);
                 let mut interactions =
                     Interactions::arbitrary_from(rng, conn_ctx, (env, self.stats(), conn_index));
@@ -135,9 +208,21 @@ impl InteractionPlan {
             Some(interactions)
         } else {
             // after we generated all interactions if some connection is still in a transaction, commit
+            // For non-MVCC mode, also check pending_txn_conn to handle the case where
+            // a DISCONNECT was generated (clearing pending state) but not yet executed
             (0..env.connections.len())
-                .find(|idx| env.conn_in_transaction(*idx))
+                .find(|idx| {
+                    let executed_txn = env.conn_in_transaction(*idx);
+                    if self.mvcc {
+                        executed_txn
+                    } else {
+                        // For non-MVCC, also require pending_txn_conn to be set
+                        // This prevents generating COMMIT after a DISCONNECT was generated
+                        executed_txn && self.pending_txn_conn() == Some(*idx)
+                    }
+                })
                 .map(|conn_index| {
+                    self.set_pending_txn_conn(None);
                     Interactions::new(conn_index, InteractionsType::Query(Query::Commit(Commit)))
                 })
         }
@@ -242,6 +327,9 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
     /// try to generate the next [Interactions] and store it
     fn next(&mut self, env: &mut SimulatorEnv) -> Option<Interaction> {
         let mvcc = self.plan.mvcc;
+        // Extract pending_txn_conn before the closure to avoid borrow conflicts
+        let pending_txn_conn = self.plan.pending_txn_conn();
+
         let mut next_interaction = || match self.peek(env) {
             Some(peek_interaction) => {
                 if mvcc && peek_interaction.requires_exclusive_tx() {
@@ -261,6 +349,28 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
                                 .build()
                                 .unwrap(),
                         );
+                    }
+                }
+
+                // For non-MVCC mode: if any connection has an exclusive lock (BEGIN IMMEDIATE),
+                // and the peeked interaction is for a different connection, commit first
+                // to avoid "Database is busy" errors
+                if !mvcc {
+                    // Check both pending and executed transactions
+                    let txn_conn = pending_txn_conn.or_else(|| {
+                        (0..env.connections.len()).find(|idx| env.conn_in_transaction(*idx))
+                    });
+                    if let Some(txn_conn) = txn_conn {
+                        if peek_interaction.connection_index != txn_conn {
+                            // Interaction is for a different connection - commit the transaction first
+                            return Some(
+                                InteractionBuilder::from_interaction(peek_interaction)
+                                    .interaction(InteractionType::Query(Query::Commit(Commit)))
+                                    .connection_index(txn_conn)
+                                    .build()
+                                    .unwrap(),
+                            );
+                        }
                     }
                 }
 
@@ -297,12 +407,33 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
             }
         };
         let next_interaction = next_interaction();
+
+        // Clear pending transaction state when we commit or disconnect
+        if let Some(ref interaction) = next_interaction {
+            if !mvcc {
+                match &interaction.interaction {
+                    InteractionType::Query(Query::Commit(_)) => {
+                        // COMMIT ends the transaction
+                        self.plan.set_pending_txn_conn(None);
+                    }
+                    InteractionType::Fault(Fault::Disconnect | Fault::ReopenDatabase) => {
+                        // Disconnect/reopen causes implicit rollback
+                        self.plan.set_pending_txn_conn(None);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // intercept interaction to update metrics
         if let Some(next_interaction) = next_interaction.as_ref() {
             // Skip counting queries that come from Properties that only exist to check tables
-            if let Some(property_meta) = next_interaction.property_meta
-                && !property_meta.property.check_tables()
-            {
+            // But always count direct query interactions (property_meta is None)
+            let should_update_stats = match next_interaction.property_meta {
+                Some(property_meta) => !property_meta.property.check_tables(),
+                None => true,
+            };
+            if should_update_stats {
                 self.plan.stats_mut().update(next_interaction);
             }
             self.plan.push(next_interaction.clone());
@@ -372,25 +503,27 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats, usize)> for Interactions {
         let query_distr = QueryDistribution::new(queries, &remaining_);
 
         #[expect(clippy::type_complexity)]
-        let mut choices: Vec<(u32, Box<dyn Fn(&mut R) -> Interactions>)> = vec![
-            (
-                query_distr.weights().total_weight(),
-                Box::new(|rng: &mut R| {
-                    Interactions::new(
-                        conn_index,
-                        InteractionsType::Query(Query::arbitrary_from(rng, conn_ctx, &query_distr)),
-                    )
-                }),
-            ),
-            (
+        let mut choices: Vec<(u32, Box<dyn Fn(&mut R) -> Interactions>)> = vec![(
+            query_distr.weights().total_weight(),
+            Box::new(|rng: &mut R| {
+                Interactions::new(
+                    conn_index,
+                    InteractionsType::Query(Query::arbitrary_from(rng, conn_ctx, &query_distr)),
+                )
+            }),
+        )];
+
+        // Only include faults if enabled in profile
+        if env.profile.io.fault.enable {
+            choices.push((
                 remaining_
                     .select
                     .min(remaining_.insert)
                     .min(remaining_.create)
                     .max(1),
                 Box::new(|rng: &mut R| random_fault(rng, env, conn_index)),
-            ),
-        ];
+            ));
+        }
 
         if let Ok(property_distr) =
             PropertyDistribution::new(env, &remaining_, &query_distr, conn_ctx)
@@ -411,5 +544,400 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats, usize)> for Interactions {
         };
 
         frequency(choices, rng)
+    }
+}
+
+/// Coordinated materialized view scenario for IVM testing.
+/// Creates base tables, populates them with initial data, and creates materialized views.
+/// This provides a consistent setup for testing incremental view maintenance.
+pub struct CoordinatedMatviewScenario {
+    pub base_tables: Vec<CoordinatedTable>,
+    pub matviews: Vec<CoordinatedMatview>,
+}
+
+pub struct CoordinatedTable {
+    pub name: String,
+    pub columns: Vec<(String, String)>, // (name, type)
+    pub initial_rows: Vec<Vec<String>>,
+}
+
+#[allow(dead_code)]
+pub struct CoordinatedMatview {
+    pub name: String,
+    pub select_sql: String,
+}
+
+impl CoordinatedMatviewScenario {
+    /// Generate a scenario for testing materialized views.
+    /// Creates navigation_history, navigation_cursor, and blocks tables
+    /// with materialized views that join them.
+    pub fn generate() -> Self {
+        let navigation_history = CoordinatedTable {
+            name: "navigation_history".to_string(),
+            columns: vec![
+                ("id".to_string(), "INTEGER PRIMARY KEY".to_string()),
+                ("block_id".to_string(), "INTEGER".to_string()),
+                ("created_at".to_string(), "TEXT".to_string()),
+            ],
+            initial_rows: vec![
+                vec![
+                    "1".to_string(),
+                    "100".to_string(),
+                    "'2024-01-01'".to_string(),
+                ],
+                vec![
+                    "2".to_string(),
+                    "101".to_string(),
+                    "'2024-01-02'".to_string(),
+                ],
+            ],
+        };
+
+        let navigation_cursor = CoordinatedTable {
+            name: "navigation_cursor".to_string(),
+            columns: vec![
+                ("id".to_string(), "INTEGER PRIMARY KEY".to_string()),
+                ("history_id".to_string(), "INTEGER".to_string()),
+                ("cursor_pos".to_string(), "INTEGER".to_string()),
+            ],
+            initial_rows: vec![vec!["1".to_string(), "1".to_string(), "0".to_string()]],
+        };
+
+        let blocks = CoordinatedTable {
+            name: "blocks".to_string(),
+            columns: vec![
+                ("id".to_string(), "INTEGER PRIMARY KEY".to_string()),
+                ("parent_id".to_string(), "INTEGER".to_string()),
+                ("content".to_string(), "TEXT".to_string()),
+            ],
+            initial_rows: vec![
+                vec![
+                    "100".to_string(),
+                    "NULL".to_string(),
+                    "'Root block'".to_string(),
+                ],
+                vec![
+                    "101".to_string(),
+                    "100".to_string(),
+                    "'Child block'".to_string(),
+                ],
+            ],
+        };
+
+        // Add more initial block rows for page pressure
+        let blocks = CoordinatedTable {
+            name: blocks.name,
+            columns: blocks.columns,
+            initial_rows: vec![
+                vec![
+                    "100".to_string(),
+                    "NULL".to_string(),
+                    "'Root_block'".to_string(),
+                ],
+                vec![
+                    "101".to_string(),
+                    "100".to_string(),
+                    "'Child_A'".to_string(),
+                ],
+                vec![
+                    "102".to_string(),
+                    "100".to_string(),
+                    "'Child_B'".to_string(),
+                ],
+                vec![
+                    "103".to_string(),
+                    "101".to_string(),
+                    "'Grandchild_A1'".to_string(),
+                ],
+                vec![
+                    "104".to_string(),
+                    "101".to_string(),
+                    "'Grandchild_A2'".to_string(),
+                ],
+                vec![
+                    "105".to_string(),
+                    "102".to_string(),
+                    "'Grandchild_B1'".to_string(),
+                ],
+                vec![
+                    "106".to_string(),
+                    "102".to_string(),
+                    "'Grandchild_B2'".to_string(),
+                ],
+                vec![
+                    "107".to_string(),
+                    "103".to_string(),
+                    "'Great_grandchild'".to_string(),
+                ],
+            ],
+        };
+
+        let current_focus = CoordinatedMatview {
+            name: "current_focus".to_string(),
+            select_sql: "SELECT nc.*, nh.block_id, nh.created_at FROM navigation_cursor nc INNER JOIN navigation_history nh ON nc.history_id = nh.id".to_string(),
+        };
+
+        let blocks_with_paths = CoordinatedMatview {
+            name: "blocks_with_paths".to_string(),
+            select_sql: "SELECT * FROM blocks".to_string(),
+        };
+
+        // Chained matviews: depend on other matviews to trigger cascading IVM updates
+        let watch_view_main = CoordinatedMatview {
+            name: "watch_view_main".to_string(),
+            select_sql: "SELECT b.id, b.content FROM blocks b INNER JOIN current_focus cf ON b.parent_id = cf.block_id".to_string(),
+        };
+
+        let watch_view_sidebar = CoordinatedMatview {
+            name: "watch_view_sidebar".to_string(),
+            select_sql: "SELECT b.id, b.parent_id FROM blocks b INNER JOIN blocks_with_paths bwp ON b.id = bwp.id".to_string(),
+        };
+
+        // Filler tables with indexes to create btree page pressure
+        let mut base_tables = vec![navigation_history, navigation_cursor, blocks];
+        for i in 0..12 {
+            let filler = CoordinatedTable {
+                name: format!("filler_{}", i),
+                columns: vec![
+                    ("id".to_string(), "INTEGER PRIMARY KEY".to_string()),
+                    ("val_a".to_string(), "INTEGER".to_string()),
+                    ("val_b".to_string(), "INTEGER".to_string()),
+                    ("label".to_string(), "TEXT".to_string()),
+                ],
+                initial_rows: (0..5)
+                    .map(|r| {
+                        let row_id = i * 100 + r;
+                        vec![
+                            format!("{}", row_id),
+                            format!("{}", row_id * 7),
+                            format!("{}", row_id * 13),
+                            format!("'filler_{}_row_{}'", i, r),
+                        ]
+                    })
+                    .collect(),
+            };
+            base_tables.push(filler);
+        }
+
+        Self {
+            base_tables,
+            matviews: vec![
+                current_focus,
+                blocks_with_paths,
+                watch_view_main,
+                watch_view_sidebar,
+            ],
+        }
+    }
+
+    /// Generate CREATE TABLE queries for all base tables
+    pub fn create_table_queries(&self) -> Vec<Query> {
+        use sql_generation::model::query::Create;
+        use sql_generation::model::table::{Column, ColumnType, Table};
+
+        self.base_tables
+            .iter()
+            .map(|t| {
+                let columns = t
+                    .columns
+                    .iter()
+                    .map(|(name, type_str)| {
+                        let col_type = if type_str.contains("INTEGER") {
+                            ColumnType::Integer
+                        } else {
+                            ColumnType::Text
+                        };
+                        Column {
+                            name: name.clone(),
+                            column_type: col_type,
+                            constraints: vec![],
+                        }
+                    })
+                    .collect();
+
+                Query::Create(Create {
+                    table: Table {
+                        name: t.name.clone(),
+                        columns,
+                        indexes: vec![],
+                        rows: vec![],
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// Generate INSERT queries for initial data
+    pub fn initial_insert_queries(&self) -> Vec<Query> {
+        use sql_generation::model::query::Insert;
+        use sql_generation::model::table::SimValue;
+        use turso_core::Value;
+
+        self.base_tables
+            .iter()
+            .flat_map(|t| {
+                t.initial_rows.iter().map(|row| {
+                    let values: Vec<SimValue> = row
+                        .iter()
+                        .map(|v| {
+                            if v == "NULL" {
+                                SimValue(Value::Null)
+                            } else if let Ok(i) = v.parse::<i64>() {
+                                SimValue(Value::from_i64(i))
+                            } else {
+                                // Strip quotes from string literals
+                                let s = v.trim_matches('\'');
+                                SimValue(Value::Text(s.to_string().into()))
+                            }
+                        })
+                        .collect();
+
+                    Query::Insert(Insert::Values {
+                        table: t.name.clone(),
+                        values: vec![values],
+                        conflict: None,
+                        on_conflict: None,
+                    })
+                })
+            })
+            .collect()
+    }
+
+    /// Generate CREATE INDEX queries for filler tables
+    pub fn create_index_queries(&self) -> Vec<Query> {
+        use sql_generation::model::query::CreateIndex;
+        use sql_generation::model::table::Index;
+        use turso_parser::ast::SortOrder;
+
+        self.base_tables
+            .iter()
+            .filter(|t| t.name.starts_with("filler_"))
+            .map(|t| {
+                Query::CreateIndex(CreateIndex {
+                    index: Index {
+                        table_name: t.name.clone(),
+                        index_name: format!("idx_{}_val_a", t.name),
+                        columns: vec![("val_a".to_string(), SortOrder::Asc)],
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// Generate CREATE MATERIALIZED VIEW queries
+    pub fn create_matview_queries(&self) -> Vec<Query> {
+        use sql_generation::model::query::CreateMaterializedView;
+
+        self.matviews
+            .iter()
+            .map(|mv| {
+                let select = Self::build_matview_select(mv);
+                Query::CreateMaterializedView(CreateMaterializedView {
+                    name: mv.name.clone(),
+                    select,
+                })
+            })
+            .collect()
+    }
+
+    fn build_matview_select(mv: &CoordinatedMatview) -> sql_generation::model::query::Select {
+        use sql_generation::model::query::Select;
+        use sql_generation::model::query::predicate::Predicate;
+        use sql_generation::model::query::select::{
+            FromClause, ResultColumn, SelectBody, SelectInner, SelectTable,
+        };
+        use sql_generation::model::table::JoinedTable;
+        use turso_parser::ast::Distinctness;
+
+        match mv.name.as_str() {
+            "current_focus" => Select {
+                with: None,
+                body: SelectBody {
+                    select: Box::new(SelectInner {
+                        distinctness: Distinctness::All,
+                        columns: vec![ResultColumn::Star],
+                        from: Some(FromClause {
+                            table: SelectTable::Table(
+                                "navigation_cursor".to_string(),
+                                Some("nc".to_string()),
+                            ),
+                            joins: vec![JoinedTable {
+                                table: "navigation_history".to_string(),
+                                alias: Some("nh".to_string()),
+                                join_type: sql_generation::model::table::JoinType::Inner,
+                                on: Predicate::eq_bare(
+                                    Predicate::qualified_column("nc", "history_id"),
+                                    Predicate::qualified_column("nh", "id"),
+                                ),
+                            }],
+                        }),
+                        where_clause: Predicate::true_(),
+                        order_by: None,
+                    }),
+                    compounds: vec![],
+                },
+                limit: None,
+            },
+            "watch_view_main" => Select {
+                with: None,
+                body: SelectBody {
+                    select: Box::new(SelectInner {
+                        distinctness: Distinctness::All,
+                        columns: vec![
+                            ResultColumn::Expr(Predicate::qualified_column("b", "id")),
+                            ResultColumn::Expr(Predicate::qualified_column("b", "content")),
+                        ],
+                        from: Some(FromClause {
+                            table: SelectTable::Table("blocks".to_string(), Some("b".to_string())),
+                            joins: vec![JoinedTable {
+                                table: "current_focus".to_string(),
+                                alias: Some("cf".to_string()),
+                                join_type: sql_generation::model::table::JoinType::Inner,
+                                on: Predicate::eq_bare(
+                                    Predicate::qualified_column("b", "parent_id"),
+                                    Predicate::qualified_column("cf", "block_id"),
+                                ),
+                            }],
+                        }),
+                        where_clause: Predicate::true_(),
+                        order_by: None,
+                    }),
+                    compounds: vec![],
+                },
+                limit: None,
+            },
+            "watch_view_sidebar" => Select {
+                with: None,
+                body: SelectBody {
+                    select: Box::new(SelectInner {
+                        distinctness: Distinctness::All,
+                        columns: vec![
+                            ResultColumn::Expr(Predicate::qualified_column("b", "id")),
+                            ResultColumn::Expr(Predicate::qualified_column("b", "parent_id")),
+                        ],
+                        from: Some(FromClause {
+                            table: SelectTable::Table("blocks".to_string(), Some("b".to_string())),
+                            joins: vec![JoinedTable {
+                                table: "blocks_with_paths".to_string(),
+                                alias: Some("bwp".to_string()),
+                                join_type: sql_generation::model::table::JoinType::Inner,
+                                on: Predicate::eq_bare(
+                                    Predicate::qualified_column("b", "id"),
+                                    Predicate::qualified_column("bwp", "id"),
+                                ),
+                            }],
+                        }),
+                        where_clause: Predicate::true_(),
+                        order_by: None,
+                    }),
+                    compounds: vec![],
+                },
+                limit: None,
+            },
+            _ => {
+                // Default: SELECT * FROM <first word of select_sql after FROM>
+                Select::simple("blocks".to_string(), Predicate::true_())
+            }
+        }
     }
 }

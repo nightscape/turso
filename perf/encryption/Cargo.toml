@@ -11,7 +11,7 @@ path = "src/main.rs"
 turso = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, default-features = true, features = ["full"] }
-futures = { workspace = true }
 tracing-subscriber = { workspace = true }
 rand = { workspace = true, features = ["small_rng"] }
 hex = { workspace = true }
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }

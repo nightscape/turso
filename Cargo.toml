@@ -46,6 +46,7 @@ members = [
     "perf/memory/codspeed",
     "perf/query-batch",
     "tools/dbhash",
+    "tools/sql-replay",
     "sdk-kit",
     "sdk-kit-macros",
     "testing/differential-oracle/sql_gen_prop",

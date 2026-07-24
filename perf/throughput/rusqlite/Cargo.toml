@@ -10,3 +10,4 @@ path = "src/main.rs"
 [dependencies]
 rusqlite = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+workspace-hack = { version = "0.1", path = "../../../workspace-hack" }

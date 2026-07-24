@@ -212,6 +212,7 @@ pub mod tests {
     pub struct TestContext {
         pub opts: Opts,
         pub tables: Vec<Table>,
+        pub views: Vec<crate::model::view::View>,
     }
 
     impl Default for TestContext {
@@ -222,6 +223,7 @@ pub mod tests {
             let mut ctx = Self {
                 opts: Default::default(),
                 tables: Default::default(),
+                views: Default::default(),
             };
             ctx.opts.table.generated_columns.enable = false;
             ctx
@@ -231,6 +233,10 @@ pub mod tests {
     impl GenerationContext for TestContext {
         fn tables(&self) -> &Vec<Table> {
             &self.tables
+        }
+
+        fn views(&self) -> &Vec<crate::model::view::View> {
+            &self.views
         }
 
         fn opts(&self) -> &Opts {

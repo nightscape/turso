@@ -1,0 +1,40 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+
+# Regression: LEFT JOIN where the right side is a materialized view.
+#
+# OP_NullRow calls Cursor::set_null_flag(true) on the right-hand cursor
+# when no match is found. The Cursor enum's set_null_flag must route
+# MaterializedView through to its inner btree cursor, otherwise the
+# query panics with "set_null_flag on unexpected cursor type".
+
+test matview-as-left-join-rhs-mixed {
+    CREATE TABLE base (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO base VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    CREATE TABLE src (id INT, val INT);
+    INSERT INTO src VALUES (1, 10), (3, 30);
+    CREATE MATERIALIZED VIEW mv AS SELECT id, val FROM src;
+    SELECT b.id, b.name, mv.val
+        FROM base b LEFT JOIN mv ON mv.id = b.id
+        ORDER BY b.id;
+}
+expect {
+    1|a|10
+    2|b|
+    3|c|30
+}
+
+test matview-as-left-join-rhs-all-unmatched {
+    CREATE TABLE base2 (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO base2 VALUES (1, 'a'), (2, 'b');
+    CREATE TABLE src2 (id INT, val INT);
+    CREATE MATERIALIZED VIEW mv2 AS SELECT id, val FROM src2;
+    SELECT b.id, b.name, mv2.val
+        FROM base2 b LEFT JOIN mv2 ON mv2.id = b.id
+        ORDER BY b.id;
+}
+expect {
+    1|a|
+    2|b|
+}

@@ -1,0 +1,91 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@requires materialized_views "requires materialized view support"
+
+test ivm-selfjoin-where-both-aliases {
+    CREATE TABLE props (entity_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL);
+    INSERT INTO props VALUES (1, 'name', 'Alice');
+    INSERT INTO props VALUES (1, 'role', 'Engineer');
+    INSERT INTO props VALUES (2, 'name', 'Bob');
+    INSERT INTO props VALUES (2, 'role', 'Designer');
+
+    CREATE MATERIALIZED VIEW pivot AS
+        SELECT a.value AS name, b.value AS role
+        FROM props AS a JOIN props AS b ON a.entity_id = b.entity_id
+        WHERE a.key = 'name' AND b.key = 'role';
+
+    SELECT name, role FROM pivot ORDER BY name;
+}
+expect {
+    Alice|Engineer
+    Bob|Designer
+}
+
+test ivm-selfjoin-where-single-alias {
+    CREATE TABLE props2 (entity_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL);
+    INSERT INTO props2 VALUES (1, 'name', 'Alice');
+    INSERT INTO props2 VALUES (1, 'role', 'Engineer');
+    INSERT INTO props2 VALUES (2, 'name', 'Bob');
+    INSERT INTO props2 VALUES (2, 'role', 'Designer');
+
+    CREATE MATERIALIZED VIEW control AS
+        SELECT a.value AS name, b.value AS v2
+        FROM props2 AS a JOIN props2 AS b ON a.entity_id = b.entity_id
+        WHERE a.key = 'name';
+
+    SELECT name, v2 FROM control ORDER BY name, v2;
+}
+expect {
+    Alice|Alice
+    Alice|Engineer
+    Bob|Bob
+    Bob|Designer
+}
+
+test ivm-selfjoin-where-integer-keys {
+    CREATE TABLE kv (entity_id INTEGER NOT NULL, key_id INTEGER NOT NULL, value TEXT NOT NULL);
+    INSERT INTO kv VALUES (1, 1, 'Alice');
+    INSERT INTO kv VALUES (1, 2, 'Engineer');
+    INSERT INTO kv VALUES (2, 1, 'Bob');
+    INSERT INTO kv VALUES (2, 2, 'Designer');
+
+    CREATE MATERIALIZED VIEW int_pivot AS
+        SELECT a.value AS name, b.value AS role
+        FROM kv AS a JOIN kv AS b ON a.entity_id = b.entity_id
+        WHERE a.key_id = 1 AND b.key_id = 2;
+
+    SELECT name, role FROM int_pivot ORDER BY name;
+}
+expect {
+    Alice|Engineer
+    Bob|Designer
+}
+
+test ivm-selfjoin-gql-eav-pattern {
+    CREATE TABLE nodes (id INTEGER PRIMARY KEY);
+    CREATE TABLE node_labels (node_id INTEGER NOT NULL, label TEXT NOT NULL);
+    CREATE TABLE node_props_text (node_id INTEGER NOT NULL, key_id INTEGER NOT NULL, value TEXT NOT NULL);
+    CREATE TABLE property_keys (id INTEGER PRIMARY KEY, key TEXT NOT NULL);
+
+    INSERT INTO nodes VALUES (1), (2);
+    INSERT INTO node_labels VALUES (1, 'Person'), (2, 'Person');
+    INSERT INTO property_keys VALUES (1, 'name'), (2, 'role');
+    INSERT INTO node_props_text VALUES (1, 1, 'Alice'), (1, 2, 'Engineer');
+    INSERT INTO node_props_text VALUES (2, 1, 'Bob'), (2, 2, 'Designer');
+
+    CREATE MATERIALIZED VIEW gql_view AS
+        SELECT p0.value AS name, p1.value AS role
+        FROM nodes AS n
+        JOIN node_labels AS nl ON nl.node_id = n.id
+        JOIN node_props_text AS p0 ON p0.node_id = n.id
+        JOIN property_keys AS pk0 ON p0.key_id = pk0.id
+        JOIN node_props_text AS p1 ON p1.node_id = n.id
+        JOIN property_keys AS pk1 ON p1.key_id = pk1.id
+        WHERE nl.label = 'Person' AND pk0.key = 'name' AND pk1.key = 'role';
+
+    SELECT name, role FROM gql_view ORDER BY name;
+}
+expect {
+    Alice|Engineer
+    Bob|Designer
+}

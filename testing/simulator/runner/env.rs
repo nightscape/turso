@@ -13,8 +13,10 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::generation::GenerationContext;
 use sql_generation::generation::generated_expr::rename_column_refs_in_expr;
+use sql_generation::model::query::select::Select;
 use sql_generation::model::query::transaction::Rollback;
 use sql_generation::model::table::{SimValue, Table};
+use sql_generation::model::view::View;
 use tracing::trace;
 use turso_core::Database;
 use turso_parser::ast::ColumnConstraint;
@@ -126,6 +128,12 @@ pub enum TxOperation {
         old_name: String,
         new_column: sql_generation::model::table::Column,
     },
+    CreateView {
+        view: View,
+    },
+    DropView {
+        view_name: String,
+    },
 }
 
 /// Database snapshot
@@ -133,6 +141,8 @@ pub enum TxOperation {
 pub struct Snapshot {
     /// The current state after applying transaction's changes (used for reads within the transaction)
     current_tables: Vec<Table>,
+    /// The current views after applying transaction's changes
+    current_views: Vec<View>,
     /// Operations recorded during this transaction, in order
     operations: Vec<TxOperation>,
     /// Named savepoint snapshots in this transaction.
@@ -312,17 +322,31 @@ impl TransactionTables {
                 new_column,
             });
     }
+
+    pub fn record_create_view(&mut self, view: View) {
+        self.expect_snapshot_mut()
+            .operations
+            .push(TxOperation::CreateView { view });
+    }
+
+    pub fn record_drop_view(&mut self, view_name: String) {
+        self.expect_snapshot_mut()
+            .operations
+            .push(TxOperation::DropView { view_name });
+    }
 }
 
 #[derive(Debug)]
 pub struct ShadowTables<'a> {
     commited_tables: &'a Vec<Table>,
+    commited_views: &'a Vec<View>,
     transaction_tables: Option<&'a TransactionTables>,
 }
 
 #[derive(Debug)]
 pub struct ShadowTablesMut<'a> {
     commited_tables: &'a mut Vec<Table>,
+    commited_views: &'a mut Vec<View>,
     transaction_tables: &'a mut Option<TransactionTables>,
     sequences: &'a mut Vec<ShadowSequence>,
 }
@@ -332,6 +356,12 @@ impl<'a> ShadowTables<'a> {
         self.transaction_tables
             .and_then(|v| v.as_snaphot_opt())
             .map_or(self.commited_tables, |v| &v.current_tables)
+    }
+
+    fn views(&self) -> &'a Vec<View> {
+        self.transaction_tables
+            .and_then(|v| v.as_snaphot_opt())
+            .map_or(self.commited_views, |v| &v.current_views)
     }
 }
 
@@ -358,6 +388,34 @@ where
             .as_mut()
             .map_or(self.commited_tables, |v| {
                 &mut v.expect_snapshot_mut().current_tables
+            })
+    }
+
+    /// Find a view by name and return a clone of its Select definition.
+    /// Uses a short-lived borrow so callers can still use &mut self afterwards.
+    pub fn find_view_select(&self, name: &str) -> Option<(Select, bool)> {
+        let views = self
+            .transaction_tables
+            .as_ref()
+            .map_or(&*self.commited_views, |v| &v.expect_snaphot().current_views);
+        views
+            .iter()
+            .find(|v| v.name == name)
+            .map(|v| (v.select.clone(), v.materialized))
+    }
+
+    #[allow(dead_code)]
+    pub fn views(&'a self) -> &'a Vec<View> {
+        self.transaction_tables
+            .as_ref()
+            .map_or(self.commited_views, |v| &v.expect_snaphot().current_views)
+    }
+
+    pub fn views_mut(&'b mut self) -> &'b mut Vec<View> {
+        self.transaction_tables
+            .as_mut()
+            .map_or(self.commited_views, |v| {
+                &mut v.expect_snapshot_mut().current_views
             })
     }
 
@@ -630,6 +688,20 @@ where
         Ok(())
     }
 
+    /// Record that a view was created during the current transaction
+    pub fn record_create_view(&mut self, view: View) {
+        if let Some(txn) = &mut *self.transaction_tables {
+            txn.record_create_view(view);
+        }
+    }
+
+    /// Record that a view was dropped during the current transaction
+    pub fn record_drop_view(&mut self, view_name: String) {
+        if let Some(txn) = &mut *self.transaction_tables {
+            txn.record_drop_view(view_name);
+        }
+    }
+
     /// Tries to upgrade the Transaction Mode
     #[inline]
     pub fn upgrade_transaction(&mut self, query: &Query) {
@@ -678,6 +750,7 @@ where
     pub fn create_snapshot(&mut self, transaction_mode: TransactionMode) {
         *self.transaction_tables = Some(TransactionTables::Snapshot(Snapshot {
             current_tables: self.commited_tables.clone(),
+            current_views: self.commited_views.clone(),
             operations: Vec::new(),
             savepoints: Vec::new(),
             transaction_mode,
@@ -908,6 +981,12 @@ where
                             }
                         }
                     }
+                    TxOperation::CreateView { view } => {
+                        self.commited_views.push(view.clone());
+                    }
+                    TxOperation::DropView { view_name } => {
+                        self.commited_views.retain(|v| &v.name != view_name);
+                    }
                 }
             }
         }
@@ -938,11 +1017,13 @@ mod tests {
 
     fn shadow_tables_mut<'a>(
         commited_tables: &'a mut Vec<Table>,
+        commited_views: &'a mut Vec<View>,
         transaction_tables: &'a mut Option<TransactionTables>,
         sequences: &'a mut Vec<ShadowSequence>,
     ) -> ShadowTablesMut<'a> {
         ShadowTablesMut {
             commited_tables,
+            commited_views,
             transaction_tables,
             sequences,
         }
@@ -951,12 +1032,14 @@ mod tests {
     #[test]
     fn savepoint_outside_transaction_commits_on_release() {
         let mut commited_tables = Vec::new();
+        let mut commited_views: Vec<View> = Vec::new();
         let mut transaction_tables = None;
         let mut sequences = Vec::new();
 
         {
             let mut tables = shadow_tables_mut(
                 &mut commited_tables,
+                &mut commited_views,
                 &mut transaction_tables,
                 &mut sequences,
             );
@@ -978,11 +1061,13 @@ mod tests {
     #[test]
     fn rollback_to_savepoint_keeps_target_active() {
         let mut commited_tables = Vec::new();
+        let mut commited_views: Vec<View> = Vec::new();
         let mut transaction_tables = None;
         let mut sequences = Vec::new();
 
         let mut tables = shadow_tables_mut(
             &mut commited_tables,
+            &mut commited_views,
             &mut transaction_tables,
             &mut sequences,
         );
@@ -1074,10 +1159,12 @@ mod tests {
         // unique. Here SET b = 2 rewrites g from (2, 3) to (3, 4): row 1's new
         // g = 3 collides with row 2's still-present old g = 3.
         let mut commited_tables = vec![table_with_unique_generated_column(&[(1, 1), (2, 1)])];
+        let mut commited_views = Vec::new();
         let mut transaction_tables = None;
         let mut sequences = Vec::new();
         let mut tables = shadow_tables_mut(
             &mut commited_tables,
+            &mut commited_views,
             &mut transaction_tables,
             &mut sequences,
         );
@@ -1099,10 +1186,12 @@ mod tests {
         // Same shape as above, but the rewritten values (3, 7) never collide
         // with any old value, so the update must be accepted and applied.
         let mut commited_tables = vec![table_with_unique_generated_column(&[(1, 1), (5, 1)])];
+        let mut commited_views = Vec::new();
         let mut transaction_tables = None;
         let mut sequences = Vec::new();
         let mut tables = shadow_tables_mut(
             &mut commited_tables,
+            &mut commited_views,
             &mut transaction_tables,
             &mut sequences,
         );
@@ -1126,11 +1215,13 @@ mod tests {
     #[test]
     fn savepoint_inside_deferred_transaction_stays_open_on_release() {
         let mut commited_tables = Vec::new();
+        let mut commited_views: Vec<View> = Vec::new();
         let mut transaction_tables = Some(TransactionTables::Deferred);
         let mut sequences = Vec::new();
 
         let mut tables = shadow_tables_mut(
             &mut commited_tables,
+            &mut commited_views,
             &mut transaction_tables,
             &mut sequences,
         );
@@ -1195,6 +1286,8 @@ pub(crate) struct SimulatorEnv {
     pub(crate) attached_dbs: Vec<String>,
     /// Sequences are global objects, not affected by transactions/savepoints
     pub sequences: Vec<ShadowSequence>,
+    // View data that is committed into the database
+    pub committed_views: Vec<View>,
 }
 
 impl UnwindSafe for SimulatorEnv {}
@@ -1221,9 +1314,9 @@ impl SimulatorEnv {
             committed_tables: self.committed_tables.clone(),
             attached_dbs: self.attached_dbs.clone(),
             sequences: self.sequences.clone(),
+            committed_views: self.committed_views.clone(),
         }
     }
-
     pub(crate) fn clear(&mut self) {
         self.clear_tables();
         self.connections.iter_mut().for_each(|c| c.disconnect());
@@ -1287,14 +1380,15 @@ impl SimulatorEnv {
 
         self.db = None;
 
+        let mut db_opts = turso_core::DatabaseOpts::new().with_autovacuum(true);
+        if self.profile.enable_views || self.profile.mvcc {
+            db_opts = db_opts.with_views(true);
+        }
         let db = match Database::open_file_with_flags(
             io.clone(),
             db_path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            turso_core::DatabaseOpts::new()
-                .with_autovacuum(true)
-                .with_attach(true)
-                .with_generated_columns(true),
+            db_opts.with_attach(true).with_generated_columns(true),
             None,
             Arc::new(SqliteDialect),
         ) {
@@ -1322,6 +1416,17 @@ impl SimulatorEnv {
         }
 
         self.io = io;
+
+        // Switch to MVCC mode if the profile says to use MVCC
+        if self.profile.mvcc {
+            let conn = db
+                .connect()
+                .expect("Failed to create connection for MVCC setup");
+            conn.execute("PRAGMA journal_mode = 'mvcc'")
+                .expect("Failed to enable MVCC mode");
+            conn.close().expect("Failed to close MVCC setup connection");
+        }
+
         self.db = Some(db);
     }
 
@@ -1509,14 +1614,15 @@ impl SimulatorEnv {
             ),
         };
 
+        let mut db_opts = turso_core::DatabaseOpts::new().with_autovacuum(true);
+        if profile.enable_views || profile.mvcc {
+            db_opts = db_opts.with_views(true);
+        }
         let db = match Database::open_file_with_flags(
             io.clone(),
             db_path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            turso_core::DatabaseOpts::new()
-                .with_autovacuum(true)
-                .with_attach(true)
-                .with_generated_columns(true),
+            db_opts.with_attach(true).with_generated_columns(true),
             None,
             Arc::new(SqliteDialect),
         ) {
@@ -1540,6 +1646,7 @@ impl SimulatorEnv {
                     .iter()
                     .map(|name| paths.aux_db(&simulation_type, &SimulationPhase::Test, name)),
             );
+            conn.close().expect("Failed to close MVCC setup connection");
         }
 
         let connections = (0..profile.max_connections)
@@ -1559,6 +1666,7 @@ impl SimulatorEnv {
             io_backend,
             profile: profile.clone(),
             committed_tables: Vec::new(),
+            committed_views: Vec::new(),
             connection_tables: vec![None; profile.max_connections],
             connection_last_query: Bitmap::new(),
             attached_dbs,
@@ -1630,6 +1738,7 @@ impl SimulatorEnv {
     pub fn connection_context(&self, conn_index: usize) -> impl GenerationContext {
         struct ConnectionGenContext<'a> {
             tables: &'a Vec<sql_generation::model::table::Table>,
+            views: &'a Vec<View>,
             opts: &'a sql_generation::generation::Opts,
         }
 
@@ -1638,16 +1747,23 @@ impl SimulatorEnv {
                 self.tables
             }
 
+            fn views(&self) -> &Vec<View> {
+                self.views
+            }
+
             fn opts(&self) -> &sql_generation::generation::Opts {
                 self.opts
             }
         }
 
-        let tables = self.get_conn_tables(conn_index).tables();
+        let shadow = self.get_conn_tables(conn_index);
+        let tables = shadow.tables();
+        let views = shadow.views();
 
         ConnectionGenContext {
             opts: &self.profile.query.gen_opts,
             tables,
+            views,
         }
     }
 
@@ -1696,6 +1812,7 @@ impl SimulatorEnv {
         ShadowTables {
             transaction_tables: self.connection_tables.get(conn_index).unwrap().as_ref(),
             commited_tables: &self.committed_tables,
+            commited_views: &self.committed_views,
         }
     }
 
@@ -1704,6 +1821,7 @@ impl SimulatorEnv {
             transaction_tables: self.connection_tables.get_mut(conn_index).unwrap(),
             commited_tables: &mut self.committed_tables,
             sequences: &mut self.sequences,
+            commited_views: &mut self.committed_views,
         }
     }
 }

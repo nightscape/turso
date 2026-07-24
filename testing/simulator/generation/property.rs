@@ -8,15 +8,15 @@
 use std::num::NonZeroUsize;
 
 use rand::distr::{Distribution, weighted::WeightedIndex};
+use rand::seq::IndexedRandom;
 use sql_generation::{
     generation::{Arbitrary, ArbitraryFrom, GenerationContext, pick, pick_index},
     model::{
         query::{
-            Create, Delete, Drop, Insert, Select,
+            Create, Delete, DropTable, Insert, Select,
             alter_table::{AlterTable, AlterTableType},
             predicate::Predicate,
             select::{CompoundOperator, CompoundSelect, ResultColumn, SelectBody, SelectInner},
-            transaction::{Begin, Commit, Rollback},
             update::{SetValue, Update},
         },
         table::{Column, ColumnType, SimValue, Table},
@@ -36,7 +36,7 @@ use crate::{
             Assertion, Interaction, InteractionBuilder, InteractionType, PropertyMetadata,
         },
         metrics::Remaining,
-        property::{InteractiveQueryInfo, Property, PropertyDiscriminants},
+        property::{Property, PropertyDiscriminants},
     },
     runner::env::SimulatorEnv,
 };
@@ -45,7 +45,7 @@ type PropertyQueryGenFunc<'a, R, G> =
     fn(&mut R, &G, &QueryDistribution, &Property) -> Option<Query>;
 
 impl Property {
-    pub(super) fn get_extensional_query_gen_function<R, G>(&self) -> PropertyQueryGenFunc<R, G>
+    pub(super) fn get_extensional_query_gen_function<R, G>(&self) -> PropertyQueryGenFunc<'_, R, G>
     where
         R: rand::Rng + ?Sized,
         G: GenerationContext,
@@ -112,7 +112,7 @@ impl Property {
                             // The inserted row will not be updated.
                             None
                         }
-                        Query::Drop(Drop { table: t }) if *t == table.name => {
+                        Query::DropTable(DropTable { table: t }) if *t == table.name => {
                             // Cannot drop the table we are inserting
                             None
                         }
@@ -148,7 +148,7 @@ impl Property {
                             // - Creating the same table is an error
                             None
                         }
-                        Query::Drop(Drop { table: t }) if *t == table.name => {
+                        Query::DropTable(DropTable { table: t }) if *t == table.name => {
                             // Cannot Drop the created table
                             None
                         }
@@ -216,7 +216,7 @@ impl Property {
                             // - Creating the same table is an error
                             None
                         }
-                        Query::Drop(Drop { table: t }) if *t == table.name => {
+                        Query::DropTable(DropTable { table: t }) if *t == table.name => {
                             // Cannot Drop the same table
                             None
                         }
@@ -262,6 +262,47 @@ impl Property {
                         unreachable!()
                     };
                     random_main_table_write(rng, ctx, write_kinds)
+                }
+            }
+            Property::IvmConsistency { .. } => {
+                // IvmConsistency generates DML queries that target base tables
+                // If scenario tables exist, prefer those; otherwise use any table
+                |rng: &mut R, ctx: &G, query_distr: &QueryDistribution, _property: &Property| {
+                    // Scenario base tables that trigger IVM on the matviews
+                    const SCENARIO_TABLES: &[&str] =
+                        &["navigation_history", "navigation_cursor", "blocks"];
+
+                    // Check if scenario tables exist in context
+                    let has_scenario_tables = ctx
+                        .tables()
+                        .iter()
+                        .any(|t| SCENARIO_TABLES.contains(&t.name.as_str()));
+
+                    // Only allow DML queries (INSERT, UPDATE, DELETE)
+                    let query = Query::arbitrary_from(rng, ctx, query_distr);
+
+                    match &query {
+                        Query::Insert(Insert::Values { table, .. })
+                        | Query::Insert(Insert::Select { table, .. })
+                        | Query::Update(Update { table, .. })
+                        | Query::Delete(Delete { table, .. }) => {
+                            if has_scenario_tables {
+                                // Only accept if it targets a scenario table
+                                if SCENARIO_TABLES.contains(&table.as_str()) {
+                                    Some(query)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                // No scenario tables, accept any DML
+                                Some(query)
+                            }
+                        }
+                        _ => {
+                            // Not a DML query, try again
+                            None
+                        }
+                    }
                 }
             }
             Property::Queries { .. } => {
@@ -511,7 +552,6 @@ impl Property {
                 row_index,
                 queries,
                 select,
-                interactive,
             } => {
                 let (table, values) = if let Insert::Values { table, values, .. }
                 | Insert::ValuesWithColumns { table, values, .. } = insert
@@ -550,18 +590,9 @@ impl Property {
 
                 let assertion = InteractionType::Assertion(Assertion::new(
                     format!(
-                        "row [{:?}] should be found in table {}, interactive={} commit={}, rollback={}",
+                        "row [{:?}] should be found in table {}",
                         row.iter().map(|v| v.to_string()).collect::<Vec<String>>(),
                         insert.table(),
-                        interactive.is_some(),
-                        interactive
-                            .as_ref()
-                            .map(|i| i.end_with_commit)
-                            .unwrap_or(false),
-                        interactive
-                            .as_ref()
-                            .map(|i| !i.end_with_commit)
-                            .unwrap_or(false),
                     ),
                     move |stack: &Vec<ResultSet>, _| {
                         let rows = stack.last().unwrap();
@@ -634,6 +665,9 @@ impl Property {
                                         // The shadow model must mirror that and leave the connection's
                                         // transaction state (and its uncommitted rows) untouched.
                                         if e.to_string().to_lowercase().contains(&format!("table {table_name} already exists")) {
+                                            // Statement error does NOT roll back the transaction in SQLite.
+                                            // Only the failed statement is rejected; prior changes remain valid.
+                                            // Do NOT call rollback_conn() here.
                                             Ok(Ok(()))
                                         } else {
                                             Ok(Err(format!("expected table already exists error, got: {e}")))
@@ -860,7 +894,7 @@ impl Property {
                     vec![table.clone()],
                 ));
 
-                let drop = InteractionType::Query(Query::Drop(Drop {
+                let drop = InteractionType::Query(Query::DropTable(DropTable {
                     table: table.clone(),
                 }));
 
@@ -988,24 +1022,26 @@ impl Property {
                 // but no IO happens right after it
                 let assert = Assertion::new(
                     "fault occured".to_string(),
-                    move |stack, env: &mut SimulatorEnv| {
+                    move |stack, _env: &mut SimulatorEnv| {
                         let last = stack.last().unwrap();
                         match last {
                             Ok(_) => {
                                 let _ = query_clone
-                                    .shadow(&mut env.get_conn_tables_mut(connection_index));
+                                    .shadow(&mut _env.get_conn_tables_mut(connection_index));
                                 Ok(Ok(()))
                             }
                             Err(err) => {
-                                // We cannot make any assumptions about the error content; all we are about is, if the statement errored,
-                                // we don't shadow the results into the simulator env, i.e. we assume whatever the statement did was rolled back.
+                                // Statement-level I/O failures do NOT automatically roll back the
+                                // transaction in SQLite. Only the failed statement is rejected;
+                                // the transaction continues with prior changes intact.
+                                // We don't shadow this failed statement's results.
                                 tracing::error!("Fault injection produced error: {err}");
 
                                 if let LimboError::CheckpointFailed(msg) = err {
-                                    // Checkpoint failure means the transaction is committed because the WAL commit succeeded, so we DON'T rollback,
-                                    // and the results of the query are shadowed into the simulator environment
+                                    // Checkpoint failure means the transaction is committed because
+                                    // the WAL commit succeeded, so we shadow the query results.
                                     query_clone
-                                        .shadow(&mut env.get_conn_tables_mut(connection_index))
+                                        .shadow(&mut _env.get_conn_tables_mut(connection_index))
                                         .expect("Failed to shadow tables");
                                     tracing::error!(
                                         "Fault injection produced CheckpointFailed error: {msg}"
@@ -1021,8 +1057,8 @@ impl Property {
                                 // transaction rollback in the model when the engine actually
                                 // rolled back (returned to autocommit); otherwise the model
                                 // would drop rows that are still live in the open transaction.
-                                if !env.conn_db_in_transaction(connection_index) {
-                                    env.rollback_conn(connection_index);
+                                if !_env.conn_db_in_transaction(connection_index) {
+                                    _env.rollback_conn(connection_index);
                                 }
                                 Ok(Ok(()))
                             }
@@ -1083,6 +1119,7 @@ impl Property {
                 ]);
 
                 let select_tlp = Select {
+                    with: None,
                     body: SelectBody {
                         select: Box::new(SelectInner {
                             distinctness: select.body.select.distinctness,
@@ -1248,6 +1285,105 @@ impl Property {
                     )
                 ),
                 ].into_iter().map(InteractionBuilder::with_interaction).collect()
+            }
+            Property::IvmConsistency {
+                matview_name,
+                view_definition,
+                dml_queries,
+            } => {
+                let matview_name_clone = matview_name.clone();
+
+                // Build interactions:
+                // 1. Execute DML queries (transaction managed at plan level or implicitly)
+                // 2. SELECT * FROM matview_name
+                // 3. Execute view_definition directly (fresh computation)
+                // 4. Assert results match
+                //
+                // NOTE: We intentionally do NOT wrap in BEGIN/COMMIT here because:
+                // - The plan-level transaction batching may already have a transaction open
+                // - Nested transactions would cause "cannot start transaction within transaction"
+                // - Each DML will auto-commit if not in a transaction, which still tests IVM
+
+                let mut interactions = Vec::new();
+
+                // DML queries (with placeholder markers for extensional query generation)
+                for query in dml_queries {
+                    let mut builder =
+                        InteractionBuilder::with_interaction(InteractionType::Query(query.clone()));
+                    builder.property_meta(PropertyMetadata::new(self, true));
+                    interactions.push(builder);
+                }
+
+                // SELECT * FROM matview_name
+                let select_matview = InteractionType::Query(Query::Select(Select::simple(
+                    matview_name.clone(),
+                    sql_generation::model::query::predicate::Predicate::true_(),
+                )));
+                interactions.push(InteractionBuilder::with_interaction(select_matview));
+
+                // Execute view_definition directly (fresh computation)
+                let select_fresh = InteractionType::Query(Query::Select(view_definition.clone()));
+                interactions.push(InteractionBuilder::with_interaction(select_fresh));
+
+                // Assertion: results should match
+                let assertion = InteractionType::Assertion(Assertion::new(
+                    format!(
+                        "materialized view {matview_name_clone} should match fresh computation"
+                    ),
+                    move |stack: &Vec<ResultSet>, _env: &mut SimulatorEnv| {
+                        if stack.len() < 2 {
+                            return Err(LimboError::InternalError(
+                                "Not enough result sets on the stack".to_string(),
+                            ));
+                        }
+
+                        let matview_result = stack.get(stack.len() - 2).unwrap();
+                        let fresh_result = stack.last().unwrap();
+
+                        match (matview_result, fresh_result) {
+                            (Ok(matview_rows), Ok(fresh_rows)) => {
+                                // Sort rows for comparison (order may differ)
+                                let mut matview_sorted = matview_rows.clone();
+                                let mut fresh_sorted = fresh_rows.clone();
+                                matview_sorted.sort();
+                                fresh_sorted.sort();
+
+                                if matview_sorted.len() != fresh_sorted.len() {
+                                    return Ok(Err(format!(
+                                        "row count mismatch: matview has {} rows, fresh computation has {} rows",
+                                        matview_sorted.len(),
+                                        fresh_sorted.len()
+                                    )));
+                                }
+
+                                for (i, (matview_row, fresh_row)) in
+                                    matview_sorted.iter().zip(fresh_sorted.iter()).enumerate()
+                                {
+                                    if matview_row != fresh_row {
+                                        print_diff(
+                                            std::slice::from_ref(matview_row),
+                                            std::slice::from_ref(fresh_row),
+                                            "matview",
+                                            "fresh",
+                                        );
+                                        return Ok(Err(format!(
+                                            "row {i} mismatch: matview {matview_row:?} != fresh {fresh_row:?}"
+                                        )));
+                                    }
+                                }
+
+                                Ok(Ok(()))
+                            }
+                            (Err(e), _) | (_, Err(e)) => Err(LimboError::InternalError(format!(
+                                "Error comparing matview results: {e}"
+                            ))),
+                        }
+                    },
+                    vec![matview_name_clone],
+                ));
+                interactions.push(InteractionBuilder::with_interaction(assertion));
+
+                interactions
             }
             Property::Queries { queries } => queries
                 .clone()
@@ -1485,6 +1621,7 @@ fn random_main_table_insert<R: rand::Rng + ?Sized>(
             table: table.name.clone(),
             values,
             on_conflict: None,
+            conflict: None,
         })
     }
 }
@@ -1734,7 +1871,7 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
-    mvcc: bool,
+    _mvcc: bool,
 ) -> Property {
     assert!(!ctx.tables().is_empty());
 
@@ -1792,40 +1929,14 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
             table: table.name.clone(),
             values: rows,
             on_conflict: None,
+            conflict: None,
         })
     };
 
-    // Choose if we want queries to be executed in an interactive transaction
-    let interactive = if !mvcc && rng.random_bool(0.5) {
-        Some(InteractiveQueryInfo {
-            start_with_immediate: rng.random_bool(0.5),
-            end_with_commit: rng.random_bool(0.5),
-        })
-    } else {
-        None
-    };
-
+    // Generate 0-2 placeholder queries between INSERT and SELECT
+    // Transaction boundaries are now managed at the plan level, not here
     let amount = rng.random_range(0..3);
-
-    let mut queries = Vec::with_capacity(amount + 2);
-
-    if let Some(ref interactive) = interactive {
-        queries.push(Query::Begin(if interactive.start_with_immediate {
-            Begin::Immediate
-        } else {
-            Begin::Deferred
-        }));
-    }
-
-    queries.extend(std::iter::repeat_n(Query::Placeholder, amount));
-
-    if let Some(ref interactive) = interactive {
-        queries.push(if interactive.end_with_commit {
-            Query::Commit(Commit)
-        } else {
-            Query::Rollback(Rollback)
-        });
-    }
+    let queries = vec![Query::Placeholder; amount];
 
     let predicate = if has_generated {
         // For tables with generated columns, create a "virtual" table with only
@@ -1859,7 +1970,6 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
         row_index,
         queries,
         select: select_query,
-        interactive,
     }
 }
 
@@ -2191,6 +2301,97 @@ fn property_sequence_monotonicity<R: rand::Rng + ?Sized>(
     }
 }
 
+fn property_ivm_consistency<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    _query_distr: &QueryDistribution,
+    ctx: &impl GenerationContext,
+    _mvcc: bool,
+) -> Property {
+    use sql_generation::model::query::predicate::Predicate;
+
+    // Try to find an existing materialized view in the context
+    let matviews: Vec<_> = ctx.views().iter().filter(|v| v.materialized).collect();
+
+    let (matview_name, view_definition) = if let Some(matview) = matviews.choose(rng) {
+        // Use existing materialized view from context
+        (matview.name.clone(), matview.select.clone())
+    } else {
+        // No existing matviews - check for coordinated scenario tables
+        let scenario_table_names = ["navigation_history", "navigation_cursor", "blocks"];
+        let has_scenario_tables = scenario_table_names
+            .iter()
+            .any(|name| ctx.tables().iter().any(|t| t.name == *name));
+
+        if has_scenario_tables {
+            // Use scenario matviews
+            if ctx.tables().iter().any(|t| t.name == "navigation_history") {
+                // Generate view definition for current_focus
+                let view_def = Select {
+                    with: None,
+                    body: sql_generation::model::query::select::SelectBody {
+                        select: Box::new(sql_generation::model::query::select::SelectInner {
+                            distinctness: Distinctness::All,
+                            columns: vec![ResultColumn::Star],
+                            from: Some(sql_generation::model::query::select::FromClause {
+                                table: sql_generation::model::query::select::SelectTable::Table(
+                                    "navigation_cursor".to_string(),
+                                    Some("nc".to_string()),
+                                ),
+                                joins: vec![sql_generation::model::table::JoinedTable {
+                                    table: "navigation_history".to_string(),
+                                    alias: Some("nh".to_string()),
+                                    join_type: sql_generation::model::table::JoinType::Inner,
+                                    on: Predicate::eq_bare(
+                                        Predicate::qualified_column("nc", "history_id"),
+                                        Predicate::qualified_column("nh", "id"),
+                                    ),
+                                }],
+                            }),
+                            where_clause: Predicate::true_(),
+                            order_by: None,
+                        }),
+                        compounds: vec![],
+                    },
+                    limit: None,
+                };
+                ("current_focus".to_string(), view_def)
+            } else {
+                // Fallback: use blocks_with_paths or generate a simple matview
+                let view_def = Select::simple("blocks".to_string(), Predicate::true_());
+                ("blocks_with_paths".to_string(), view_def)
+            }
+        } else {
+            // No scenario tables, generate a simple property from any table
+            let tables = ctx.tables();
+            if tables.is_empty() {
+                // Fallback: create a minimal property
+                let view_def = Select::expr(Predicate::true_());
+                (
+                    format!("matview_{}", rng.random_range(1000..9999u32)),
+                    view_def,
+                )
+            } else {
+                let table = pick(tables, rng);
+                let view_def = Select::simple(table.name.clone(), Predicate::true_());
+                (
+                    format!("matview_{}", rng.random_range(1000..9999u32)),
+                    view_def,
+                )
+            }
+        }
+    };
+
+    // Generate 1-3 DML queries targeting base tables
+    let num_dml = rng.random_range(1..=3);
+    let dml_queries = vec![Query::Placeholder; num_dml];
+
+    Property::IvmConsistency {
+        matview_name,
+        view_definition,
+        dml_queries,
+    }
+}
+
 type PropertyGenFunc<R, G> = fn(&mut R, &QueryDistribution, &G, bool) -> Property;
 
 impl PropertyDiscriminants {
@@ -2219,6 +2420,7 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::FsyncNoWait => property_fsync_no_wait,
             PropertyDiscriminants::FaultyQuery => property_faulty_query,
             PropertyDiscriminants::SequenceMonotonicity => property_sequence_monotonicity,
+            PropertyDiscriminants::IvmConsistency => property_ivm_consistency,
             PropertyDiscriminants::Queries => {
                 unreachable!("should not try to generate queries property")
             }
@@ -2345,6 +2547,22 @@ impl PropertyDiscriminants {
                     0
                 }
             }
+            PropertyDiscriminants::IvmConsistency => {
+                // Generate if:
+                // 1. We have existing materialized views in context, OR
+                // 2. Coordinated matview scenario is enabled
+                // Either way, we need at least one table for DML operations
+                let has_matviews = ctx.views().iter().any(|v| v.materialized);
+                let coordinated_scenario = env.profile.query.enable_coordinated_matview_scenario;
+
+                if !ctx.tables().is_empty() && (has_matviews || coordinated_scenario) {
+                    // High weight to ensure IVM consistency is frequently tested
+                    // This is the primary property for catching IVM bugs
+                    50
+                } else {
+                    0
+                }
+            }
             PropertyDiscriminants::Queries => {
                 unreachable!("queries property should not be generated")
             }
@@ -2387,6 +2605,10 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
             PropertyDiscriminants::SequenceMonotonicity => QueryCapabilities::SEQUENCE,
+            PropertyDiscriminants::IvmConsistency => QueryCapabilities::SELECT
+                .union(QueryCapabilities::INSERT)
+                .union(QueryCapabilities::UPDATE)
+                .union(QueryCapabilities::DELETE),
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),
         }
     }

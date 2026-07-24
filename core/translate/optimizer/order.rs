@@ -328,23 +328,27 @@ pub fn plan_satisfies_order_target(
                 schema,
                 EqualityPrefixScope::ConstantEquality,
             ),
-            AccessMethodParams::Subquery { iter_dir } => {
-                let Table::FromClauseSubquery(from_clause_subquery) = &table_ref.table else {
-                    unreachable!(
-                        "access_method.params::Subquery must be for a FromClauseSubquery table"
-                    );
-                };
-                OrderConsumption {
-                    consumed: subquery_intrinsic_order_consumed(
-                        table_ref.internal_id,
-                        from_clause_subquery,
-                        *iter_dir,
-                        &order_target.columns[target_col_idx..],
-                        schema,
-                    ),
-                    includes_rowid: false,
+            AccessMethodParams::Subquery { iter_dir } => match &table_ref.table {
+                Table::FromClauseSubquery(from_clause_subquery) => {
+                    OrderConsumption {
+                        consumed: subquery_intrinsic_order_consumed(
+                            table_ref.internal_id,
+                            from_clause_subquery,
+                            *iter_dir,
+                            &order_target.columns[target_col_idx..],
+                            schema,
+                        ),
+                        includes_rowid: false,
+                    }
                 }
-            }
+                // Any non-FromClauseSubquery table paired with a `Subquery` access
+                // method is not one whose ordering the sort-elimination optimizer
+                // may rely on. Report "no usable ordering" (0 columns consumed) so
+                // an explicit sort is kept; claiming an order that isn't guaranteed
+                // would produce wrong results. Any such `Subquery` carrier we cannot
+                // classify gets the same conservative answer.
+                _ => OrderConsumption::NONE,
+            },
             _ => return false,
         };
 

@@ -110,7 +110,7 @@ cargo run --release -p memory-benchmark -- --mode mvcc --workload insert-heavy -
 # All CLI options
 cargo run --release -p memory-benchmark -- \
   --mode wal|mvcc \
-  --workload insert-heavy|read-heavy|mixed|scan-heavy|recursive-cte|series-blob|update-churn \
+  --workload insert-heavy|read-heavy|mixed|scan-heavy|recursive-cte|series-blob|update-churn|matview-delta \
   -i <iterations> \
   -b <batch-size> \
   --connections <N> \
@@ -141,6 +141,7 @@ Every run produces a `dhat-heap.json` in the current directory. This file contai
 | `recursive-cte` | Repeated linear, priority-queue, UNION-distinct, and outer-LIMIT recursive CTE queries | No schema setup; `batch-size` is the target recursive result cardinality |
 | `series-blob` | `INSERT INTO bench(data) SELECT zeroblob(2048) FROM generate_series(1, ?)` | Creates `bench`; `batch-size` is the series length |
 | `update-churn` | Repeated UPDATEs to a fixed 10k-row set (key space partitioned per connection to avoid write-write conflicts) | Seeds 10k rows. Generates superseded versions — the MVCC GC accumulation case. |
+| `matview-delta` | IVM/DBSP delta churn: ~90% single-row UPDATE, 10% INSERT, occasional DELETE against a table with three materialized views (join, aggregate, LEFT JOIN + aggregate) | Seeds 1k rows, creates 3 matviews; single connection (deterministic delta volume); enables `experimental_materialized_views` |
 
 Profiles implement the `Profile` trait in `perf/memory/src/profile/`. To add a new workload, create a new file implementing the trait and wire it into the `WorkloadProfile` enum in `main.rs`.
 

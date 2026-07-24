@@ -273,6 +273,43 @@ impl PrimaryKeyProfile {
 // CREATE TABLE PROFILE
 // =============================================================================
 
+/// Relative weights for picking which schema to target when generating
+/// CREATE TABLE. A weight of 0 disables that schema entirely.
+///
+/// Defaults to all weights = 1 so every schema is equally likely. The
+/// `attached` weight applies to each attached database independently.
+#[derive(Debug, Clone)]
+pub struct SchemaTargetProfile {
+    /// Weight for the main schema (table name without qualifier).
+    pub main: u32,
+    /// Weight for the `temp.` schema.
+    pub temp: u32,
+    /// Weight applied per attached database (e.g. `aux.foo`).
+    pub attached: u32,
+}
+
+impl Default for SchemaTargetProfile {
+    fn default() -> Self {
+        Self {
+            main: 1,
+            temp: 1,
+            attached: 1,
+        }
+    }
+}
+
+impl SchemaTargetProfile {
+    /// Restrict generation to the main schema. Use for matview workloads,
+    /// since matviews cannot reference attached databases.
+    pub fn main_only() -> Self {
+        Self {
+            main: 1,
+            temp: 0,
+            attached: 0,
+        }
+    }
+}
+
 /// Profile for controlling CREATE TABLE statement generation.
 #[derive(Debug, Clone)]
 pub struct CreateTableProfile {
@@ -288,6 +325,8 @@ pub struct CreateTableProfile {
     pub primary_key: PrimaryKeyProfile,
     /// Profile for non-PK column generation.
     pub column: ColumnProfile,
+    /// Weights for picking which schema (main / temp / attached) to target.
+    pub target_schemas: SchemaTargetProfile,
 }
 
 impl Default for CreateTableProfile {
@@ -299,6 +338,7 @@ impl Default for CreateTableProfile {
             strict_probability: 20,
             primary_key: PrimaryKeyProfile::default(),
             column: ColumnProfile::default(),
+            target_schemas: SchemaTargetProfile::default(),
         }
     }
 }
@@ -313,6 +353,7 @@ impl CreateTableProfile {
             strict_probability: self.strict_probability,
             primary_key: self.primary_key.integer_only(),
             column: self.column.minimal(),
+            target_schemas: self.target_schemas,
         }
     }
 
@@ -325,6 +366,7 @@ impl CreateTableProfile {
             strict_probability: self.strict_probability,
             primary_key: self.primary_key,
             column: self.column.high_constraints(),
+            target_schemas: self.target_schemas,
         }
     }
 
@@ -337,6 +379,7 @@ impl CreateTableProfile {
             strict_probability: self.strict_probability,
             primary_key: self.primary_key.integer_only(),
             column: self.column.full_constraints(),
+            target_schemas: self.target_schemas,
         }
     }
 
@@ -349,7 +392,22 @@ impl CreateTableProfile {
             strict_probability: self.strict_probability,
             primary_key: self.primary_key.none(),
             column: self.column,
+            target_schemas: self.target_schemas,
         }
+    }
+
+    /// Builder method to restrict CREATE TABLE to the main schema.
+    /// Useful for matview-heavy fuzzing since matviews cannot reference
+    /// attached databases.
+    pub fn main_schema_only(mut self) -> Self {
+        self.target_schemas = SchemaTargetProfile::main_only();
+        self
+    }
+
+    /// Builder method to set the schema target profile directly.
+    pub fn with_target_schemas(mut self, profile: SchemaTargetProfile) -> Self {
+        self.target_schemas = profile;
+        self
     }
 
     /// Builder method to set identifier pattern.
@@ -506,6 +564,25 @@ pub fn identifier() -> impl Strategy<Value = String> {
     ]
 }
 
+/// Generate a column name.
+///
+/// Biased toward a small shared pool so that two distinct tables genuinely end
+/// up with columns of the same *bare* name. Fully random readable identifiers
+/// essentially never collide, which structurally hid a class of IVM bug: the
+/// projection-rewrite path in `DbspCompiler` rebuilds a passthrough projection
+/// with the table qualifier discarded, so an unqualified reference silently
+/// binds to the first same-named column in the join's input schema. That bug is
+/// only reachable when two joined relations share a bare column name.
+pub fn column_identifier() -> impl Strategy<Value = String> {
+    prop_oneof![
+        6 => identifier(),
+        4 => proptest::sample::select(vec![
+            "id", "name", "kind", "val", "ref_id", "parent_id", "tag", "amount",
+        ])
+        .prop_map(String::from),
+    ]
+}
+
 /// Generate a valid SQL identifier that is not in the excluded set.
 pub fn identifier_excluding(excluded: HashSet<String>) -> impl Strategy<Value = String> {
     identifier().prop_filter("must not be in excluded set", move |s| {
@@ -607,7 +684,7 @@ pub fn column_def_with_profile(profile: &ColumnProfile) -> BoxedStrategy<ColumnD
     let data_type_weights = profile.data_type_weights.clone();
 
     (
-        identifier(),
+        column_identifier(),
         data_type_weighted(&data_type_weights),
         0u8..100, // for NOT NULL decision
         0u8..100, // for UNIQUE decision
@@ -660,7 +737,7 @@ pub fn primary_key_column_def_with_profile(
 ) -> BoxedStrategy<ColumnDef> {
     let data_type_weights = profile.data_type_weights.clone();
 
-    (identifier(), data_type_weighted(&data_type_weights))
+    (column_identifier(), data_type_weighted(&data_type_weights))
         .prop_map(|(name, data_type)| ColumnDef {
             name,
             data_type,
@@ -711,23 +788,6 @@ pub fn create_table(
     schema: &Schema,
     profile: &StatementProfile,
 ) -> BoxedStrategy<CreateTableStatement> {
-    let attached_databases = schema.attached_databases.clone();
-    let mut database_choices = vec![None, Some("temp".to_string())];
-    for db in attached_databases {
-        if db == "temp" {
-            continue;
-        }
-        database_choices.push(Some(db));
-    }
-    let target_databases: Vec<(Option<String>, std::collections::HashSet<String>)> =
-        database_choices
-            .into_iter()
-            .map(|db| {
-                let existing_names = schema.table_names_in_database(db.as_deref());
-                (db, existing_names)
-            })
-            .collect();
-
     // Extract profile values from the CreateTableProfile
     let create_table_profile = profile.create_table_profile();
     let column_count_range = create_table_profile.column_count_range.clone();
@@ -735,6 +795,36 @@ pub fn create_table(
     let pk_profile = create_table_profile.primary_key.clone();
     let if_not_exists_prob = create_table_profile.if_not_exists_probability;
     let strict_prob = create_table_profile.strict_probability;
+    let target_schemas = create_table_profile.target_schemas.clone();
+
+    // Build a weighted multiset of (schema, existing_names_in_schema) pairs
+    // by repeating each schema according to its profile weight. A weight of 0
+    // excludes that schema. The downstream `proptest::sample::Index` picks
+    // uniformly across the multiset, which mimics weighted selection.
+    let attached_databases = schema.attached_databases.clone();
+    let mut target_databases: Vec<(Option<String>, std::collections::HashSet<String>)> = Vec::new();
+    for _ in 0..target_schemas.main {
+        target_databases.push((None, schema.table_names_in_database(None)));
+    }
+    for _ in 0..target_schemas.temp {
+        target_databases.push((
+            Some("temp".to_string()),
+            schema.table_names_in_database(Some("temp")),
+        ));
+    }
+    for db in attached_databases {
+        if db == "temp" {
+            continue;
+        }
+        for _ in 0..target_schemas.attached {
+            target_databases.push((Some(db.clone()), schema.table_names_in_database(Some(&db))));
+        }
+    }
+    // All weights zero means no valid target — fall back to main so the
+    // strategy still produces a statement.
+    if target_databases.is_empty() {
+        target_databases.push((None, schema.table_names_in_database(None)));
+    }
 
     any::<proptest::sample::Index>()
         .prop_flat_map(move |db_idx| {

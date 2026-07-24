@@ -1,0 +1,75 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@requires-file materialized_views "requires materialized view support"
+
+# Simple matview-check to verify the harness works
+matview-check simple-filter {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 5);
+    ---
+    SELECT id, x FROM t WHERE x > 8
+}
+mutate {
+    INSERT INTO t VALUES (4, 30);
+    DELETE FROM t WHERE id = 1;
+}
+
+# Compound equijoin with literal filter in ON clause
+matview-check compound-equijoin-with-literal {
+    CREATE TABLE items (id INTEGER PRIMARY KEY);
+    CREATE TABLE attrs (item_id INTEGER, key TEXT, value TEXT);
+    INSERT INTO items VALUES (1), (2);
+    INSERT INTO attrs VALUES (1, 'name', 'Alice');
+    INSERT INTO attrs VALUES (2, 'name', 'Bob');
+    INSERT INTO attrs VALUES (1, 'age', '30');
+    ---
+    SELECT a.value FROM items i
+    JOIN attrs a ON a.item_id = i.id AND a.key = 'name'
+}
+mutate {
+    INSERT INTO items VALUES (3);
+    INSERT INTO attrs VALUES (3, 'name', 'Carol');
+}
+
+# Join with non-equijoin filter pushdown (single-side predicate)
+matview-check join-filter-pushdown {
+    CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);
+    CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount REAL);
+    INSERT INTO users VALUES (1, 'Alice', 25), (2, 'Bob', 17);
+    INSERT INTO orders VALUES (1, 1, 100.0), (2, 2, 50.0);
+    ---
+    SELECT u.name, o.amount FROM users u
+    JOIN orders o ON u.id = o.user_id AND u.age >= 18
+}
+mutate {
+    INSERT INTO orders VALUES (3, 2, 75.0);
+    INSERT INTO users VALUES (3, 'Carol', 22);
+    INSERT INTO orders VALUES (4, 3, 200.0);
+}
+
+# GQL/EAV pattern with multiple joins and property key lookups via ON
+matview-check gql-eav-compound-keys {
+    CREATE TABLE nodes (id INTEGER PRIMARY KEY);
+    CREATE TABLE node_labels (node_id INTEGER NOT NULL, label TEXT NOT NULL);
+    CREATE TABLE property_keys (id INTEGER PRIMARY KEY, key TEXT NOT NULL);
+    CREATE TABLE node_props_text (node_id INTEGER NOT NULL, key_id INTEGER NOT NULL, value TEXT NOT NULL);
+    INSERT INTO nodes VALUES (1), (2);
+    INSERT INTO node_labels VALUES (1, 'Person'), (2, 'Person');
+    INSERT INTO property_keys VALUES (1, 'name'), (2, 'role');
+    INSERT INTO node_props_text VALUES (1, 1, 'Alice'), (1, 2, 'Engineer');
+    INSERT INTO node_props_text VALUES (2, 1, 'Bob'), (2, 2, 'Designer');
+    ---
+    SELECT p0.value AS name, p1.value AS role
+    FROM nodes AS n
+    JOIN node_labels AS nl ON nl.node_id = n.id
+    JOIN node_props_text AS p0 ON p0.node_id = n.id
+    JOIN property_keys AS pk0 ON p0.key_id = pk0.id
+    JOIN node_props_text AS p1 ON p1.node_id = n.id
+    JOIN property_keys AS pk1 ON p1.key_id = pk1.id
+    WHERE nl.label = 'Person' AND pk0.key = 'name' AND pk1.key = 'role'
+}
+mutate {
+    INSERT INTO nodes VALUES (3);
+    INSERT INTO node_labels VALUES (3, 'Person');
+    INSERT INTO node_props_text VALUES (3, 1, 'Carol'), (3, 2, 'Manager');
+}

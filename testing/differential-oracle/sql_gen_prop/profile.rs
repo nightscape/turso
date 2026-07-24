@@ -10,7 +10,7 @@ use crate::statement::StatementKind;
 
 // Re-export profiles from their respective modules
 pub use crate::create_index::CreateIndexProfile;
-pub use crate::create_table::CreateTableProfile;
+pub use crate::create_table::{CreateTableProfile, SchemaTargetProfile};
 pub use crate::create_trigger::{CreateTriggerOpWeights, CreateTriggerProfile};
 pub use crate::delete::DeleteProfile;
 pub use crate::expression::{ExpressionProfile, ExtendedExpressionProfile};
@@ -179,6 +179,12 @@ pub struct StatementProfile {
     /// DROP VIEW weight (no extra profile needed).
     pub drop_view_weight: u32,
 
+    // DDL weights - Materialized Views
+    /// CREATE MATERIALIZED VIEW weight.
+    pub create_materialized_view_weight: u32,
+    /// DROP MATERIALIZED VIEW weight.
+    pub drop_materialized_view_weight: u32,
+
     // DDL weights - Triggers
     /// CREATE TRIGGER weight and optional operation-level weights.
     pub create_trigger: WeightedProfile<CreateTriggerProfile>,
@@ -196,6 +202,9 @@ pub struct StatementProfile {
     pub vacuum_weight: u32,
     pub analyze_weight: u32,
     pub reindex_weight: u32,
+
+    // Simulator control weights
+    pub reopen_database_weight: u32,
 
     // Global generation profile
     /// Global profile for value, expression, function, and condition generation.
@@ -220,6 +229,8 @@ impl Default for StatementProfile {
             drop_index_weight: 1,
             create_view_weight: 1,
             drop_view_weight: 1,
+            create_materialized_view_weight: 0,
+            drop_materialized_view_weight: 0,
             create_trigger: WeightedProfile::new(1),
             drop_trigger_weight: 1,
 
@@ -234,6 +245,9 @@ impl Default for StatementProfile {
             vacuum_weight: 0,
             analyze_weight: 0,
             reindex_weight: 0,
+
+            // Simulator control - disabled by default
+            reopen_database_weight: 0,
 
             // Global generation profile
             generation: GenerationProfile::default(),
@@ -257,6 +271,8 @@ impl StatementProfile {
             drop_index_weight: 0,
             create_view_weight: 0,
             drop_view_weight: 0,
+            create_materialized_view_weight: 0,
+            drop_materialized_view_weight: 0,
             create_trigger: WeightedProfile::new(0),
             drop_trigger_weight: 0,
             begin_weight: 0,
@@ -267,6 +283,7 @@ impl StatementProfile {
             vacuum_weight: 0,
             analyze_weight: 0,
             reindex_weight: 0,
+            reopen_database_weight: 0,
             generation: self.generation,
         }
     }
@@ -335,6 +352,22 @@ impl StatementProfile {
             rollback_weight: 10,
             savepoint_weight: 8,
             release_weight: 7,
+            generation: self.generation,
+            ..Self::default().none()
+        }
+    }
+
+    /// Builder method to create a matview-heavy profile that biases toward
+    /// write-heavy DML with frequent matview creation and reopens.
+    pub fn matview_heavy(self) -> Self {
+        Self {
+            select: WeightedProfile::new(15),
+            insert: WeightedProfile::new(40),
+            update: WeightedProfile::new(20),
+            delete: WeightedProfile::new(10),
+            create_materialized_view_weight: 8,
+            drop_materialized_view_weight: 2,
+            reopen_database_weight: 3,
             generation: self.generation,
             ..Self::default().none()
         }
@@ -471,6 +504,20 @@ impl StatementProfile {
         self
     }
 
+    // Builder methods for DDL - Materialized Views
+
+    /// Builder method to set CREATE MATERIALIZED VIEW weight.
+    pub fn with_create_materialized_view(mut self, weight: u32) -> Self {
+        self.create_materialized_view_weight = weight;
+        self
+    }
+
+    /// Builder method to set DROP MATERIALIZED VIEW weight.
+    pub fn with_drop_materialized_view(mut self, weight: u32) -> Self {
+        self.drop_materialized_view_weight = weight;
+        self
+    }
+
     // Builder methods for DDL - Triggers
 
     /// Builder method to set CREATE TRIGGER weight.
@@ -569,6 +616,8 @@ impl StatementProfile {
             + self.drop_index_weight
             + self.create_view_weight
             + self.drop_view_weight
+            + self.create_materialized_view_weight
+            + self.drop_materialized_view_weight
             + self.create_trigger.weight
             + self.drop_trigger_weight
     }
@@ -617,6 +666,9 @@ impl StatementProfile {
         match kind {
             StatementKind::Select => self.select.weight,
             StatementKind::Insert => self.insert.weight,
+            // Upserts share 40% of insert weight (20% each)
+            StatementKind::InsertOrReplace => self.insert.weight / 5,
+            StatementKind::Upsert => self.insert.weight / 5,
             StatementKind::Update => self.update.weight,
             StatementKind::Delete => self.delete.weight,
             StatementKind::CreateTable => self.create_table.weight,
@@ -627,6 +679,8 @@ impl StatementProfile {
             StatementKind::DropIndex => self.drop_index_weight,
             StatementKind::CreateView => self.create_view_weight,
             StatementKind::DropView => self.drop_view_weight,
+            StatementKind::CreateMaterializedView => self.create_materialized_view_weight,
+            StatementKind::DropMaterializedView => self.drop_materialized_view_weight,
             StatementKind::CreateTrigger => self.create_trigger.weight,
             StatementKind::DropTrigger => self.drop_trigger_weight,
             StatementKind::Begin => self.begin_weight,
@@ -637,6 +691,7 @@ impl StatementProfile {
             StatementKind::Vacuum => self.vacuum_weight,
             StatementKind::Analyze => self.analyze_weight,
             StatementKind::Reindex => self.reindex_weight,
+            StatementKind::ReopenDatabase => self.reopen_database_weight,
         }
     }
 

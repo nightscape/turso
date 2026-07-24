@@ -1,0 +1,415 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@requires materialized_views "requires materialized view support"
+
+# IVM LEFT JOIN in materialized views.
+#
+# Today LEFT JOIN is rejected at view-creation by the IVM compiler
+# (core/incremental/join_operator.rs:395-410). DBSP semantics:
+#   L ⟕ R = (L ⋈ R) ⊎ { (l, NULL_R) : count_R[l.k] == 0 }
+#
+# The implementation wires three operators per LEFT JOIN:
+#   * the existing InnerJoinOperator (matched rows)
+#   * a new MatchCounterOperator (null-padded unmatched rows)
+#   * a MergeOperator(UnionMode::All) combining the two
+#
+# This file starts with the minimal cases that drive implementation:
+#   1   create-time null-pad emission
+#   3   incremental insert-of-first-match retracts the null-pad
+#   4   incremental delete-of-last-match re-emits the null-pad
+#   11  composition with json_group_array (holon shape)
+#   21  Risk-1 lockin: LEFT JOIN must not push LeftOnly conjuncts to L
+#
+# Additional cases (#2, #5-#10, #12-#16, #18-#20) land as the operator
+# fills in. Rejection sentinels (#24-#26) lock RIGHT/FULL/CROSS in
+# their currently-rejected state.
+
+# 1. Create matview against parents-only data; junction is empty.
+#    Each parent must appear with NULL in the junction column.
+test left-join-create-empty-junction {
+    CREATE TABLE parents_1 (pid INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE junction_1 (pid INT, tag TEXT);
+    INSERT INTO parents_1 VALUES (1,'A'),(2,'B'),(3,'C');
+    CREATE MATERIALIZED VIEW lj_1 AS
+        SELECT p.pid, p.name, j.tag
+        FROM parents_1 p LEFT JOIN junction_1 j ON j.pid = p.pid;
+    SELECT pid, name, tag FROM lj_1 ORDER BY pid;
+}
+expect {
+    1|A|
+    2|B|
+    3|C|
+}
+
+# 3. Incremental: INSERT junction row creates first match for a parent.
+#    The parent's null-padded row must retract; matched row must appear.
+test left-join-incremental-add-match {
+    CREATE TABLE parents_3 (pid INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE junction_3 (pid INT, tag TEXT);
+    INSERT INTO parents_3 VALUES (1,'A'),(2,'B');
+    CREATE MATERIALIZED VIEW lj_3 AS
+        SELECT p.pid, p.name, j.tag
+        FROM parents_3 p LEFT JOIN junction_3 j ON j.pid = p.pid;
+    INSERT INTO junction_3 VALUES (1,'x');
+    SELECT pid, name, tag FROM lj_3 ORDER BY pid, tag;
+}
+expect {
+    1|A|x
+    2|B|
+}
+
+# 4. Incremental: DELETE the only junction row for a parent.
+#    Matched row retracts; null-padded row reappears.
+test left-join-incremental-remove-last-match {
+    CREATE TABLE parents_4 (pid INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE junction_4 (id INTEGER PRIMARY KEY, pid INT, tag TEXT);
+    INSERT INTO parents_4 VALUES (1,'A'),(2,'B');
+    INSERT INTO junction_4 VALUES (1,1,'x');
+    CREATE MATERIALIZED VIEW lj_4 AS
+        SELECT p.pid, p.name, j.tag
+        FROM parents_4 p LEFT JOIN junction_4 j ON j.pid = p.pid;
+    DELETE FROM junction_4 WHERE id = 1;
+    SELECT pid, name, tag FROM lj_4 ORDER BY pid;
+}
+expect {
+    1|A|
+    2|B|
+}
+
+# 11. Composition with json_group_array: holon's target shape.
+#     Parent + empty junction + json_group_array(j.tag) GROUP BY parent.
+#
+#     ⚠ KNOWN ISSUE — needs FILTER work to land:
+#     Today json_group_array of a synthetic NULL row from LEFT JOIN
+#     produces '[null]'. Holon needs '[]'. Getting '[]' requires
+#     FILTER (WHERE j.tag IS NOT NULL) which is its own engineering
+#     gap. For now this test locks down the engine's *current* output
+#     post-LEFT-JOIN. Flip the expected value to ["a"] / [] when
+#     FILTER lands.
+test left-join-with-json-group-array-empty-junction {
+    CREATE TABLE parents_11 (pid INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE junction_11 (pid INT, tag TEXT);
+    INSERT INTO parents_11 VALUES (1,'A'),(2,'B');
+    INSERT INTO junction_11 VALUES (1,'a');
+    CREATE MATERIALIZED VIEW lj_11 AS
+        SELECT p.pid, json_group_array(j.tag) AS tags
+        FROM parents_11 p LEFT JOIN junction_11 j ON j.pid = p.pid
+        GROUP BY p.pid;
+    SELECT pid, tags FROM lj_11 ORDER BY pid;
+}
+expect {
+    1|["a"]
+    2|[null]
+}
+
+# 11b. The FILTER variant: `FILTER (WHERE j.tag IS NOT NULL)` excludes
+#      synthetic NULLs from unmatched LEFT JOIN parents, producing '[]'
+#      instead of '[null]'. This is the holon shape unblocker.
+#      See ivm-aggregate-filter.sqltest for the rest of FILTER coverage.
+test left-join-with-json-group-array-empty-junction-filtered {
+    CREATE TABLE parents_11b (pid INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE junction_11b (pid INT, tag TEXT);
+    INSERT INTO parents_11b VALUES (1,'A'),(2,'B');
+    INSERT INTO junction_11b VALUES (1,'a');
+    CREATE MATERIALIZED VIEW lj_11b AS
+        SELECT p.pid, json_group_array(j.tag) FILTER (WHERE j.tag IS NOT NULL) AS tags
+        FROM parents_11b p LEFT JOIN junction_11b j ON j.pid = p.pid
+        GROUP BY p.pid;
+    SELECT pid, tags FROM lj_11b ORDER BY pid;
+}
+expect {
+    1|["a"]
+    2|[]
+}
+
+# 5. Second match for an already-matched parent: count goes 1→2,
+#    no null-pad transition, both matched rows appear.
+test left-join-incremental-second-match {
+    CREATE TABLE parents_5 (pid INTEGER PRIMARY KEY);
+    CREATE TABLE junction_5 (pid INT, tag TEXT);
+    INSERT INTO parents_5 VALUES (1),(2);
+    INSERT INTO junction_5 VALUES (1,'a');
+    CREATE MATERIALIZED VIEW lj_5 AS
+        SELECT p.pid, j.tag
+        FROM parents_5 p LEFT JOIN junction_5 j ON j.pid = p.pid;
+    INSERT INTO junction_5 VALUES (1,'b');
+    SELECT pid, tag FROM lj_5 ORDER BY pid, tag;
+}
+expect {
+    1|a
+    1|b
+    2|
+}
+
+# 6. DELETE one of N matches: count stays > 0, no null-pad re-emission.
+test left-join-multiple-matches-then-delete-one {
+    CREATE TABLE parents_6 (pid INTEGER PRIMARY KEY);
+    CREATE TABLE junction_6 (id INTEGER PRIMARY KEY, pid INT, tag TEXT);
+    INSERT INTO parents_6 VALUES (1),(2);
+    INSERT INTO junction_6 VALUES (1,1,'a'),(2,1,'b'),(3,1,'c');
+    CREATE MATERIALIZED VIEW lj_6 AS
+        SELECT p.pid, j.tag
+        FROM parents_6 p LEFT JOIN junction_6 j ON j.pid = p.pid;
+    DELETE FROM junction_6 WHERE id = 2;
+    SELECT pid, tag FROM lj_6 ORDER BY pid, tag;
+}
+expect {
+    1|a
+    1|c
+    2|
+}
+
+# 7. DELETE a parent that has matches: all matched rows retract.
+test left-join-parent-delete-cascade {
+    CREATE TABLE parents_7 (pid INTEGER PRIMARY KEY);
+    CREATE TABLE junction_7 (pid INT, tag TEXT);
+    INSERT INTO parents_7 VALUES (1),(2);
+    INSERT INTO junction_7 VALUES (1,'a'),(1,'b'),(2,'c');
+    CREATE MATERIALIZED VIEW lj_7 AS
+        SELECT p.pid, j.tag
+        FROM parents_7 p LEFT JOIN junction_7 j ON j.pid = p.pid;
+    DELETE FROM parents_7 WHERE pid = 1;
+    SELECT pid, tag FROM lj_7 ORDER BY pid, tag;
+}
+expect {
+    2|c
+}
+
+# 8. DELETE a parent that has NO matches: its null-pad row retracts.
+test left-join-parent-delete-no-matches {
+    CREATE TABLE parents_8 (pid INTEGER PRIMARY KEY);
+    CREATE TABLE junction_8 (pid INT, tag TEXT);
+    INSERT INTO parents_8 VALUES (1),(2),(3);
+    INSERT INTO junction_8 VALUES (1,'a');
+    CREATE MATERIALIZED VIEW lj_8 AS
+        SELECT p.pid, j.tag
+        FROM parents_8 p LEFT JOIN junction_8 j ON j.pid = p.pid;
+    DELETE FROM parents_8 WHERE pid = 2;
+    SELECT pid, tag FROM lj_8 ORDER BY pid;
+}
+expect {
+    1|a
+    3|
+}
+
+# 10. Multiple INSERTs in BEGIN/COMMIT converge to the right end-state.
+#     Regression guard for delta-consolidation bugs (see MEMORY.md
+#     "IVM Recursive CTE Negative Weight Bug" for the class of issue).
+test left-join-batched-tx {
+    CREATE TABLE parents_10 (pid INTEGER PRIMARY KEY);
+    CREATE TABLE junction_10 (id INTEGER PRIMARY KEY, pid INT, tag TEXT);
+    INSERT INTO parents_10 VALUES (1),(2),(3);
+    CREATE MATERIALIZED VIEW lj_10 AS
+        SELECT p.pid, j.tag
+        FROM parents_10 p LEFT JOIN junction_10 j ON j.pid = p.pid;
+    BEGIN;
+    INSERT INTO junction_10 VALUES (1,1,'a');
+    INSERT INTO junction_10 VALUES (2,1,'b');
+    INSERT INTO junction_10 VALUES (3,2,'c');
+    COMMIT;
+    SELECT pid, tag FROM lj_10 ORDER BY pid, tag;
+}
+expect {
+    1|a
+    1|b
+    2|c
+    3|
+}
+
+# 21. Risk-1 lockin: LEFT JOIN with non-equijoin ON-conjuncts is rejected.
+#
+#     `L LEFT JOIN R ON L.k = R.lk AND L.x > 5` has subtle semantics:
+#     L rows where `L.x > 5` is false must still appear with NULL R
+#     columns (LEFT JOIN preserves L). Pushing `L.x > 5` to L drops
+#     those rows; applying it post-merge ALSO drops them (the predicate
+#     fails for null-padded rows too). Correct handling requires the
+#     match counter to treat LeftOnly-failing L rows as forced-unmatched
+#     — out of scope for the initial LEFT JOIN landing.
+#
+#     Sentinel: this rejection lets us re-enable the support later
+#     without silent semantic regressions in between.
+test left-join-with-leftonly-on-conjunct-rejected {
+    CREATE TABLE parents_21 (pid INTEGER PRIMARY KEY, x INT);
+    CREATE TABLE junction_21 (pid INT, tag TEXT);
+    CREATE MATERIALIZED VIEW lj_21 AS
+        SELECT p.pid, p.x, j.tag
+        FROM parents_21 p LEFT JOIN junction_21 j
+            ON j.pid = p.pid AND p.x > 5;
+}
+expect error {
+    LEFT JOIN with non-equijoin ON-conjuncts
+}
+
+# 30. Dual LEFT JOIN: row preserved when *neither* junction matches.
+#
+#     Regression for the diamond-DAG bug: `merge1` feeding both `inner2`
+#     and `match_counter2` caused the upstream `match_counter1` to be
+#     re-executed once per consumer. The second run observed its own
+#     first-run writes to L_PRESENCE/R_COUNT and emitted a *different*
+#     delta — so `inner2` and `mc2` saw inconsistent left inputs and
+#     rows like `block:f` (no tags, no blockers) silently disappeared.
+#     Fix: memoise execute_node outputs per circuit run
+#     (DbspCircuit::exec_node_cache).
+test left-join-dual-empty-both-junctions {
+    CREATE TABLE block_30 (id TEXT PRIMARY KEY, content TEXT);
+    CREATE TABLE block_tags_30 (block_id TEXT, tag TEXT);
+    CREATE TABLE task_blockers_30 (blocked_id TEXT, blocker_id TEXT);
+    INSERT INTO block_30 VALUES ('a','alpha'),('b','bravo'),('f','foxtrot');
+    INSERT INTO block_tags_30 VALUES ('a','urgent');
+    INSERT INTO task_blockers_30 VALUES ('b','a');
+    CREATE MATERIALIZED VIEW lj_30 AS
+        SELECT b.id, bt.tag, tb.blocker_id
+        FROM block_30 b
+        LEFT OUTER JOIN block_tags_30    bt ON bt.block_id   = b.id
+        LEFT OUTER JOIN task_blockers_30 tb ON tb.blocked_id = b.id;
+    SELECT id, COALESCE(tag,''), COALESCE(blocker_id,'') FROM lj_30 ORDER BY id;
+}
+expect {
+    a|urgent|
+    b||a
+    f||
+}
+
+# 31. Dual LEFT JOIN: DELETE the last junction entry for a row keeps
+#     the parent row alive with the other junction's contents intact.
+#     Direct repro for the holon `block:d` regression — the diamond
+#     DAG made `match_counter1` re-run twice per row, second pass
+#     silently retracted the just-emitted null-pad row.
+test left-join-dual-delete-last-junction-keeps-row {
+    CREATE TABLE block_31 (id TEXT PRIMARY KEY);
+    CREATE TABLE block_tags_31 (block_id TEXT, tag TEXT);
+    CREATE TABLE task_blockers_31 (id INTEGER PRIMARY KEY, blocked_id TEXT, blocker_id TEXT);
+    INSERT INTO block_31 VALUES ('a'),('b');
+    INSERT INTO block_tags_31 VALUES ('b','review');
+    INSERT INTO task_blockers_31 VALUES (1,'a','x'),(2,'b','y');
+    CREATE MATERIALIZED VIEW lj_31 AS
+        SELECT b.id, bt.tag, tb.blocker_id
+        FROM block_31 b
+        LEFT OUTER JOIN block_tags_31    bt ON bt.block_id   = b.id
+        LEFT OUTER JOIN task_blockers_31 tb ON tb.blocked_id = b.id;
+    DELETE FROM task_blockers_31 WHERE id = 1;
+    SELECT id, COALESCE(tag,''), COALESCE(blocker_id,'') FROM lj_31 ORDER BY id;
+}
+expect {
+    a||
+    b|review|y
+}
+
+# 32. Dual LEFT JOIN + dual json_group_array + GROUP BY (the holon
+#     hydration target shape). Empty-on-both rows must surface with
+#     '[]' / '[]' instead of being dropped. Composes the G0 diamond-DAG
+#     fix with this rev's FILTER (WHERE … IS NOT NULL) capability.
+test left-join-dual-with-aggregation {
+    CREATE TABLE block_32 (id TEXT PRIMARY KEY, content TEXT);
+    CREATE TABLE block_tags_32 (block_id TEXT, tag TEXT);
+    CREATE TABLE task_blockers_32 (blocked_id TEXT, blocker_id TEXT);
+    INSERT INTO block_32 VALUES ('a','alpha'),('b','bravo'),('f','foxtrot');
+    INSERT INTO block_tags_32 VALUES ('a','urgent'),('a','review');
+    INSERT INTO task_blockers_32 VALUES ('b','a');
+    CREATE MATERIALIZED VIEW lj_32 AS
+        SELECT b.id,
+          COALESCE(json_group_array(bt.tag) FILTER (WHERE bt.tag IS NOT NULL), '[]') AS tags,
+          COALESCE(json_group_array(tb.blocker_id) FILTER (WHERE tb.blocker_id IS NOT NULL), '[]') AS blocked_by
+        FROM block_32 b
+        LEFT OUTER JOIN block_tags_32    bt ON bt.block_id   = b.id
+        LEFT OUTER JOIN task_blockers_32 tb ON tb.blocked_id = b.id
+        GROUP BY b.id;
+    SELECT id, tags, blocked_by FROM lj_32 ORDER BY id;
+}
+expect {
+    a|["review","urgent"]|[]
+    b|[]|["a"]
+    f|[]|[]
+}
+
+# 33. Dual LEFT JOIN + FILTER aggregation: DELETE the last junction
+#     entry for an isolated row. Direct repro for the holon `block:d`
+#     regression in `bugs/holon_block_hydration_repro.sql`.
+test left-join-dual-delete-last-junction-isolated-row-filtered {
+    CREATE TABLE block_33 (id TEXT PRIMARY KEY);
+    CREATE TABLE block_tags_33 (block_id TEXT, tag TEXT);
+    CREATE TABLE task_blockers_33 (id INTEGER PRIMARY KEY, blocked_id TEXT, blocker_id TEXT);
+    INSERT INTO block_33 VALUES ('a'),('d');
+    INSERT INTO task_blockers_33 VALUES (1,'d','a');
+    CREATE MATERIALIZED VIEW lj_33 AS
+        SELECT b.id,
+          COALESCE(json_group_array(bt.tag) FILTER (WHERE bt.tag IS NOT NULL), '[]') AS tags,
+          COALESCE(json_group_array(tb.blocker_id) FILTER (WHERE tb.blocker_id IS NOT NULL), '[]') AS blocked_by
+        FROM block_33 b
+        LEFT OUTER JOIN block_tags_33    bt ON bt.block_id   = b.id
+        LEFT OUTER JOIN task_blockers_33 tb ON tb.blocked_id = b.id
+        GROUP BY b.id;
+    DELETE FROM task_blockers_33 WHERE id = 1;
+    SELECT id, tags, blocked_by FROM lj_33 ORDER BY id;
+}
+expect {
+    a|[]|[]
+    d|[]|[]
+}
+
+# 40. Redundant UPDATE on the LEFT side drops a null-padded (unmatched)
+#     row from the matview. Repro for holon
+#     devlog/2026-05-07-turso-ivm-focus-roots-stale-rows.md.
+#
+#     Sequence:
+#       INSERT parent → matview has 1 row (null-padded, no junction).
+#       UPDATE parent SET content = 'D' (real change) → matview still 1 row.
+#       UPDATE parent SET content = 'D' (no-op, same value) → matview drops to 0.
+#
+#     Triggers when the right side of the LEFT JOIN has zero matching rows
+#     (so the row is null-padded by MatchCounterOperator).
+test left-join-redundant-update-keeps-null-padded-row {
+    CREATE TABLE parents_40 (id TEXT PRIMARY KEY, content TEXT);
+    CREATE TABLE junction_40 (pid TEXT, tag TEXT);
+    CREATE MATERIALIZED VIEW lj_40 AS
+        SELECT p.id, p.content, j.tag
+        FROM parents_40 p LEFT OUTER JOIN junction_40 j ON j.pid = p.id;
+    INSERT INTO parents_40 VALUES ('id1', 'orig');
+    UPDATE parents_40 SET content = 'D' WHERE id = 'id1';
+    UPDATE parents_40 SET content = 'D' WHERE id = 'id1';
+    SELECT id, content, COALESCE(tag,'') FROM lj_40 ORDER BY id;
+}
+expect {
+    id1|D|
+}
+
+# 41. Same as #40 but with GROUP BY, mirroring the holon `block` matview
+#     shape (the bug also affects matviews that group every base column,
+#     not just the column-list shape in #40).
+test left-join-redundant-update-with-group-by {
+    CREATE TABLE parents_41 (id TEXT PRIMARY KEY, content TEXT);
+    CREATE TABLE junction_41 (pid TEXT, tag TEXT);
+    CREATE MATERIALIZED VIEW lj_41 AS
+        SELECT p.id, p.content
+        FROM parents_41 p LEFT OUTER JOIN junction_41 j ON j.pid = p.id
+        GROUP BY p.id, p.content;
+    INSERT INTO parents_41 VALUES ('id1', 'orig');
+    UPDATE parents_41 SET content = 'D' WHERE id = 'id1';
+    UPDATE parents_41 SET content = 'D' WHERE id = 'id1';
+    SELECT id, content FROM lj_41 ORDER BY id;
+}
+expect {
+    id1|D
+}
+
+# 42. Multiple no-op UPDATEs in a single transaction. δL accumulates
+#     [del(orig), ins(D), del(D), ins(D), del(D), ins(D)] — without
+#     consolidation MatchCounter would emit a spurious null-pad
+#     retraction every redundant-update pair.
+test left-join-redundant-update-batch-tx {
+    CREATE TABLE parents_42 (id TEXT PRIMARY KEY, content TEXT);
+    CREATE TABLE junction_42 (pid TEXT, tag TEXT);
+    CREATE MATERIALIZED VIEW lj_42 AS
+        SELECT p.id, p.content, j.tag
+        FROM parents_42 p LEFT OUTER JOIN junction_42 j ON j.pid = p.id;
+    INSERT INTO parents_42 VALUES ('id1', 'orig');
+    BEGIN;
+    UPDATE parents_42 SET content = 'D' WHERE id = 'id1';
+    UPDATE parents_42 SET content = 'D' WHERE id = 'id1';
+    UPDATE parents_42 SET content = 'D' WHERE id = 'id1';
+    COMMIT;
+    SELECT id, content, COALESCE(tag,'') FROM lj_42 ORDER BY id;
+}
+expect {
+    id1|D|
+}
