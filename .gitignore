@@ -106,10 +106,13 @@ dhat-heap.json
 .aristo/critiques/
 .aristo/proofs/*.proof.bak
 .aristo/archive/
-
 # pgregress actual output and diffs
 postgres/regress/results/
 
 # Amp orb runtime files
 .amp/portals/*
 sqlite/conformance/upstream/logs/
+
+# Auto Claude data directory
+.auto-claude/
+.code-graph/

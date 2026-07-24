@@ -18,3 +18,4 @@ proc-macro = true
 quote = "1.0.38"
 proc-macro2 = "1.0.93"
 syn = { version = "2.0.96", features = ["full", "clone-impls", "visit-mut"] }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }

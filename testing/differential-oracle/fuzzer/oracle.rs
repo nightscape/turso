@@ -601,6 +601,10 @@ mod tests {
             has_unordered_limit: true,
             unordered_limit_reason: Some("limit_order_by_scalar_subquery".to_string()),
             check_unnesting_invariant: false,
+            is_matview_ddl: false,
+            sqlite_sql: None,
+            matview_output_columns: None,
+            is_reopen: false,
         };
         let turso = QueryResult::Rows(vec![Row(vec![SqlValue::Integer(1)])]);
         let sqlite = QueryResult::Rows(vec![Row(vec![SqlValue::Integer(2)])]);
@@ -670,6 +674,10 @@ mod tests {
             has_unordered_limit: false,
             unordered_limit_reason: None,
             check_unnesting_invariant: false,
+            is_matview_ddl: false,
+            sqlite_sql: None,
+            matview_output_columns: None,
+            is_reopen: false,
         };
 
         let result = check_differential(&turso_conn, &sqlite_conn, &schema, &stmt);
@@ -720,6 +728,10 @@ mod tests {
             has_unordered_limit: false,
             unordered_limit_reason: None,
             check_unnesting_invariant: false,
+            is_matview_ddl: false,
+            sqlite_sql: None,
+            matview_output_columns: None,
+            is_reopen: false,
         };
 
         let result = check_differential(&turso_conn, &sqlite_conn, &schema, &stmt);
@@ -796,6 +808,10 @@ mod tests {
                 has_unordered_limit: false,
                 unordered_limit_reason: None,
                 check_unnesting_invariant: true,
+                is_matview_ddl: false,
+                sqlite_sql: None,
+                matview_output_columns: None,
+                is_reopen: false,
             };
             assert!(
                 check_subquery_unnesting_invariant(&conn, &stmt)
@@ -827,6 +843,10 @@ mod tests {
             has_unordered_limit: false,
             unordered_limit_reason: None,
             check_unnesting_invariant: true,
+            is_matview_ddl: false,
+            sqlite_sql: None,
+            matview_output_columns: None,
+            is_reopen: false,
         };
         assert!(
             check_subquery_unnesting_invariant(&conn, &non_equality).is_none(),

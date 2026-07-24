@@ -1,0 +1,453 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@requires materialized_views "requires materialized view support"
+
+# IVM array/string aggregation in materialized views.
+#
+# Adds support for json_group_array, group_concat (and DISTINCT variants)
+# in CREATE MATERIALIZED VIEW. Today these aggregates are rejected by
+# the IVM compiler (compiler.rs:2313 fall-through).
+#
+# Tests are organized:
+#   1-13   core single-table cases (insert/delete/update/null/distinct)
+#   14     mixed-type lex-sort lockdown (Value::Ord contract)
+#   15-16  transaction & consolidated-delta safety
+#   17-20  rejection paths (non-literal sep, non-column arg, blob input)
+#   21-25  INNER JOIN cases
+#   26     multi-aggregate cohabitation (state-bag isolation)
+#   27     LEFT JOIN + array-agg (returns '[null]' for unmatched parents
+#          since a synthetic NULL from the LEFT JOIN feeds the aggregate)
+
+# 1. Create matview against pre-populated source.
+test json-group-array-create {
+    CREATE TABLE t1 (g INT, v TEXT);
+    INSERT INTO t1 VALUES (1,'a'),(1,'b'),(2,'c');
+    CREATE MATERIALIZED VIEW agg_array_1 AS
+        SELECT g, json_group_array(v) AS arr FROM t1 GROUP BY g;
+    SELECT g, arr FROM agg_array_1 ORDER BY g;
+}
+expect {
+    1|["a","b"]
+    2|["c"]
+}
+
+# 2. Create matview against empty source, then insert.
+test json-group-array-create-empty-source {
+    CREATE TABLE t2 (g INT, v TEXT);
+    CREATE MATERIALIZED VIEW agg_array_2 AS
+        SELECT g, json_group_array(v) AS arr FROM t2 GROUP BY g;
+    INSERT INTO t2 VALUES (1,'x'),(1,'y');
+    SELECT g, arr FROM agg_array_2 ORDER BY g;
+}
+expect {
+    1|["x","y"]
+}
+
+# 3. Incremental insert into existing group.
+test json-group-array-insert {
+    CREATE TABLE t3 (g INT, v TEXT);
+    INSERT INTO t3 VALUES (1,'a'),(1,'b'),(2,'c');
+    CREATE MATERIALIZED VIEW agg_array_3 AS
+        SELECT g, json_group_array(v) AS arr FROM t3 GROUP BY g;
+    INSERT INTO t3 VALUES (1,'x');
+    SELECT g, arr FROM agg_array_3 WHERE g = 1;
+}
+expect {
+    1|["a","b","x"]
+}
+
+# 4. Incremental delete from a multi-element group.
+test json-group-array-delete {
+    CREATE TABLE t4 (g INT, v TEXT);
+    INSERT INTO t4 VALUES (1,'a'),(1,'b'),(1,'c');
+    CREATE MATERIALIZED VIEW agg_array_4 AS
+        SELECT g, json_group_array(v) AS arr FROM t4 GROUP BY g;
+    DELETE FROM t4 WHERE v = 'b';
+    SELECT g, arr FROM agg_array_4 WHERE g = 1;
+}
+expect {
+    1|["a","c"]
+}
+
+# 5. Delete the only row of a group; group disappears.
+test json-group-array-delete-empties-group {
+    CREATE TABLE t5 (g INT, v TEXT);
+    INSERT INTO t5 VALUES (1,'only'),(2,'kept');
+    CREATE MATERIALIZED VIEW agg_array_5 AS
+        SELECT g, json_group_array(v) AS arr FROM t5 GROUP BY g;
+    DELETE FROM t5 WHERE g = 1;
+    SELECT g, arr FROM agg_array_5 ORDER BY g;
+}
+expect {
+    2|["kept"]
+}
+
+# 6a. UPDATE that rewrites a non-key value.
+test json-group-array-update-value {
+    CREATE TABLE t6a (id INTEGER PRIMARY KEY, g INT, v TEXT);
+    INSERT INTO t6a VALUES (1,1,'old'),(2,1,'keep');
+    CREATE MATERIALIZED VIEW agg_array_6a AS
+        SELECT g, json_group_array(v) AS arr FROM t6a GROUP BY g;
+    UPDATE t6a SET v = 'new' WHERE id = 1;
+    SELECT g, arr FROM agg_array_6a;
+}
+expect {
+    1|["keep","new"]
+}
+
+# 6b. UPDATE that rewrites the GROUP BY key.
+test json-group-array-update-group-key {
+    CREATE TABLE t6b (id INTEGER PRIMARY KEY, g INT, v TEXT);
+    INSERT INTO t6b VALUES (1,1,'a'),(2,2,'b');
+    CREATE MATERIALIZED VIEW agg_array_6b AS
+        SELECT g, json_group_array(v) AS arr FROM t6b GROUP BY g;
+    UPDATE t6b SET g = 2 WHERE id = 1;
+    SELECT g, arr FROM agg_array_6b ORDER BY g;
+}
+expect {
+    2|["a","b"]
+}
+
+# 7. json_group_array INCLUDES NULL inputs (rendered as JSON null).
+#    Note: output order is Value::Ord (Null < Numeric < Text), not insertion
+#    order — see test 14 for the full mixed-type lex-sort lockdown.
+test json-group-array-includes-nulls {
+    CREATE TABLE t7 (g INT, v TEXT);
+    INSERT INTO t7 VALUES (1,'a'),(1,NULL),(1,'b');
+    CREATE MATERIALIZED VIEW agg_array_7 AS
+        SELECT g, json_group_array(v) AS arr FROM t7 GROUP BY g;
+    SELECT g, arr FROM agg_array_7;
+}
+expect {
+    1|[null,"a","b"]
+}
+
+# 8. group_concat default separator is `,`.
+test group-concat-default-separator {
+    CREATE TABLE t8 (g INT, v TEXT);
+    INSERT INTO t8 VALUES (1,'a'),(1,'b'),(1,'c');
+    CREATE MATERIALIZED VIEW agg_concat_8 AS
+        SELECT g, group_concat(v) AS s FROM t8 GROUP BY g;
+    SELECT g, s FROM agg_concat_8;
+}
+expect {
+    1|a,b,c
+}
+
+# 9. group_concat custom separator.
+test group-concat-custom-separator {
+    CREATE TABLE t9 (g INT, v TEXT);
+    INSERT INTO t9 VALUES (1,'a'),(1,'b'),(1,'c');
+    CREATE MATERIALIZED VIEW agg_concat_9 AS
+        SELECT g, group_concat(v, '|') AS s FROM t9 GROUP BY g;
+    SELECT g, s FROM agg_concat_9;
+}
+expect {
+    1|a|b|c
+}
+
+# 10a. group_concat SKIPS NULL inputs.
+test group-concat-skips-nulls {
+    CREATE TABLE t10a (g INT, v TEXT);
+    INSERT INTO t10a VALUES (1,'a'),(1,NULL),(1,'b');
+    CREATE MATERIALIZED VIEW agg_concat_10a AS
+        SELECT g, group_concat(v) AS s FROM t10a GROUP BY g;
+    SELECT g, s FROM agg_concat_10a;
+}
+expect {
+    1|a,b
+}
+
+# 10b. All-NULL group: group_concat is NULL but COUNT(*) keeps the group alive.
+test group-concat-all-null-group {
+    CREATE TABLE t10b (g INT, v TEXT);
+    INSERT INTO t10b VALUES (1,NULL),(1,NULL);
+    CREATE MATERIALIZED VIEW agg_concat_10b AS
+        SELECT g, COUNT(*) AS n, group_concat(v) AS s FROM t10b GROUP BY g;
+    SELECT g, n, s FROM agg_concat_10b;
+}
+expect {
+    1|2|
+}
+
+# 11. json_group_array(DISTINCT v): each value emitted once; deletes
+#     don't suppress until the last copy is gone.
+test json-group-array-distinct {
+    CREATE TABLE t11 (id INTEGER PRIMARY KEY, g INT, v TEXT);
+    INSERT INTO t11 VALUES (1,1,'a'),(2,1,'a'),(3,1,'b');
+    CREATE MATERIALIZED VIEW agg_array_11 AS
+        SELECT g, json_group_array(DISTINCT v) AS arr FROM t11 GROUP BY g;
+    DELETE FROM t11 WHERE id = 1;
+    SELECT g, arr FROM agg_array_11;
+    DELETE FROM t11 WHERE id = 2;
+    SELECT g, arr FROM agg_array_11;
+}
+expect {
+    1|["a","b"]
+    1|["b"]
+}
+
+# 12. group_concat(DISTINCT v): same idea for the string flavor.
+test group-concat-distinct {
+    CREATE TABLE t12 (id INTEGER PRIMARY KEY, g INT, v TEXT);
+    INSERT INTO t12 VALUES (1,1,'a'),(2,1,'a'),(3,1,'b');
+    CREATE MATERIALIZED VIEW agg_concat_12 AS
+        SELECT g, group_concat(DISTINCT v) AS s FROM t12 GROUP BY g;
+    DELETE FROM t12 WHERE id = 1;
+    SELECT g, s FROM agg_concat_12;
+    DELETE FROM t12 WHERE id = 2;
+    SELECT g, s FROM agg_concat_12;
+}
+expect {
+    1|a,b
+    1|b
+}
+
+# 13. Multi-group; delete from one group, others unchanged.
+test array-agg-multi-group-cross-delete {
+    CREATE TABLE t13 (id INTEGER PRIMARY KEY, g INT, v TEXT);
+    INSERT INTO t13 VALUES (1,1,'a'),(2,2,'b'),(3,2,'c'),(4,3,'d');
+    CREATE MATERIALIZED VIEW agg_array_13 AS
+        SELECT g, json_group_array(v) AS arr FROM t13 GROUP BY g;
+    DELETE FROM t13 WHERE id = 2;
+    SELECT g, arr FROM agg_array_13 ORDER BY g;
+}
+expect {
+    1|["a"]
+    2|["c"]
+    3|["d"]
+}
+
+# 14. Mixed-type group: lex-sorted via Value::Ord (Null < Numeric < Text).
+#     LOCKS DOWN the divergence from regular VIEW insertion order.
+test array-agg-mixed-types-lex-sorted {
+    CREATE TABLE t14 (id INTEGER PRIMARY KEY, g INT, v);
+    INSERT INTO t14 VALUES (1,1,'a'),(2,1,1),(3,1,1.5),(4,1,NULL);
+    CREATE MATERIALIZED VIEW agg_array_14 AS
+        SELECT g, json_group_array(v) AS arr FROM t14 GROUP BY g;
+    SELECT g, arr FROM agg_array_14;
+}
+expect {
+    1|[null,1,1.5,"a"]
+}
+
+# 15. Multiple INSERTs in BEGIN/COMMIT: same end state as auto-commit.
+test array-agg-batched-tx {
+    CREATE TABLE t15 (g INT, v TEXT);
+    CREATE MATERIALIZED VIEW agg_array_15 AS
+        SELECT g, json_group_array(v) AS arr FROM t15 GROUP BY g;
+    BEGIN;
+    INSERT INTO t15 VALUES (1,'a');
+    INSERT INTO t15 VALUES (1,'b');
+    INSERT INTO t15 VALUES (1,'c');
+    COMMIT;
+    SELECT g, arr FROM agg_array_15;
+}
+expect {
+    1|["a","b","c"]
+}
+
+# 16. UPDATE inside a single statement: consolidated delta should
+#     produce the same multiset as a delete+insert.
+test array-agg-update-as-delete-then-insert {
+    CREATE TABLE t16 (id INTEGER PRIMARY KEY, g INT, v TEXT);
+    INSERT INTO t16 VALUES (1,1,'old1'),(2,1,'old2');
+    CREATE MATERIALIZED VIEW agg_array_16 AS
+        SELECT g, group_concat(v) AS s FROM t16 GROUP BY g;
+    UPDATE t16 SET v = 'new' WHERE v = 'old1';
+    SELECT g, s FROM agg_array_16;
+}
+expect {
+    1|new,old2
+}
+
+# 17. Non-literal separator in group_concat → ParseError at CREATE time.
+test group-concat-non-literal-separator-rejected {
+    CREATE TABLE t17 (g INT, v TEXT);
+    CREATE MATERIALIZED VIEW agg_concat_17 AS
+        SELECT g, group_concat(v, v) AS s FROM t17 GROUP BY g;
+}
+expect error {
+    group_concat separator must be a string literal
+}
+
+# 18. NULL-literal separator in group_concat → ParseError at CREATE time.
+test group-concat-null-separator-rejected {
+    CREATE TABLE t18 (g INT, v TEXT);
+    CREATE MATERIALIZED VIEW agg_concat_18 AS
+        SELECT g, group_concat(v, NULL) AS s FROM t18 GROUP BY g;
+}
+expect error {
+    group_concat separator must be a non-NULL string literal
+}
+
+# 19. Complex expression argument to json_group_array.
+#     The logical-plan layer pre-projects non-column expressions into
+#     synthetic columns (`__agg_arg_proj_N`), so the IVM operator just
+#     sees a column reference. The expression is evaluated per row by
+#     the projection upstream of the aggregate.
+test array-agg-expression-arg {
+    CREATE TABLE t19 (g INT, v TEXT);
+    INSERT INTO t19 VALUES (1,'a'),(1,'b');
+    CREATE MATERIALIZED VIEW agg_array_19 AS
+        SELECT g, json_group_array(v || 'x') AS arr FROM t19 GROUP BY g;
+    SELECT g, arr FROM agg_array_19;
+}
+expect {
+    1|["ax","bx"]
+}
+
+# 20. Blob input through json_group_array (H1 lockdown).
+#     Locks down current behavior — convert_dbtype_to_raw_jsonb does not
+#     bail on blobs at the call site we use, but the resulting blob is
+#     malformed JSON when finalized. The engine surfaces "malformed JSON".
+#     If a future commit makes blob detection eager, update this test.
+test array-agg-blob-input {
+    CREATE TABLE t20 (g INT, v BLOB);
+    INSERT INTO t20 VALUES (1, x'deadbeef');
+    CREATE MATERIALIZED VIEW agg_array_20 AS
+        SELECT g, json_group_array(v) AS arr FROM t20 GROUP BY g;
+    SELECT g, arr FROM agg_array_20;
+}
+expect error {
+    malformed JSON
+}
+
+# 21-25. INNER JOIN matview with array aggregation.
+#     LEFT JOIN is independently unsupported in IVM (see test 27).
+test array-agg-inner-join-create {
+    CREATE TABLE parent_21 (pid INTEGER PRIMARY KEY, label TEXT);
+    CREATE TABLE edge_21 (pid INT, tag TEXT);
+    INSERT INTO parent_21 VALUES (1,'p1'),(2,'p2'),(3,'p3');
+    INSERT INTO edge_21 VALUES (1,'a'),(1,'b'),(2,'c');
+    CREATE MATERIALIZED VIEW hydrated_21 AS
+        SELECT p.pid, p.label, json_group_array(e.tag) AS tags
+        FROM parent_21 p JOIN edge_21 e ON p.pid = e.pid
+        GROUP BY p.pid, p.label;
+    SELECT pid, label, tags FROM hydrated_21 ORDER BY pid;
+}
+expect {
+    1|p1|["a","b"]
+    2|p2|["c"]
+}
+
+test array-agg-inner-join-incremental-tag-insert {
+    CREATE TABLE parent_22 (pid INTEGER PRIMARY KEY, label TEXT);
+    CREATE TABLE edge_22 (pid INT, tag TEXT);
+    INSERT INTO parent_22 VALUES (1,'p1'),(2,'p2');
+    INSERT INTO edge_22 VALUES (1,'a');
+    CREATE MATERIALIZED VIEW hydrated_22 AS
+        SELECT p.pid, json_group_array(e.tag) AS tags
+        FROM parent_22 p JOIN edge_22 e ON p.pid = e.pid
+        GROUP BY p.pid;
+    INSERT INTO edge_22 VALUES (1,'b'),(2,'c');
+    SELECT pid, tags FROM hydrated_22 ORDER BY pid;
+}
+expect {
+    1|["a","b"]
+    2|["c"]
+}
+
+test array-agg-inner-join-incremental-tag-delete {
+    CREATE TABLE parent_23 (pid INTEGER PRIMARY KEY, label TEXT);
+    CREATE TABLE edge_23 (id INTEGER PRIMARY KEY, pid INT, tag TEXT);
+    INSERT INTO parent_23 VALUES (1,'p1');
+    INSERT INTO edge_23 VALUES (1,1,'a'),(2,1,'b'),(3,1,'c');
+    CREATE MATERIALIZED VIEW hydrated_23 AS
+        SELECT p.pid, json_group_array(e.tag) AS tags
+        FROM parent_23 p JOIN edge_23 e ON p.pid = e.pid
+        GROUP BY p.pid;
+    DELETE FROM edge_23 WHERE id = 2;
+    SELECT pid, tags FROM hydrated_23;
+}
+expect {
+    1|["a","c"]
+}
+
+test array-agg-inner-join-parent-delete {
+    CREATE TABLE parent_24 (pid INTEGER PRIMARY KEY, label TEXT);
+    CREATE TABLE edge_24 (pid INT, tag TEXT);
+    INSERT INTO parent_24 VALUES (1,'p1'),(2,'p2');
+    INSERT INTO edge_24 VALUES (1,'a'),(2,'b');
+    CREATE MATERIALIZED VIEW hydrated_24 AS
+        SELECT p.pid, json_group_array(e.tag) AS tags
+        FROM parent_24 p JOIN edge_24 e ON p.pid = e.pid
+        GROUP BY p.pid;
+    DELETE FROM parent_24 WHERE pid = 1;
+    DELETE FROM edge_24 WHERE pid = 1;
+    SELECT pid, tags FROM hydrated_24;
+}
+expect {
+    2|["b"]
+}
+
+test array-agg-inner-join-distinct-tags {
+    CREATE TABLE parent_25 (pid INTEGER PRIMARY KEY);
+    CREATE TABLE edge_25 (pid INT, tag TEXT);
+    INSERT INTO parent_25 VALUES (1);
+    INSERT INTO edge_25 VALUES (1,'a'),(1,'a'),(1,'b');
+    CREATE MATERIALIZED VIEW hydrated_25 AS
+        SELECT p.pid, json_group_array(DISTINCT e.tag) AS tags
+        FROM parent_25 p JOIN edge_25 e ON p.pid = e.pid
+        GROUP BY p.pid;
+    SELECT pid, tags FROM hydrated_25;
+}
+expect {
+    1|["a","b"]
+}
+
+# 26. Multi-aggregate cohabitation: ensures new fields don't
+#     corrupt the existing scalar fields' state.
+test array-agg-with-count-and-min {
+    CREATE TABLE t26 (id INTEGER PRIMARY KEY, g INT, v TEXT);
+    INSERT INTO t26 VALUES (1,1,'b'),(2,1,'a'),(3,1,'c');
+    CREATE MATERIALIZED VIEW agg_combo_26 AS
+        SELECT g, COUNT(*) AS n, MIN(v) AS m, json_group_array(v) AS arr
+        FROM t26 GROUP BY g;
+    DELETE FROM t26 WHERE id = 2;
+    SELECT g, n, m, arr FROM agg_combo_26;
+}
+expect {
+    1|2|b|["b","c"]
+}
+
+# 27. LEFT JOIN + array aggregation: now supported. Output value for an
+#     unmatched parent is `'[null]'` (one synthetic NULL row from the
+#     LEFT JOIN gets aggregated). Holon needs `'[]'` here, which requires
+#     `FILTER (WHERE e.tag IS NOT NULL)` — separate engineering gap.
+#     See `testing/runner/tests/ivm-left-join.sqltest` for the LEFT JOIN
+#     coverage proper.
+test array-agg-left-join {
+    CREATE TABLE parent_27 (pid INTEGER PRIMARY KEY);
+    CREATE TABLE edge_27 (pid INT, tag TEXT);
+    INSERT INTO parent_27 VALUES (1),(2);
+    INSERT INTO edge_27 VALUES (1,'a');
+    CREATE MATERIALIZED VIEW hydrated_27 AS
+        SELECT p.pid, json_group_array(e.tag) AS tags
+        FROM parent_27 p LEFT JOIN edge_27 e ON p.pid = e.pid
+        GROUP BY p.pid;
+    SELECT pid, tags FROM hydrated_27 ORDER BY pid;
+}
+expect {
+    1|["a"]
+    2|[null]
+}
+
+# 27b. FILTER variant of test 27: skip synthetic LEFT JOIN NULLs so the
+#      tags column for unmatched parents reads `'[]'` (the holon-required
+#      semantics). See ivm-aggregate-filter.sqltest for full FILTER coverage.
+test array-agg-left-join-filtered {
+    CREATE TABLE parent_27b (pid INTEGER PRIMARY KEY);
+    CREATE TABLE edge_27b (pid INT, tag TEXT);
+    INSERT INTO parent_27b VALUES (1),(2);
+    INSERT INTO edge_27b VALUES (1,'a');
+    CREATE MATERIALIZED VIEW hydrated_27b AS
+        SELECT p.pid, json_group_array(e.tag) FILTER (WHERE e.tag IS NOT NULL) AS tags
+        FROM parent_27b p LEFT JOIN edge_27b e ON p.pid = e.pid
+        GROUP BY p.pid;
+    SELECT pid, tags FROM hydrated_27b ORDER BY pid;
+}
+expect {
+    1|["a"]
+    2|[]
+}

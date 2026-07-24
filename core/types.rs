@@ -30,6 +30,7 @@ use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::iter::{FusedIterator, Peekable};
 use std::ops::Deref;
+use std::sync::atomic::AtomicU64;
 use std::task::{Poll, Waker};
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
@@ -3541,6 +3542,7 @@ impl Cursor {
         match self {
             Self::BTree(cursor, _) => cursor.as_mut(),
             Self::Dyn(cursor, _) => cursor.as_mut(),
+            Self::MaterializedView(cursor) => cursor.btree_cursor_mut(),
             _ => {
                 mark_unlikely();
                 panic!("Cursor is not a btree cursor");
@@ -3641,6 +3643,7 @@ impl Cursor {
             // the index-method cursor, so there is no column state to null
             // out here.
             Self::IndexMethod(_) => {}
+            Self::MaterializedView(cursor) => cursor.btree_cursor_mut().set_null_flag(flag),
             _ => {
                 mark_unlikely();
                 panic!("set_null_flag on unexpected cursor type");
@@ -3873,7 +3876,7 @@ impl<'a> SeekKey<'a> {
 
 #[derive(Debug)]
 pub enum DatabaseChangeType {
-    Delete,
+    Delete { bin_record: Vec<u8> },
     Update { bin_record: std::vec::Vec<u8> },
     Insert { bin_record: std::vec::Vec<u8> },
 }
@@ -3886,6 +3889,71 @@ pub struct DatabaseChange {
     pub table_name: String,
     pub id: i64,
 }
+
+impl DatabaseChange {
+    /// Parse the binary record data into a vector of owned values, one per column.
+    /// Insert, Update and Delete all carry a row image and parse the same way.
+    pub fn parse_record(&self) -> Result<Vec<Value>> {
+        match &self.change {
+            DatabaseChangeType::Insert { bin_record }
+            | DatabaseChangeType::Update { bin_record }
+            | DatabaseChangeType::Delete { bin_record } => {
+                let record = ImmutableRecord::from_bin_record(bin_record.clone());
+                record.get_values_owned()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CallbackId(u64);
+
+impl Default for CallbackId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CallbackId {
+    pub fn new() -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        Self(COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+/// Event data for materialized view change callbacks.
+/// Provides both the changes and the schema metadata needed to interpret them.
+///
+/// # Timing Behavior
+///
+/// **IMPORTANT**: Callbacks fire BEFORE the transaction commits. This means:
+/// - Changes may still be rolled back if a later error occurs
+/// - The data in `changes` represents pending changes, not committed state
+/// - If you need guaranteed committed data, poll the view/table directly after
+///   the transaction completes successfully
+///
+/// This timing allows callbacks to be used for notifications and real-time updates
+/// where eventual consistency is acceptable, but is not suitable for use cases
+/// requiring transactional guarantees.
+#[derive(Debug)]
+pub struct RelationChangeEvent {
+    /// Name of the materialized view or table that changed
+    pub relation_name: String,
+    /// Column names in the view/table, in the same order as values in DatabaseChange records
+    pub columns: Vec<String>,
+    /// The actual row changes (inserts, updates, deletes).
+    /// WARNING: These changes are pending and may be rolled back.
+    pub changes: Vec<DatabaseChange>,
+}
+
+/// Type alias for a change callback function that receives relation change events.
+pub type ChangeCallbackFn = std::sync::Arc<dyn Fn(&RelationChangeEvent) + Send + Sync>;
+
+/// Type alias for a relation filter (set of relation names to match, or None for all).
+pub type RelationFilter = Option<std::collections::HashSet<String>>;
+
+/// Type alias for a registered change callback entry.
+pub type ChangeCallbackEntry = (CallbackId, RelationFilter, ChangeCallbackFn);
 
 #[derive(Debug)]
 pub struct WalFrameInfo {
@@ -5238,5 +5306,36 @@ mod tests {
         for value in values {
             assert_eq!(value.try_clone().unwrap(), value);
         }
+    }
+
+    fn database_change(change: DatabaseChangeType) -> DatabaseChange {
+        DatabaseChange {
+            change_id: 1,
+            change_time: 0,
+            change,
+            table_name: "t".to_string(),
+            id: 1,
+        }
+    }
+
+    #[test]
+    fn parse_record_reads_the_row_image_of_a_delete() {
+        let values = [Value::from_i64(7), Value::build_text("gone")];
+        let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+        let change = database_change(DatabaseChangeType::Delete {
+            bin_record: record.get_payload().to_vec(),
+        });
+
+        assert_eq!(change.parse_record().unwrap(), values);
+    }
+
+    #[test]
+    fn parse_record_fails_on_a_corrupt_row_image() {
+        // Header claims one 4-byte integer, data section holds nothing.
+        let change = database_change(DatabaseChangeType::Insert {
+            bin_record: vec![0x02, 0x04],
+        });
+
+        assert!(change.parse_record().is_err());
     }
 }

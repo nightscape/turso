@@ -1,0 +1,27 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@requires materialized_views "requires materialized view support"
+
+test ivm-recursive-cte-create-index-crash {
+    CREATE TABLE t (id INTEGER, parent_id INTEGER, val INTEGER, label TEXT);
+    INSERT INTO t VALUES (1, NULL, 10, 'root');
+    INSERT INTO t VALUES (2, 1, 20, 'child');
+    CREATE MATERIALIZED VIEW mv AS
+      WITH RECURSIVE mv AS (
+        SELECT id, parent_id, val, label, '/' || id AS path
+        FROM t WHERE parent_id IS NULL
+        UNION ALL
+        SELECT b.id, b.parent_id, b.val, b.label, p.path || '/' || b.id AS path
+        FROM t AS b INNER JOIN mv AS p ON b.parent_id = p.id
+      ) SELECT * FROM mv;
+
+    SELECT COUNT(*) FROM mv;
+
+    CREATE INDEX idx ON t (id DESC, parent_id DESC, label ASC, val ASC);
+
+    SELECT COUNT(*) FROM mv;
+}
+expect {
+    2
+    2
+}

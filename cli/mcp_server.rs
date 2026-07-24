@@ -77,7 +77,11 @@ impl StmtClass {
             | Stmt::CreateTrigger { .. }
             | Stmt::CreateView { .. }
             | Stmt::CreateMaterializedView { .. }
+            | Stmt::RefreshMaterializedView { .. }
             | Stmt::CreateVirtualTable(_)
+            | Stmt::CreateServer(_)
+            | Stmt::CreateForeignTable(_)
+            | Stmt::DropServer { .. }
             | Stmt::CreateType { .. }
             | Stmt::CreateDomain { .. }
             | Stmt::CreateSequence { .. }

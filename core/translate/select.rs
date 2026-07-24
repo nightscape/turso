@@ -3,7 +3,7 @@ use super::plan::{
     select_star, Distinctness, InSeekSource, JoinOrderMember, NamedWindowBound, NamedWindowDef,
     Operation, OuterQueryReference, QueryDestination, Search, TableReferences, Window,
 };
-use crate::schema::Table;
+use crate::schema::{Column, Table};
 use crate::stack::trace_stack;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
@@ -26,9 +26,8 @@ use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
 use crate::{vdbe::builder::ProgramBuilder, Result};
 use std::borrow::Cow;
-use turso_parser::ast::ResultColumn;
 use turso_parser::ast::SortOrder;
-use turso_parser::ast::{self, CompoundSelect, Expr};
+use turso_parser::ast::{self, CompoundSelect, Expr, ResultColumn};
 
 #[turso_macros::trace_stack]
 pub fn translate_select(
@@ -156,6 +155,7 @@ fn select_plan_first_virtual_table_name(select_plan: &SelectPlan) -> Option<Stri
     None
 }
 
+#[turso_macros::trace_stack]
 pub fn prepare_select_plan(
     select: ast::Select,
     resolver: &Resolver,

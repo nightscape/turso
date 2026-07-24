@@ -1,0 +1,470 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@requires materialized_views "requires materialized view support"
+
+# IVM `FILTER (WHERE ...)` clause for aggregates.
+#
+# Today the IVM logical plan builder silently drops
+# `filter_over.filter_clause` from FunctionCall AST nodes (see
+# core/translate/logical.rs:2200-2228), so
+#   sum(v) FILTER (WHERE v >= 10)
+# is treated identically to
+#   sum(v)
+#
+# DBSP semantics: γ_AGG_FILTER(p)(L) = γ_AGG(σ_p(L)). Per-row state
+# updates are gated on the predicate. Group existence stays unfiltered
+# (the unfiltered self.count continues to track group membership).
+#
+# v1 supports FILTER on: sum, avg, group_concat, json_group_array,
+# string_agg, jsonb_group_array. count/count(*)/min/max/distinct +
+# FILTER are deferred (see HANDOFF_IVM_AGGREGATE_FILTER.md and the
+# rejection lockdown tests below).
+#
+# v1 also auto-lifts simple filter-referenced columns into the
+# pre-projection so filters resolve regardless of which sibling
+# aggregate triggers a pre-projection.
+
+# 1. CREATE-time: FILTER skips rows that fail the predicate.
+test filter-create-skips-rows {
+    CREATE TABLE t1 (g INT, v INT);
+    INSERT INTO t1 VALUES (1, 10), (1, 20), (1, 5), (2, 100);
+    CREATE MATERIALIZED VIEW mv_1 AS
+        SELECT g, sum(v) FILTER (WHERE v >= 10) AS s FROM t1 GROUP BY g;
+    SELECT g, s FROM mv_1 ORDER BY g;
+}
+expect {
+    1|30.0
+    2|100.0
+}
+
+# 2. Incremental INSERT of a passing row: aggregate updates.
+test filter-incremental-insert-passes {
+    CREATE TABLE t2 (g INT, v INT);
+    INSERT INTO t2 VALUES (1, 10);
+    CREATE MATERIALIZED VIEW mv_2 AS
+        SELECT g, sum(v) FILTER (WHERE v >= 10) AS s FROM t2 GROUP BY g;
+    INSERT INTO t2 VALUES (1, 25);
+    SELECT g, s FROM mv_2 ORDER BY g;
+}
+expect {
+    1|35.0
+}
+
+# 3. Incremental INSERT of a failing row: aggregate unchanged.
+test filter-incremental-insert-fails {
+    CREATE TABLE t3 (g INT, v INT);
+    INSERT INTO t3 VALUES (1, 10);
+    CREATE MATERIALIZED VIEW mv_3 AS
+        SELECT g, sum(v) FILTER (WHERE v >= 10) AS s FROM t3 GROUP BY g;
+    INSERT INTO t3 VALUES (1, 5);
+    SELECT g, s FROM mv_3 ORDER BY g;
+}
+expect {
+    1|10.0
+}
+
+# 4. Incremental DELETE of a passing row: aggregate decreases.
+test filter-incremental-delete-passes {
+    CREATE TABLE t4 (id INTEGER PRIMARY KEY, g INT, v INT);
+    INSERT INTO t4 VALUES (1, 1, 10), (2, 1, 20), (3, 1, 5);
+    CREATE MATERIALIZED VIEW mv_4 AS
+        SELECT g, sum(v) FILTER (WHERE v >= 10) AS s FROM t4 GROUP BY g;
+    DELETE FROM t4 WHERE id = 2;
+    SELECT g, s FROM mv_4 ORDER BY g;
+}
+expect {
+    1|10.0
+}
+
+# 5. Incremental DELETE of a failing row: aggregate unchanged.
+test filter-incremental-delete-fails {
+    CREATE TABLE t5 (id INTEGER PRIMARY KEY, g INT, v INT);
+    INSERT INTO t5 VALUES (1, 1, 10), (2, 1, 5);
+    CREATE MATERIALIZED VIEW mv_5 AS
+        SELECT g, sum(v) FILTER (WHERE v >= 10) AS s FROM t5 GROUP BY g;
+    DELETE FROM t5 WHERE id = 2;
+    SELECT g, s FROM mv_5 ORDER BY g;
+}
+expect {
+    1|10.0
+}
+
+# 6. UPDATE pivots a row from passing to failing: aggregate retracts.
+test filter-update-pivots-pass-to-fail {
+    CREATE TABLE t6 (id INTEGER PRIMARY KEY, g INT, v INT);
+    INSERT INTO t6 VALUES (1, 1, 10), (2, 1, 20);
+    CREATE MATERIALIZED VIEW mv_6 AS
+        SELECT g, sum(v) FILTER (WHERE v >= 10) AS s FROM t6 GROUP BY g;
+    UPDATE t6 SET v = 5 WHERE id = 1;
+    SELECT g, s FROM mv_6 ORDER BY g;
+}
+expect {
+    1|20.0
+}
+
+# 7. UPDATE pivots a row from failing to passing: aggregate increases.
+test filter-update-pivots-fail-to-pass {
+    CREATE TABLE t7 (id INTEGER PRIMARY KEY, g INT, v INT);
+    INSERT INTO t7 VALUES (1, 1, 5), (2, 1, 20);
+    CREATE MATERIALIZED VIEW mv_7 AS
+        SELECT g, sum(v) FILTER (WHERE v >= 10) AS s FROM t7 GROUP BY g;
+    UPDATE t7 SET v = 30 WHERE id = 1;
+    SELECT g, s FROM mv_7 ORDER BY g;
+}
+expect {
+    1|50.0
+}
+
+# 8. holon shape: json_group_array over LEFT JOIN with FILTER excludes
+#    synthetic NULLs from unmatched parents → expect '[]', not '[null]'.
+test filter-left-join-empty-bucket {
+    CREATE TABLE p8 (pid INTEGER PRIMARY KEY);
+    CREATE TABLE j8 (pid INT, tag TEXT);
+    INSERT INTO p8 VALUES (1), (2);
+    INSERT INTO j8 VALUES (1, 'a');
+    CREATE MATERIALIZED VIEW mv_8 AS
+        SELECT p.pid, json_group_array(j.tag) FILTER (WHERE j.tag IS NOT NULL) AS tags
+        FROM p8 p LEFT JOIN j8 j ON j.pid = p.pid
+        GROUP BY p.pid;
+    SELECT pid, tags FROM mv_8 ORDER BY pid;
+}
+expect {
+    1|["a"]
+    2|[]
+}
+
+# 9. holon shape: adding a junction row flips a parent's tags from [] to ["x"].
+test filter-left-join-add-tag {
+    CREATE TABLE p9 (pid INTEGER PRIMARY KEY);
+    CREATE TABLE j9 (pid INT, tag TEXT);
+    INSERT INTO p9 VALUES (1), (2);
+    INSERT INTO j9 VALUES (1, 'a');
+    CREATE MATERIALIZED VIEW mv_9 AS
+        SELECT p.pid, json_group_array(j.tag) FILTER (WHERE j.tag IS NOT NULL) AS tags
+        FROM p9 p LEFT JOIN j9 j ON j.pid = p.pid
+        GROUP BY p.pid;
+    INSERT INTO j9 VALUES (2, 'x');
+    SELECT pid, tags FROM mv_9 ORDER BY pid;
+}
+expect {
+    1|["a"]
+    2|["x"]
+}
+
+# 10. holon shape: removing the only matching junction row flips tags
+#     from ["x"] back to [].
+test filter-left-join-remove-last-tag {
+    CREATE TABLE p10 (pid INTEGER PRIMARY KEY);
+    CREATE TABLE j10 (id INTEGER PRIMARY KEY, pid INT, tag TEXT);
+    INSERT INTO p10 VALUES (1), (2);
+    INSERT INTO j10 VALUES (1, 1, 'a'), (2, 2, 'x');
+    CREATE MATERIALIZED VIEW mv_10 AS
+        SELECT p.pid, json_group_array(j.tag) FILTER (WHERE j.tag IS NOT NULL) AS tags
+        FROM p10 p LEFT JOIN j10 j ON j.pid = p.pid
+        GROUP BY p.pid;
+    DELETE FROM j10 WHERE id = 2;
+    SELECT pid, tags FROM mv_10 ORDER BY pid;
+}
+expect {
+    1|["a"]
+    2|[]
+}
+
+# 11. SUM with FILTER excluding all rows in a group: expect NULL.
+#     M1 lockdown — today Turso's to_values returns 0 from
+#     `unwrap_or(0.0)` because the branch was unreachable; FILTER makes
+#     it reachable. SQLite semantics: NULL.
+test filter-on-sum-empty-group-emits-null {
+    CREATE TABLE t11 (g INT, v INT);
+    INSERT INTO t11 VALUES (1, 5);
+    CREATE MATERIALIZED VIEW mv_11 AS
+        SELECT g, sum(v) FILTER (WHERE v >= 10) AS s FROM t11 GROUP BY g;
+    SELECT g, s FROM mv_11 ORDER BY g;
+}
+expect {
+    1|
+}
+
+# 12. group_concat with FILTER excluding all rows: expect NULL.
+test filter-on-group-concat-empty-group-emits-null {
+    CREATE TABLE t12 (g INT, v TEXT);
+    INSERT INTO t12 VALUES (1, 'a');
+    CREATE MATERIALIZED VIEW mv_12 AS
+        SELECT g, group_concat(v, ',') FILTER (WHERE length(v) > 5) AS s FROM t12 GROUP BY g;
+}
+expect error {
+    FILTER expression
+}
+
+# 12b. group_concat with simple-shape FILTER excluding all: expect NULL.
+test filter-on-group-concat-empty-group-emits-null-simple {
+    CREATE TABLE t12b (g INT, v INT);
+    INSERT INTO t12b VALUES (1, 1);
+    CREATE MATERIALIZED VIEW mv_12b AS
+        SELECT g, group_concat(v, ',') FILTER (WHERE v > 5) AS s FROM t12b GROUP BY g;
+    SELECT g, s FROM mv_12b ORDER BY g;
+}
+expect {
+    1|
+}
+
+# 13. AVG with FILTER excluding all rows: expect NULL.
+test filter-on-avg-empty-group-emits-null {
+    CREATE TABLE t13 (g INT, v INT);
+    INSERT INTO t13 VALUES (1, 5);
+    CREATE MATERIALIZED VIEW mv_13 AS
+        SELECT g, avg(v) FILTER (WHERE v >= 10) AS a FROM t13 GROUP BY g;
+    SELECT g, a FROM mv_13 ORDER BY g;
+}
+expect {
+    1|
+}
+
+# 14. FILTER with AND-combined predicate.
+test filter-with-and-predicate {
+    CREATE TABLE t14 (g INT, x INT, y INT);
+    INSERT INTO t14 VALUES (1, 5, 1), (1, 15, 8), (1, 25, 50), (1, 30, 5);
+    CREATE MATERIALIZED VIEW mv_14 AS
+        SELECT g, sum(x) FILTER (WHERE x > 10 AND y < 10) AS s FROM t14 GROUP BY g;
+    SELECT g, s FROM mv_14 ORDER BY g;
+}
+expect {
+    1|45.0
+}
+
+# 15. FILTER with column-to-column comparison.
+test filter-with-column-column-comparison {
+    CREATE TABLE t15 (g INT, a INT, b INT);
+    INSERT INTO t15 VALUES (1, 10, 5), (1, 3, 8), (1, 20, 1);
+    CREATE MATERIALIZED VIEW mv_15 AS
+        SELECT g, sum(a) FILTER (WHERE a > b) AS s FROM t15 GROUP BY g;
+    SELECT g, s FROM mv_15 ORDER BY g;
+}
+expect {
+    1|30.0
+}
+
+# 16. Auto-lift: aggregate has a complex arg (forces pre-projection),
+#     filter references a column NOT in any aggregate arg.
+#     Validates 1e auto-lifting: `z` must survive into pre-projection.
+test filter-on-aggregate-with-complex-arg {
+    CREATE TABLE t16 (g INT, x INT, y INT, z INT);
+    INSERT INTO t16 VALUES (1, 2, 3, 1), (1, 4, 5, 0), (1, 1, 1, 1);
+    CREATE MATERIALIZED VIEW mv_16 AS
+        SELECT g, sum(x * y) FILTER (WHERE z = 1) AS s FROM t16 GROUP BY g;
+    SELECT g, s FROM mv_16 ORDER BY g;
+}
+expect {
+    1|7.0
+}
+
+# ─────────────────────────────────────────────────────────────────────
+# Rejection lockdown — each must produce a clear error at view creation.
+# ─────────────────────────────────────────────────────────────────────
+
+# 17. count(*) FILTER — rejected (Count needs filtered_counts persisted
+#     state; deferred to v2).
+test filter-rejected-on-count-star {
+    CREATE TABLE t17 (g INT, active INT);
+    CREATE MATERIALIZED VIEW mv_17 AS
+        SELECT g, count(*) FILTER (WHERE active = 1) AS n FROM t17 GROUP BY g;
+}
+expect error {
+    FILTER not supported with
+}
+
+# 18. count(x) FILTER — rejected for same reason as 17.
+test filter-rejected-on-count-col {
+    CREATE TABLE t18 (g INT, v INT);
+    CREATE MATERIALIZED VIEW mv_18 AS
+        SELECT g, count(v) FILTER (WHERE v > 0) AS n FROM t18 GROUP BY g;
+}
+expect error {
+    FILTER not supported with
+}
+
+# 19. min(x) FILTER — rejected (column-keyed delta tracking; see C1).
+test filter-rejected-on-min {
+    CREATE TABLE t19 (g INT, v INT);
+    CREATE MATERIALIZED VIEW mv_19 AS
+        SELECT g, min(v) FILTER (WHERE v > 0) AS m FROM t19 GROUP BY g;
+}
+expect error {
+    FILTER not supported with
+}
+
+# 20. max(x) FILTER — rejected.
+test filter-rejected-on-max {
+    CREATE TABLE t20 (g INT, v INT);
+    CREATE MATERIALIZED VIEW mv_20 AS
+        SELECT g, max(v) FILTER (WHERE v > 0) AS m FROM t20 GROUP BY g;
+}
+expect error {
+    FILTER not supported with
+}
+
+# 21a. count(distinct x) FILTER — rejected (DISTINCT machinery is
+#      column-mask-keyed; see C1/M5).
+test filter-rejected-on-count-distinct {
+    CREATE TABLE t21a (g INT, v INT);
+    CREATE MATERIALIZED VIEW mv_21a AS
+        SELECT g, count(distinct v) FILTER (WHERE v > 0) AS n FROM t21a GROUP BY g;
+}
+expect error {
+    FILTER not supported with
+}
+
+# 21b. sum(distinct x) FILTER — rejected.
+test filter-rejected-on-sum-distinct {
+    CREATE TABLE t21b (g INT, v INT);
+    CREATE MATERIALIZED VIEW mv_21b AS
+        SELECT g, sum(distinct v) FILTER (WHERE v > 0) AS s FROM t21b GROUP BY g;
+}
+expect error {
+    FILTER not supported with
+}
+
+# 21c. avg(distinct x) FILTER — rejected.
+test filter-rejected-on-avg-distinct {
+    CREATE TABLE t21c (g INT, v INT);
+    CREATE MATERIALIZED VIEW mv_21c AS
+        SELECT g, avg(distinct v) FILTER (WHERE v > 0) AS a FROM t21c GROUP BY g;
+}
+expect error {
+    FILTER not supported with
+}
+
+# 22. Two aggregates over the same column with different filters —
+#     rejected (column-keyed AggregateState would silently double-count
+#     into the same map slot; see C1).
+test filter-rejected-duplicate-column-different-filter {
+    CREATE TABLE t22 (g INT, v INT);
+    CREATE MATERIALIZED VIEW mv_22 AS
+        SELECT g, sum(v) AS total, sum(v) FILTER (WHERE v > 0) AS pos_total
+        FROM t22 GROUP BY g;
+}
+expect error {
+    FILTER on aggregate over column
+}
+
+# 23. FILTER predicate uses an unsupported expression shape (function
+#     call) — rejected with a clear error pointing at the FILTER clause.
+test filter-rejected-unsupported-predicate-shape {
+    CREATE TABLE t23 (g INT, v TEXT);
+    CREATE MATERIALIZED VIEW mv_23 AS
+        SELECT g, json_group_array(v) FILTER (WHERE length(v) > 0) AS arr FROM t23 GROUP BY g;
+}
+expect error {
+    FILTER expression
+}
+
+# 24. count(*) OVER (...) — pre-existing bug fix lockdown. Today the
+#     FunctionCallStar arm at logical.rs:2242-2281 destructures `name, ..`
+#     and silently drops both filter_clause AND over_clause. After fix,
+#     OVER on count(*) is rejected with a clear window-function error.
+test count-star-window-rejected {
+    CREATE TABLE t24 (g INT);
+    CREATE MATERIALIZED VIEW mv_24 AS
+        SELECT g, count(*) OVER (PARTITION BY g) AS n FROM t24;
+}
+expect error {
+    window functions
+}
+
+# 25. json_group_array(DISTINCT col) FILTER (WHERE …) — accepted.
+#
+#     The v1 carve-out used to reject this unconditionally because
+#     CountDistinct/SumDistinct/AvgDistinct compute their transitions
+#     from raw row values and would silently ignore FILTER. But
+#     JsonGroupArrayDistinct gates on `filter_passes` in apply_delta
+#     (aggregate_operator.rs:1462-1469), so DISTINCT + FILTER works
+#     correctly here.
+test filter-with-json-group-array-distinct {
+    CREATE TABLE t25_parent (pid INTEGER PRIMARY KEY);
+    CREATE TABLE t25_tags (pid INT, tag TEXT);
+    INSERT INTO t25_parent VALUES (1),(2),(3);
+    INSERT INTO t25_tags VALUES (1,'urgent'),(1,'urgent'),(1,'review'),(2,NULL);
+    CREATE MATERIALIZED VIEW mv_25 AS
+        SELECT p.pid,
+            COALESCE(
+                json_group_array(DISTINCT t.tag) FILTER (WHERE t.tag IS NOT NULL),
+                '[]'
+            ) AS tags
+        FROM t25_parent p LEFT JOIN t25_tags t ON t.pid = p.pid
+        GROUP BY p.pid;
+    SELECT pid, tags FROM mv_25 ORDER BY pid;
+}
+expect {
+    1|["review","urgent"]
+    2|[]
+    3|[]
+}
+
+# 26. group_concat(DISTINCT col) FILTER (WHERE …) — accepted, same
+#     argument as #25. group_concat distinct deduplicates in the
+#     emission step from the same multiset state.
+test filter-with-group-concat-distinct {
+    CREATE TABLE t26 (g INT, v TEXT);
+    INSERT INTO t26 VALUES (1,'a'),(1,'a'),(1,'b'),(1,NULL),(2,'c');
+    CREATE MATERIALIZED VIEW mv_26 AS
+        SELECT g, group_concat(DISTINCT v) FILTER (WHERE v IS NOT NULL) AS s
+        FROM t26 GROUP BY g;
+    SELECT g, s FROM mv_26 ORDER BY g;
+}
+expect {
+    1|a,b
+    2|c
+}
+
+# 27. count(DISTINCT col) FILTER (WHERE …) — STILL rejected. The
+#     distinct-count transitions are computed from raw row values
+#     before FILTER is consulted, so allowing it would silently
+#     produce wrong counts. Lockdown so future relaxations remember
+#     to update `detect_distinct_transitions` first.
+test filter-with-count-distinct-rejected {
+    CREATE TABLE t27 (g INT, v INT);
+    CREATE MATERIALIZED VIEW mv_27 AS
+        SELECT g, count(DISTINCT v) FILTER (WHERE v > 0) AS n
+        FROM t27 GROUP BY g;
+}
+expect error {
+    FILTER not supported
+}
+
+# 28. sum(DISTINCT col) FILTER (WHERE …) — STILL rejected, same
+#     reason as #27.
+test filter-with-sum-distinct-rejected {
+    CREATE TABLE t28 (g INT, v INT);
+    CREATE MATERIALIZED VIEW mv_28 AS
+        SELECT g, sum(DISTINCT v) FILTER (WHERE v > 0) AS s
+        FROM t28 GROUP BY g;
+}
+expect error {
+    FILTER not supported
+}
+
+# 29. Incremental INSERT into json_group_array(DISTINCT) FILTER —
+#     adding a row that fails the predicate must not appear, and
+#     adding a duplicate of an existing distinct value must not
+#     duplicate it in the array.
+test filter-with-json-group-array-distinct-incremental {
+    CREATE TABLE t29_parent (pid INTEGER PRIMARY KEY);
+    CREATE TABLE t29_tags (id INTEGER PRIMARY KEY, pid INT, tag TEXT);
+    INSERT INTO t29_parent VALUES (1);
+    INSERT INTO t29_tags VALUES (1,1,'a');
+    CREATE MATERIALIZED VIEW mv_29 AS
+        SELECT p.pid,
+            COALESCE(
+                json_group_array(DISTINCT t.tag) FILTER (WHERE t.tag IS NOT NULL),
+                '[]'
+            ) AS tags
+        FROM t29_parent p LEFT JOIN t29_tags t ON t.pid = p.pid
+        GROUP BY p.pid;
+    INSERT INTO t29_tags VALUES (2,1,'a');
+    INSERT INTO t29_tags VALUES (3,1,'b');
+    INSERT INTO t29_tags VALUES (4,1,NULL);
+    SELECT pid, tags FROM mv_29 ORDER BY pid;
+}
+expect {
+    1|["a","b"]
+}

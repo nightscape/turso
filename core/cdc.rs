@@ -12,10 +12,15 @@ pub const TURSO_CDC_VERSION_TABLE_NAME: &str = "turso_cdc_version";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum CaptureDataChangesMode {
+    Off,
     Id,
     Before,
     After,
     Full,
+    CallbackOnlyId,
+    CallbackOnlyBefore,
+    CallbackOnlyAfter,
+    CallbackOnlyFull,
 }
 
 /// CDC schema version with integer ordering for feature checks.
@@ -75,6 +80,20 @@ impl CaptureDataChangesInfo {
         let (mode, table) = value
             .split_once(",")
             .unwrap_or((value, TURSO_CDC_DEFAULT_TABLE_NAME));
+
+        if table == "callback_only" {
+            return match mode {
+                "off" => Ok(None),
+                "id" => Ok(Some(CaptureDataChangesInfo { mode: CaptureDataChangesMode::CallbackOnlyId, table: String::new(), version })),
+                "before" => Ok(Some(CaptureDataChangesInfo { mode: CaptureDataChangesMode::CallbackOnlyBefore, table: String::new(), version })),
+                "after" => Ok(Some(CaptureDataChangesInfo { mode: CaptureDataChangesMode::CallbackOnlyAfter, table: String::new(), version })),
+                "full" => Ok(Some(CaptureDataChangesInfo { mode: CaptureDataChangesMode::CallbackOnlyFull, table: String::new(), version })),
+                _ => Err(LimboError::InvalidArgument(
+                    "unexpected pragma value: expected '<mode>,callback_only' where mode is one of off|id|before|after|full".to_string(),
+                )),
+            };
+        }
+
         match mode {
             "off" => Ok(None),
             "id" => Ok(Some(CaptureDataChangesInfo { mode: CaptureDataChangesMode::Id, table: table.to_string(), version })),
@@ -82,32 +101,36 @@ impl CaptureDataChangesInfo {
             "after" => Ok(Some(CaptureDataChangesInfo { mode: CaptureDataChangesMode::After, table: table.to_string(), version })),
             "full" => Ok(Some(CaptureDataChangesInfo { mode: CaptureDataChangesMode::Full, table: table.to_string(), version })),
             _ => Err(LimboError::InvalidArgument(
-                "unexpected pragma value: expected '<mode>' or '<mode>,<cdc-table-name>' parameter where mode is one of off|id|before|after|full".to_string(),
+                "unexpected pragma value: expected '<mode>' or '<mode>,<cdc-table-name>' or '<mode>,callback_only' parameter where mode is one of off|id|before|after|full".to_string(),
             ))
         }
     }
     pub fn has_updates(&self) -> bool {
-        self.mode == CaptureDataChangesMode::Full
+        matches!(
+            self.mode,
+            CaptureDataChangesMode::Full | CaptureDataChangesMode::CallbackOnlyFull
+        )
     }
     pub fn has_after(&self) -> bool {
         matches!(
             self.mode,
-            CaptureDataChangesMode::After | CaptureDataChangesMode::Full
+            CaptureDataChangesMode::After
+                | CaptureDataChangesMode::Full
+                | CaptureDataChangesMode::CallbackOnlyAfter
+                | CaptureDataChangesMode::CallbackOnlyFull
         )
     }
     pub fn has_before(&self) -> bool {
         matches!(
             self.mode,
-            CaptureDataChangesMode::Before | CaptureDataChangesMode::Full
+            CaptureDataChangesMode::Before
+                | CaptureDataChangesMode::Full
+                | CaptureDataChangesMode::CallbackOnlyBefore
+                | CaptureDataChangesMode::CallbackOnlyFull
         )
     }
     pub fn mode_name(&self) -> &str {
-        match self.mode {
-            CaptureDataChangesMode::Id => "id",
-            CaptureDataChangesMode::Before => "before",
-            CaptureDataChangesMode::After => "after",
-            CaptureDataChangesMode::Full => "full",
-        }
+        self.mode.mode_name()
     }
     pub fn cdc_version(&self) -> CdcVersion {
         self.version.unwrap_or(CDC_VERSION_CURRENT)
@@ -134,5 +157,36 @@ impl CaptureDataChangesExt for Option<CaptureDataChangesInfo> {
     }
     fn table(&self) -> Option<&str> {
         self.as_ref().map(|i| i.table.as_str())
+    }
+}
+
+impl CaptureDataChangesMode {
+    pub fn mode_name(&self) -> &str {
+        match self {
+            CaptureDataChangesMode::Off => "off",
+            CaptureDataChangesMode::Id | CaptureDataChangesMode::CallbackOnlyId => "id",
+            CaptureDataChangesMode::Before | CaptureDataChangesMode::CallbackOnlyBefore => "before",
+            CaptureDataChangesMode::After | CaptureDataChangesMode::CallbackOnlyAfter => "after",
+            CaptureDataChangesMode::Full | CaptureDataChangesMode::CallbackOnlyFull => "full",
+        }
+    }
+    pub fn table_name<'a>(&self, table: &'a str) -> Option<&'a str> {
+        if self.is_callback_only() || matches!(self, CaptureDataChangesMode::Off) {
+            None
+        } else {
+            Some(table)
+        }
+    }
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, CaptureDataChangesMode::Off)
+    }
+    pub fn is_callback_only(&self) -> bool {
+        matches!(
+            self,
+            CaptureDataChangesMode::CallbackOnlyId
+                | CaptureDataChangesMode::CallbackOnlyBefore
+                | CaptureDataChangesMode::CallbackOnlyAfter
+                | CaptureDataChangesMode::CallbackOnlyFull
+        )
     }
 }
