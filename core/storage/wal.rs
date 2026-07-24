@@ -11281,8 +11281,8 @@ pub mod test {
     #[test]
     fn test_wal_rollback_does_not_leak_read_lock() {
         let (db, _path) = get_database();
-        let conn1 = db.connect().unwrap();
-        let conn2 = db.connect().unwrap();
+        let conn1 = db.connect(crate::ConnectOpts::new()).unwrap();
+        let conn2 = db.connect(crate::ConnectOpts::new()).unwrap();
 
         conn1
             .execute("create table test(id integer primary key, value text)")
