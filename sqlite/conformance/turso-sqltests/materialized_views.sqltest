@@ -317,6 +317,23 @@ expect {
     2|75.0|2
 }
 
+# With 100 groups the aggregate state index spans more than one btree page.
+# A group whose state sits at a page boundary must still be found.
+test matview-sum-finds-group-state-across-index-pages {
+    CREATE TABLE t(g TEXT, v INTEGER);
+    CREATE MATERIALIZED VIEW mv AS SELECT g, SUM(v) AS s FROM t GROUP BY g;
+    INSERT INTO t
+    WITH RECURSIVE c(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM c WHERE i < 99)
+    SELECT 'g' || i, 1 FROM c;
+    INSERT INTO t VALUES ('g46', 1);
+    SELECT * FROM mv WHERE g = 'g46';
+    SELECT count(*), sum(s) FROM mv;
+}
+expect {
+    g46|2.0
+    100|101.0
+}
+
 test matview-empty-table-population {
     CREATE TABLE t(a INTEGER, b INTEGER);
     CREATE MATERIALIZED VIEW v AS
