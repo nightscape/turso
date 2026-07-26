@@ -86,6 +86,7 @@ pub enum WriteRow {
     },
     InsertIndex {
         rowid: i64,
+        sought: bool,
     },
     UpdateExisting {
         rowid: i64,
@@ -116,17 +117,10 @@ impl WriteRow {
         loop {
             match self {
                 WriteRow::GetRecord => {
-                    // First, seek in the index to find if the row exists
-                    let index_values = index_key.clone();
-                    let index_record =
-                        ImmutableRecord::from_values(&index_values, index_values.len())?;
+                    let found =
+                        return_if_io!(seek_dbsp_index_key(&mut cursors.index_cursor, &index_key));
 
-                    let res = return_if_io!(cursors.index_cursor.seek(
-                        SeekKey::IndexKey(index_record.as_record_ref()),
-                        SeekOp::GE { eq_only: true }
-                    ));
-
-                    if !matches!(res, SeekResult::Found) {
+                    if !found {
                         // Row doesn't exist, we'll insert a new one
                         *self = WriteRow::ComputeNewRowId {
                             final_weight: weight,
@@ -261,9 +255,31 @@ impl WriteRow {
                     let btree_key = BTreeKey::new_table_rowid(rowid_val, Some(&immutable_record));
 
                     return_if_io!(cursors.table_cursor.insert(&btree_key));
-                    *self = WriteRow::InsertIndex { rowid: rowid_val };
+                    *self = WriteRow::InsertIndex {
+                        rowid: rowid_val,
+                        sought: false,
+                    };
                 }
-                WriteRow::InsertIndex { rowid } => {
+                WriteRow::InsertIndex {
+                    rowid,
+                    sought: false,
+                } => {
+                    // GetRecord may have left the cursor on the next leaf page,
+                    // which is not where this key must be inserted.
+                    let mut index_values = index_key.clone();
+                    index_values.push(Value::from_i64(*rowid));
+                    let index_record =
+                        ImmutableRecord::from_values(&index_values, index_values.len())?;
+                    return_if_io!(cursors.index_cursor.seek(
+                        SeekKey::IndexKey(index_record.as_record_ref()),
+                        SeekOp::GE { eq_only: false }
+                    ));
+                    *self = WriteRow::InsertIndex {
+                        rowid: *rowid,
+                        sought: true,
+                    };
+                }
+                WriteRow::InsertIndex { rowid, .. } => {
                     // For has_rowid indexes, we need to append the rowid to the index key
                     // Use the function parameter index_key directly
                     let mut index_values = index_key.clone();
@@ -300,6 +316,35 @@ impl WriteRow {
             }
         }
     }
+}
+
+/// Returns whether the DBSP state index holds an entry whose
+/// `(storage_id, key_hash, element_hash)` prefix equals `index_key`, and leaves
+/// the cursor on it. An `eq_only` seek reports `NotFound` when that entry is the
+/// first one on the next leaf page, so this seeks with `eq_only: false`.
+pub fn seek_dbsp_index_key(cursor: &mut BTreeCursor, index_key: &[Value]) -> IOResultOr<bool> {
+    let index_record = ImmutableRecord::from_values(index_key, index_key.len())?;
+    let res = return_if_io!(cursor.seek(
+        SeekKey::IndexKey(index_record.as_record_ref()),
+        SeekOp::GE { eq_only: false }
+    ));
+    let positioned = match res {
+        SeekResult::Found => true,
+        SeekResult::NotFound => false,
+        SeekResult::TryAdvance => {
+            return_if_io!(cursor.next());
+            cursor.has_record()
+        }
+    };
+    if !positioned {
+        return Ok(IOResult::Done(false));
+    }
+    let record = return_if_io!(cursor.record()).expect("a positioned cursor has a record");
+    let (v0, v1, v2) = record.get_three_values(0, 1, 2)?;
+    let found = v0.to_owned()? == index_key[0]
+        && v1.to_owned()? == index_key[1]
+        && v2.to_owned()? == index_key[2];
+    Ok(IOResult::Done(found))
 }
 
 #[cfg(test)]
