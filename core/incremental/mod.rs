@@ -2,6 +2,8 @@ pub mod aggregate_operator;
 pub mod compiler;
 pub mod cursor;
 pub mod dbsp;
+#[cfg(test)]
+mod eq_only_seek_boundary;
 pub mod expr_compiler;
 pub mod filter_operator;
 pub mod input_operator;
