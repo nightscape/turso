@@ -4,6 +4,57 @@ use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult};
 use crate::{return_if_io, LimboError, Result, Value};
 
+/// Position `cursor` on the DBSP state index entry whose
+/// `(storage_id, key_hash, element_hash)` prefix equals `index_key`, returning
+/// whether such an entry exists.
+///
+/// Use `eq_only: false` so that when the target key falls on a leaf-page
+/// boundary, the btree returns `TryAdvance` and we can step to the next page to
+/// inspect the actual entry. With `eq_only: true` the btree collapses
+/// TryAdvance into NotFound, which silently turns retractions into no-ops and
+/// leaves stale entries behind. Mirrors the handling in `read_next_join_row`
+/// (see core/incremental/join_operator.rs).
+///
+/// With `eq_only: false` the seek may also position at a key strictly greater
+/// than the target. In every branch we verify the cursor's
+/// `(storage_id, key_hash, element_hash)` prefix matches before treating the
+/// entry as a hit; otherwise this is treated as `NotFound`.
+///
+/// Re-entrant: every poll restarts at the seek, so the optional `next()` after
+/// `TryAdvance` is never applied twice.
+pub fn seek_dbsp_index_key(
+    cursor: &mut BTreeCursor,
+    index_key: &[Value],
+) -> Result<IOResult<bool>> {
+    let index_record = ImmutableRecord::from_values(index_key, index_key.len())?;
+    let res = return_if_io!(cursor.seek(
+        SeekKey::IndexKey(index_record.as_record_ref()),
+        SeekOp::GE { eq_only: false }
+    ));
+    let positioned = match res {
+        SeekResult::Found => true,
+        SeekResult::NotFound => false,
+        SeekResult::TryAdvance => {
+            return_if_io!(cursor.next());
+            cursor.has_record()
+        }
+    };
+    if !positioned {
+        return Ok(IOResult::Done(false));
+    }
+    let record = return_if_io!(cursor.record());
+    let found = match record {
+        Some(r) => {
+            let (v0, v1, v2) = r.get_three_values(0, 1, 2)?;
+            v0.to_owned()? == index_key[0]
+                && v1.to_owned()? == index_key[1]
+                && v2.to_owned()? == index_key[2]
+        }
+        None => false,
+    };
+    Ok(IOResult::Done(found))
+}
+
 #[derive(Debug, Default)]
 pub enum ReadRecord {
     #[default]
@@ -86,8 +137,11 @@ pub enum WriteRow {
         rowid: i64,
         final_weight: isize,
     },
+    /// `sought` distinguishes the index re-seek from the index insert, so a
+    /// yielded insert is re-driven rather than preceded by a fresh seek.
     InsertIndex {
         rowid: i64,
+        sought: bool,
     },
     UpdateExisting {
         rowid: i64,
@@ -118,17 +172,11 @@ impl WriteRow {
         loop {
             match self {
                 WriteRow::GetRecord => {
-                    // First, seek in the index to find if the row exists
-                    let index_values = index_key.clone();
-                    let index_record =
-                        ImmutableRecord::from_values(&index_values, index_values.len())?;
+                    // First, seek in the index to find if the row exists.
+                    let found =
+                        return_if_io!(seek_dbsp_index_key(&mut cursors.index_cursor, &index_key));
 
-                    let res = return_if_io!(cursors.index_cursor.seek(
-                        SeekKey::IndexKey(index_record.as_record_ref()),
-                        SeekOp::GE { eq_only: true }
-                    ));
-
-                    if !matches!(res, SeekResult::Found) {
+                    if !found {
                         // Row doesn't exist, we'll insert a new one
                         *self = WriteRow::ComputeNewRowId {
                             final_weight: weight,
@@ -259,9 +307,35 @@ impl WriteRow {
                     let btree_key = BTreeKey::new_table_rowid(rowid_val, Some(&immutable_record));
 
                     return_if_io!(cursors.table_cursor.insert(&btree_key));
-                    *self = WriteRow::InsertIndex { rowid: rowid_val };
+                    *self = WriteRow::InsertIndex {
+                        rowid: rowid_val,
+                        sought: false,
+                    };
                 }
-                WriteRow::InsertIndex { rowid } => {
+                WriteRow::InsertIndex {
+                    rowid,
+                    sought: false,
+                } => {
+                    // The index insert positions off the cursor. `GetRecord`
+                    // seeks with `eq_only: false` and may advance past a leaf
+                    // boundary, so its position is not the insert position:
+                    // seek to where this key belongs first. Done in its own
+                    // state so a yielded (mid-balance) insert is not preceded
+                    // by this seek on re-entry.
+                    let mut index_values = index_key.clone();
+                    index_values.push(Value::from_i64(*rowid));
+                    let index_record =
+                        ImmutableRecord::from_values(&index_values, index_values.len())?;
+                    return_if_io!(cursors.index_cursor.seek(
+                        SeekKey::IndexKey(index_record.as_record_ref()),
+                        SeekOp::GE { eq_only: false }
+                    ));
+                    *self = WriteRow::InsertIndex {
+                        rowid: *rowid,
+                        sought: true,
+                    };
+                }
+                WriteRow::InsertIndex { rowid, .. } => {
                     // For has_rowid indexes, we need to append the rowid to the index key
                     // Use the function parameter index_key directly
                     let mut index_values = index_key.clone();

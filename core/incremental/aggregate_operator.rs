@@ -6,7 +6,7 @@ use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
 use crate::incremental::operator::{
     generate_storage_id, ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
 };
-use crate::incremental::persistence::{ReadRecord, WriteRow};
+use crate::incremental::persistence::{seek_dbsp_index_key, ReadRecord, WriteRow};
 use crate::numeric::Numeric;
 use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
@@ -555,19 +555,13 @@ impl AggregateEvalState {
                             element_id.to_value()?,
                         ];
 
-                        // Create an immutable record for the index key
-                        let index_record = ImmutableRecord::from_values(
-                            &index_key_values,
-                            index_key_values.len(),
-                        )?;
-
-                        // Seek in the index to find if this row exists
-                        let seek_result = return_if_io!(cursors.index_cursor.seek(
-                            SeekKey::IndexKey(index_record.as_record_ref()),
-                            SeekOp::GE { eq_only: true }
+                        // Seek in the index to find if this row exists.
+                        let found = return_if_io!(seek_dbsp_index_key(
+                            &mut cursors.index_cursor,
+                            &index_key_values
                         ));
 
-                        let rowid = if matches!(seek_result, SeekResult::Found) {
+                        let rowid = if found {
                             // Found in index, get the table rowid
                             // The btree code handles extracting the rowid from the index record for has_rowid indexes
                             return_if_io!(cursors.index_cursor.rowid())
@@ -2730,15 +2724,12 @@ impl FetchDistinctState {
                         zset_hash.to_value()?,
                         element_id.to_value()?,
                     ];
-                    let index_record = ImmutableRecord::from_values(&index_key, index_key.len())?;
-
-                    let seek_result = return_if_io!(cursors.index_cursor.seek(
-                        SeekKey::IndexKey(index_record.as_record_ref()),
-                        SeekOp::GE { eq_only: true }
-                    ));
+                    // Same leaf-boundary hazard as the aggregate-state lookup above.
+                    let found =
+                        return_if_io!(seek_dbsp_index_key(&mut cursors.index_cursor, &index_key));
 
                     // Early exit if not found in index
-                    if !matches!(seek_result, SeekResult::Found) {
+                    if !found {
                         let groups = std::mem::take(groups_to_fetch);
                         let values = std::mem::take(values_to_fetch);
                         *self = FetchDistinctState::FetchGroup {
