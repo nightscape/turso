@@ -300,20 +300,35 @@ pub fn plan_satisfies_order_target(
                 schema,
                 EqualityPrefixScope::ConstantEquality,
             ),
-            AccessMethodParams::Subquery { iter_dir } => {
-                let Table::FromClauseSubquery(from_clause_subquery) = &table_ref.table else {
-                    unreachable!(
-                        "access_method.params::Subquery must be for a FromClauseSubquery table"
-                    );
-                };
-                subquery_intrinsic_order_consumed(
-                    table_ref.internal_id,
-                    from_clause_subquery,
-                    *iter_dir,
-                    &order_target.columns[target_col_idx..],
-                    schema,
-                )
-            }
+            AccessMethodParams::Subquery { iter_dir } => match &table_ref.table {
+                Table::FromClauseSubquery(from_clause_subquery) => {
+                    subquery_intrinsic_order_consumed(
+                        table_ref.internal_id,
+                        from_clause_subquery,
+                        *iter_dir,
+                        &order_target.columns[target_col_idx..],
+                        schema,
+                    )
+                }
+                // A recursive-CTE working table also carries a `Subquery` access
+                // method (see `Table::RecursiveCte` construction in
+                // `core/translate/select.rs`), but it is backed by an ephemeral
+                // queue cursor whose rows are emitted in fixpoint/BFS order -- NOT
+                // an ordering the sort-elimination optimizer may rely on. Report
+                // "no usable ordering" (0 columns consumed) so an explicit sort is
+                // kept; claiming an order the queue does not guarantee would
+                // produce wrong results, which is worse than the panic this
+                // replaces.
+                //
+                // The old `unreachable!` here assumed a `Subquery` access method
+                // implied a `FromClauseSubquery`. That premise became false once
+                // recursive-CTE arms started being run through `optimize_plan`
+                // (commit f12f03c): the outer query's `d.id = b.id` join over the
+                // working table now reaches this arm whenever the outer query
+                // carries an ORDER BY / GROUP BY. Any other future `Subquery`
+                // carrier we cannot classify gets the same conservative answer.
+                _ => 0,
+            },
             _ => return false,
         };
 
