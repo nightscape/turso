@@ -369,6 +369,7 @@ fn translate_recursive_cte(
     let label_output_start = program.allocate_label();
     let label_output_next = program.allocate_label();
     let label_done = program.allocate_label();
+    let label_too_many_iterations = program.allocate_label();
 
     // Init
     program.emit_insn(Insn::Init {
@@ -423,10 +424,13 @@ fn translate_recursive_cte(
         value: DEFAULT_RECURSIVE_MAX_ITERATIONS as i64,
         dest: reg_record,
     });
+    // Breaching the guard means the recursion did not converge. Falling through to the output
+    // label would return the rows accumulated so far as though it had, which is a silent wrong
+    // answer, so raise instead.
     program.emit_insn(Insn::Ge {
         lhs: reg_iteration,
         rhs: reg_record,
-        target_pc: label_output_start,
+        target_pc: label_too_many_iterations,
         flags: CmpInsFlags::default(),
         collation: None,
     });
@@ -555,6 +559,18 @@ fn translate_recursive_cte(
         target_pc: label_loop_start,
     });
 
+    // === Non-convergence ===
+    // Only reachable from the iteration guard above. Placed here so it cannot be fallen into.
+    program.preassign_label_to_next_insn(label_too_many_iterations);
+    program.emit_insn(Insn::Halt {
+        err_code: 1,
+        description: format!(
+            "recursive CTE '{cte_name}' did not converge within {DEFAULT_RECURSIVE_MAX_ITERATIONS} iterations"
+        ),
+        description_reg: None,
+        on_error: None,
+    });
+
     // === Output phase: read from result table ===
     program.preassign_label_to_next_insn(label_output_start);
 
@@ -649,7 +665,7 @@ fn translate_recursive_cte(
             limit: select.limit,
         };
 
-        let outer_plan = prepare_select_plan(
+        let mut outer_plan = prepare_select_plan(
             outer_select,
             resolver,
             program,
@@ -657,6 +673,10 @@ fn translate_recursive_cte(
             _query_destination,
             connection,
         )?;
+
+        // The query wrapping the CTE is likewise a plain SELECT; without this it nested-loop
+        // scans the CTE result once per outer row, which is quadratic on its own.
+        optimize_plan(program, &mut outer_plan, resolver)?;
 
         let num_output_cols = outer_plan.select_result_columns().len();
         emit_program(connection, resolver, program, outer_plan, |_| {})?;
@@ -766,7 +786,7 @@ fn emit_base_case_rows(
                 };
 
                 // Prepare and emit the base case plan
-                let base_plan = prepare_select_plan(
+                let mut base_plan = prepare_select_plan(
                     base_select,
                     resolver,
                     program,
@@ -774,6 +794,11 @@ fn emit_base_case_rows(
                     base_destination,
                     _connection,
                 )?;
+
+                // The arms of a recursive CTE are ordinary SELECTs and must go through the
+                // optimizer like any other, otherwise every table keeps its default full-table
+                // scan and an indexed equality such as `WHERE parent_id = ?` degrades to O(N).
+                optimize_plan(program, &mut base_plan, resolver)?;
 
                 emit_program(_connection, resolver, program, base_plan, |_| {})?;
             }
@@ -917,7 +942,7 @@ fn emit_recursive_step_rows(
                     };
 
                     // Prepare the recursive step plan with the CTE as an outer query reference
-                    let recursive_plan = prepare_select_plan(
+                    let mut recursive_plan = prepare_select_plan(
                         recursive_select,
                         resolver,
                         program,
@@ -925,6 +950,11 @@ fn emit_recursive_step_rows(
                         recursive_destination,
                         _connection,
                     )?;
+
+                    // See the note in the base arm. The working table participates in the join
+                    // order as a normal `Table::RecursiveCte` joined table, so the optimizer can
+                    // drive the recursion from the queue and probe the base table by index.
+                    optimize_plan(program, &mut recursive_plan, resolver)?;
 
                     // Emit the recursive step program
                     emit_program(_connection, resolver, program, recursive_plan, |_| {})?;

@@ -19,9 +19,16 @@ use std::fmt::{self, Display, Formatter};
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast;
 
-/// Default maximum iterations for recursive CTEs.
-/// This prevents infinite loops in queries that don't converge.
-pub const DEFAULT_RECURSIVE_MAX_ITERATIONS: usize = 100;
+/// Runaway guard for recursive CTEs: the iteration count at which a recursion is declared
+/// non-convergent and the query is failed.
+///
+/// This is deliberately far above any plausible hierarchy depth. It is a guard against a
+/// recursion that can never terminate, not a limit on how deep a legitimate query may go --
+/// SQLite imposes no such limit, and ordinary idioms (deep parent chains, `WITH RECURSIVE
+/// seq(i) AS (... WHERE i < 50000)` series generators) routinely exceed small values. Breaching
+/// it raises an error; it never truncates the result, so the value only decides when we give up,
+/// never whether we return a wrong answer.
+pub const DEFAULT_RECURSIVE_MAX_ITERATIONS: usize = 100_000;
 
 /// Result type for preprocessing aggregate expressions
 type PreprocessAggregateResult = (
