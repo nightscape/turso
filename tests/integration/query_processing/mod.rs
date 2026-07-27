@@ -31,6 +31,7 @@ mod test_ivm_left_join_aggregate_duplicate;
 mod test_ivm_matview_ddl_column_validation;
 mod test_ivm_matview_first_open_partial;
 mod test_ivm_nested_join;
+mod test_ivm_outdent_retract_race;
 mod test_ivm_pager_bulk_insert;
 mod test_ivm_populate_stash_drop;
 mod test_ivm_recursive_antijoin_reparent_dup;
