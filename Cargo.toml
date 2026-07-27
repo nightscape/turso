@@ -199,6 +199,17 @@ debug = false
 codegen-units = 16
 lto = false
 
+# Debugger profile: full debug info for variable inspection in LLDB/DAP
+# Usage: cargo build --profile debugger
+# `split-debuginfo = "packed"` consolidates DWARF into a self-contained `.dSYM`
+# bundle (via dsymutil) so LLDB doesn't depend on the per-crate `.o`/`.rlib`
+# files cargo prunes after linking — without this, breakpoints in dependency
+# crates fail to bind in LLDB/DAP.
+[profile.debugger]
+inherits = "dev"
+debug = 2
+split-debuginfo = "packed"
+
 [profile.fuzzing]
 inherits = "dev"
 opt-level = 3
