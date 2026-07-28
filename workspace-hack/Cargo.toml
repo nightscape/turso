@@ -68,7 +68,7 @@ smallvec = { version = "1", default-features = false, features = ["const_new", "
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["full", "test-util", "tracing"] }
-tracing = { version = "0.1", features = ["release_max_level_info"] }
+tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [build-dependencies]
@@ -128,7 +128,7 @@ syn = { version = "2", features = ["extra-traits", "fold", "full", "visit", "vis
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["full", "test-util", "tracing"] }
-tracing = { version = "0.1", features = ["release_max_level_info"] }
+tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [target.x86_64-unknown-linux-gnu.dependencies]
