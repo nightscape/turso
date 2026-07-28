@@ -102,6 +102,12 @@ pub fn translate_create_materialized_view(
     })?;
     let view_columns = view_column_schema.flat_columns();
 
+    // Column references resolve only when the DBSP circuit compiles, so compile once
+    // here to reject bad columns at DDL time. Storage roots do not affect compilation.
+    resolver.with_schema(database_id, |s| {
+        IncrementalView::from_stmt(view_name.clone(), select_stmt.clone(), s, 0, 0, 0)
+    })?;
+
     // Reconstruct the SQL string for storage
     let sql = create_materialized_view_to_str(&view_name.name.as_ident(), select_stmt);
 

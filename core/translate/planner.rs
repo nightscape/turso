@@ -1326,22 +1326,35 @@ fn parse_table(
         }
     }
 
-    // Check if this is an incompatible view
-    let is_incompatible = resolver.with_schema(database_id, |schema| {
+    // Check if this view failed to load
+    let load_failure = resolver.with_schema(database_id, |schema| {
         schema
             .incompatible_views
-            .contains(&normalized_qualified_name)
+            .get(&normalized_qualified_name)
+            .cloned()
     });
 
-    if is_incompatible {
-        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
-        crate::bail_parse_error!(
-            "Materialized view '{}' has an incompatible version. \n\
-             The view was created with a different DBSP version than the current version ({}). \n\
-             Please DROP and recreate the view to use it.",
-            normalized_qualified_name,
-            DBSP_CIRCUIT_VERSION
-        );
+    match load_failure {
+        Some(crate::schema::IncompatibleViewReason::VersionMismatch) => {
+            use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+            crate::bail_parse_error!(
+                "Materialized view '{}' has an incompatible version. \n\
+                 The view was created with a different DBSP version than the current version ({}). \n\
+                 Please DROP and recreate the view to use it.",
+                normalized_qualified_name,
+                DBSP_CIRCUIT_VERSION
+            );
+        }
+        Some(crate::schema::IncompatibleViewReason::CompileFailure(cause)) => {
+            crate::bail_parse_error!(
+                "Materialized view '{}' could not be loaded: {} \n\
+                 Its definition no longer matches the schema. \
+                 Use DROP VIEW to remove it, then recreate it.",
+                normalized_qualified_name,
+                cause
+            );
+        }
+        None => {}
     }
 
     // A view row whose stored SQL failed to parse at schema load

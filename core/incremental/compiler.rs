@@ -3528,10 +3528,10 @@ impl DbspCompiler {
                 let (idx, _) = schema
                     .find_column(&col.name, col.table.as_deref())
                     .ok_or_else(|| {
-                        LimboError::ParseError(format!(
-                            "Column '{}' with table {:?} not found in schema",
-                            col.name, col.table
-                        ))
+                        LimboError::ParseError(match &col.table {
+                            Some(table) => format!("no such column: {}.{}", table, col.name),
+                            None => format!("no such column: {}", col.name),
+                        })
                     })?;
                 // Return a Register expression with the correct index
                 Ok(ast::Expr::Register(idx))
@@ -4138,22 +4138,14 @@ impl DbspCompiler {
                             || c.table.as_deref() == Some(table_name))
                 })
                 .ok_or_else(|| {
-                    LimboError::ParseError(format!(
-                        "Column '{}.{}' not found in schema for filter",
-                        table, col.name
-                    ))
+                    LimboError::ParseError(format!("no such column: {}.{}", table, col.name))
                 })
         } else {
             schema
                 .columns
                 .iter()
                 .position(|c| c.name == col.name)
-                .ok_or_else(|| {
-                    LimboError::ParseError(format!(
-                        "Column '{}' not found in schema for filter",
-                        col.name
-                    ))
-                })
+                .ok_or_else(|| LimboError::ParseError(format!("no such column: {}", col.name)))
         }
     }
 }

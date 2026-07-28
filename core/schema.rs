@@ -759,6 +759,17 @@ pub enum SchemaObjectType {
     Index,
 }
 
+/// Why a materialized view stored in sqlite_schema could not be loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncompatibleViewReason {
+    /// No DBSP state table for the current circuit version — the view was
+    /// written by a build with a different DBSP version.
+    VersionMismatch,
+    /// The stored view SQL no longer compiles against the current schema,
+    /// e.g. a base table or one of its columns was dropped.
+    CompileFailure(String),
+}
+
 #[derive(Debug)]
 pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
@@ -788,8 +799,8 @@ pub struct Schema {
     /// This includes both base tables and other materialized views (for cascading updates).
     pub table_to_materialized_views: HashMap<String, Vec<String>>,
 
-    /// Track views that exist but have incompatible versions
-    pub incompatible_views: HashSet<String>,
+    /// Materialized views in sqlite_schema that failed to load, mapped to why.
+    pub incompatible_views: HashMap<String, IncompatibleViewReason>,
 
     /// View rows in sqlite_schema whose stored SQL failed to parse (e.g.
     /// older versions wrote view column lists without identifier quoting).
@@ -930,7 +941,7 @@ impl Schema {
         let views: ViewsMap = HashMap::default();
         let triggers = HashMap::default();
         let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::default();
-        let incompatible_views = HashSet::default();
+        let incompatible_views = HashMap::default();
         let mut type_registry = HashMap::default();
         if enable_custom_types {
             bootstrap_builtin_types(&mut type_registry)?;
@@ -1194,7 +1205,7 @@ impl Schema {
         // Get all materialized views that depend on this table
         if let Some(v) = self.table_to_materialized_views.get(&table_name) {
             v.iter()
-                .filter(|name| self.incompatible_views.contains(&**name))
+                .filter(|name| self.incompatible_views.contains_key(&**name))
                 .for_each(|n| views.push(n));
         }
         f(&views)
@@ -2112,30 +2123,53 @@ impl Schema {
         dbsp_state_roots: HashMap<String, i64>,
         dbsp_state_index_roots: HashMap<String, i64>,
     ) -> Result<()> {
-        let mut pending: Vec<(String, String, i64)> = materialized_view_info
+        struct PendingView {
+            name: String,
+            sql: String,
+            root: i64,
+            last_error: String,
+        }
+
+        let mut pending: Vec<PendingView> = materialized_view_info
             .into_iter()
-            .map(|(name, (sql, root))| (name, sql, root))
+            .map(|(name, (sql, root))| PendingView {
+                name,
+                sql,
+                root,
+                last_error: String::new(),
+            })
             .collect();
 
         let mut last_count = pending.len() + 1;
         while !pending.is_empty() && pending.len() < last_count {
             last_count = pending.len();
             let mut deferred = Vec::new();
-            for (view_name, sql, main_root) in pending {
+            for view in pending {
                 match self.populate_one_materialized_view(
-                    &view_name,
-                    &sql,
-                    main_root,
+                    &view.name,
+                    &view.sql,
+                    view.root,
                     &dbsp_state_roots,
                     &dbsp_state_index_roots,
                 ) {
                     Ok(()) => {
-                        self.reconnect_downstream_matview_edges(&view_name);
+                        self.reconnect_downstream_matview_edges(&view.name);
                     }
+                    // A missing table is the dependency-ordering case: a later pass
+                    // may register it. Any other failure is final for this view.
                     Err(e) if e.to_string().contains("not found in schema") => {
-                        deferred.push((view_name, sql, main_root));
+                        deferred.push(PendingView {
+                            last_error: e.to_string(),
+                            ..view
+                        });
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        tracing::warn!("Materialized view '{}' is unusable: {}", view.name, e);
+                        self.incompatible_views.insert(
+                            view.name,
+                            IncompatibleViewReason::CompileFailure(e.to_string()),
+                        );
+                    }
                 }
             }
             pending = deferred;
@@ -2145,35 +2179,32 @@ impl Schema {
             // Distinguish permanently broken views from circular dependencies.
             // A view is permanently broken if its SQL doesn't reference any other
             // pending view — no amount of reordering will fix it (e.g., it references
-            // a dropped column or table).
+            // a dropped table).
             let pending_names: HashSet<String> =
-                pending.iter().map(|(n, _, _)| n.clone()).collect();
+                pending.iter().map(|view| view.name.clone()).collect();
             let mut stale = Vec::new();
             let mut circular = Vec::new();
-            for (view_name, sql, main_root) in pending {
+            for view in pending {
                 let references_pending_view = pending_names
                     .iter()
-                    .any(|other| *other != view_name && sql.contains(other.as_str()));
+                    .any(|other| *other != view.name && view.sql.contains(other.as_str()));
                 if references_pending_view {
-                    circular.push((view_name, sql, main_root));
+                    circular.push(view.name);
                 } else {
-                    stale.push(view_name);
+                    stale.push((view.name, view.last_error));
                 }
             }
 
-            for view_name in &stale {
-                tracing::warn!(
-                    "Dropping stale materialized view '{}': references non-existent table or column",
-                    view_name
-                );
-                self.incompatible_views.insert(view_name.to_string());
+            for (view_name, reason) in stale {
+                tracing::warn!("Materialized view '{}' is unusable: {}", view_name, reason);
+                self.incompatible_views
+                    .insert(view_name, IncompatibleViewReason::CompileFailure(reason));
             }
 
             if !circular.is_empty() {
-                let names: Vec<&str> = circular.iter().map(|(n, _, _)| n.as_str()).collect();
                 return Err(crate::LimboError::InternalError(format!(
                     "Cannot resolve materialized view dependencies (possible circular dependency): {}",
-                    names.join(", ")
+                    circular.join(", ")
                 )));
             }
         }
@@ -2196,7 +2227,10 @@ impl Schema {
                 "Materialized view '{}' has incompatible version or missing DBSP state table",
                 view_name
             );
-            self.incompatible_views.insert(view_name.to_string());
+            self.incompatible_views.insert(
+                view_name.to_string(),
+                IncompatibleViewReason::VersionMismatch,
+            );
             0
         };
 
@@ -2242,7 +2276,7 @@ impl Schema {
             column_dependencies: Default::default(),
         })));
 
-        if !self.incompatible_views.contains(view_name) {
+        if !self.incompatible_views.contains_key(view_name) {
             self.add_materialized_view(incremental_view, table, sql.to_string());
         }
 
