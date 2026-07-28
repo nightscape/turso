@@ -25,6 +25,7 @@ mod test_ivm_json_group_array_multiset_negative;
 mod test_ivm_json_set;
 mod test_ivm_left_join;
 mod test_ivm_left_join_aggregate_duplicate;
+mod test_ivm_matview_ddl_column_validation;
 mod test_ivm_matview_first_open_partial;
 mod test_ivm_nested_join;
 mod test_ivm_pager_bulk_insert;
