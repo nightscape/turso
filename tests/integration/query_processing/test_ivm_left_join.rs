@@ -5,6 +5,8 @@
 //! file-backed DB to lock down the MatchCounterOperator's btree-resident
 //! state (L_PRESENCE + R_COUNT) across DB reopens.
 
+use tempfile::TempDir;
+
 #[ignore = "blocked on MergeOperator cross-session restore (Risk-2 in plan): \
   the LEFT JOIN's MergeOperator(UnionMode::All) starts with next_rowid=1 \
   on every DB reopen, producing rowids that collide with the persisted \
@@ -14,10 +16,9 @@
   MergeOperator. Track via separate handoff."]
 #[tokio::test]
 async fn test_left_join_cross_session_restore() -> anyhow::Result<()> {
-    let db_path = "/tmp/turso-ivm-left-join-cross-session-test.db";
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("left-join-cross-session-test.db");
+    let db_path = db_path.to_str().unwrap();
 
     let matview_sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS lj AS \
                        SELECT p.pid, p.name, j.tag \
@@ -122,9 +123,6 @@ async fn test_left_join_cross_session_restore() -> anyhow::Result<()> {
         drop(db);
     }
 
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
     Ok(())
 }
 
@@ -135,10 +133,9 @@ async fn test_left_join_cross_session_count_state() -> anyhow::Result<()> {
     // Session 1: create matview with two junction rows for the same parent.
     // Session 2: reopen, DELETE one junction row. The R_COUNT must still be
     // > 0 (we still have one match), so no null-pad row should appear.
-    let db_path = "/tmp/turso-ivm-left-join-count-state-test.db";
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("left-join-count-state-test.db");
+    let db_path = db_path.to_str().unwrap();
 
     let matview_sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS lj AS \
                        SELECT p.pid, j.tag \
@@ -207,9 +204,6 @@ async fn test_left_join_cross_session_count_state() -> anyhow::Result<()> {
         drop(db);
     }
 
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
     Ok(())
 }
 

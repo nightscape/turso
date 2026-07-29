@@ -17,16 +17,10 @@
 //! retraction is lost and the matview holds BOTH the stale matched row and
 //! the new unmatched row -> two rows for one base id.
 
+use tempfile::TempDir;
 use turso::Builder;
 
-fn fresh(path: &str) {
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{path}-wal"));
-    let _ = std::fs::remove_file(format!("{path}-shm"));
-}
-
 async fn setup(db_path: &str) -> anyhow::Result<turso::Connection> {
-    fresh(db_path);
     let db = Builder::new_local(db_path)
         .experimental_materialized_views(true)
         .build()
@@ -92,7 +86,9 @@ async fn assert_single_row(conn: &turso::Connection, label: &str) -> anyhow::Res
 /// Minimal: insert a junction row (group fills), then delete it (group empties).
 #[tokio::test]
 async fn test_ivm_agg_matview_stale_group_on_delete() -> anyhow::Result<()> {
-    let conn = setup("/tmp/turso-ivm-aggstale-min.db").await?;
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("aggstale-min.db");
+    let conn = setup(db_path.to_str().unwrap()).await?;
     assert_single_row(&conn, "initial (unmatched)").await?;
 
     conn.execute("INSERT INTO j1 (base_id, a) VALUES ('x', 'Page')", ())
@@ -111,8 +107,9 @@ async fn test_ivm_agg_matview_stale_group_on_delete() -> anyhow::Result<()> {
 /// land in the same ingest batch, distinct from adding the tag in a later batch.
 #[tokio::test]
 async fn test_ivm_agg_stale_group_born_matched_then_delete() -> anyhow::Result<()> {
-    let path = "/tmp/turso-ivm-aggstale-born.db";
-    fresh(path);
+    let dir = TempDir::new()?;
+    let path = dir.path().join("aggstale-born.db");
+    let path = path.to_str().unwrap();
     let db = Builder::new_local(path)
         .experimental_materialized_views(true)
         .build()
@@ -170,8 +167,9 @@ async fn test_ivm_agg_stale_group_born_matched_then_delete() -> anyhow::Result<(
 /// re-inserted; if it doesn't, the '[]' ghost survives beside the ['Page'] row.
 #[tokio::test]
 async fn test_ivm_agg_ingest_rescan_delete_then_reinsert_tag() -> anyhow::Result<()> {
-    let path = "/tmp/turso-ivm-aggstale-rescan.db";
-    fresh(path);
+    let dir = TempDir::new()?;
+    let path = dir.path().join("aggstale-rescan.db");
+    let path = path.to_str().unwrap();
     let db = Builder::new_local(path)
         .experimental_materialized_views(true)
         .build()
@@ -240,8 +238,9 @@ async fn test_ivm_agg_ingest_rescan_delete_then_reinsert_tag() -> anyhow::Result
 /// advice groups stay empty (as for ref-doc-6); only tags toggles.
 #[tokio::test]
 async fn test_ivm_agg_three_chain_tags_middle_toggle() -> anyhow::Result<()> {
-    let path = "/tmp/turso-ivm-aggstale-3chain.db";
-    fresh(path);
+    let dir = TempDir::new()?;
+    let path = dir.path().join("aggstale-3chain.db");
+    let path = path.to_str().unwrap();
     let db = Builder::new_local(path)
         .experimental_materialized_views(true)
         .build()
@@ -316,8 +315,9 @@ async fn test_ivm_agg_three_chain_tags_middle_toggle() -> anyhow::Result<()> {
 /// null-padded LEFT-JOIN row in the chained block matview.
 #[tokio::test]
 async fn test_ivm_agg_multiblock_interleaved_toggle() -> anyhow::Result<()> {
-    let path = "/tmp/turso-ivm-aggstale-multi.db";
-    fresh(path);
+    let dir = TempDir::new()?;
+    let path = dir.path().join("aggstale-multi.db");
+    let path = path.to_str().unwrap();
     let db = Builder::new_local(path)
         .experimental_materialized_views(true)
         .build()
@@ -443,7 +443,9 @@ async fn test_ivm_agg_multiblock_interleaved_toggle() -> anyhow::Result<()> {
 /// then REPLACE tags with {} (delete Page).
 #[tokio::test]
 async fn test_ivm_agg_matview_stale_group_on_delete_holon_txn() -> anyhow::Result<()> {
-    let conn = setup("/tmp/turso-ivm-aggstale-txn.db").await?;
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("aggstale-txn.db");
+    let conn = setup(db_path.to_str().unwrap()).await?;
 
     conn.execute("BEGIN", ()).await?;
     conn.execute("UPDATE base SET updated_at = 1 WHERE id = 'x'", ())

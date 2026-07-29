@@ -1,12 +1,13 @@
 //! Test that stale materialized views (referencing dropped columns/tables)
 //! are gracefully skipped on DB reopen instead of causing a fatal error.
 
+use tempfile::TempDir;
+
 #[tokio::test]
 async fn test_stale_matview_dropped_column_reopen() -> anyhow::Result<()> {
-    let db_path = "/tmp/turso-ivm-stale-matview-reopen-test.db";
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("stale-matview-reopen-test.db");
+    let db_path = db_path.to_str().unwrap();
 
     // Session 1: Create table with columns A, B and a matview referencing both
     {
@@ -75,18 +76,14 @@ async fn test_stale_matview_dropped_column_reopen() -> anyhow::Result<()> {
         drop(db);
     }
 
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
     Ok(())
 }
 
 #[tokio::test]
 async fn test_stale_matview_dropped_table_reopen() -> anyhow::Result<()> {
-    let db_path = "/tmp/turso-ivm-stale-matview-dropped-table-test.db";
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("stale-matview-dropped-table-test.db");
+    let db_path = db_path.to_str().unwrap();
 
     // Session 1: Create table and matview
     {
@@ -132,19 +129,15 @@ async fn test_stale_matview_dropped_table_reopen() -> anyhow::Result<()> {
         drop(db);
     }
 
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
     Ok(())
 }
 
 #[tokio::test]
 async fn test_valid_chained_matview_still_works() -> anyhow::Result<()> {
     // Ensure the fix doesn't break valid chained matview loading
-    let db_path = "/tmp/turso-ivm-stale-matview-chain-ok-test.db";
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("stale-matview-chain-ok-test.db");
+    let db_path = db_path.to_str().unwrap();
 
     {
         let db = turso::Builder::new_local(db_path)
@@ -186,8 +179,5 @@ async fn test_valid_chained_matview_still_works() -> anyhow::Result<()> {
         drop(db);
     }
 
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
     Ok(())
 }

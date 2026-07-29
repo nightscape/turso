@@ -9,12 +9,13 @@
 //! 2. A non-FILTER aggregate matview's blob format is unchanged by this work
 //!    (regression guard for the "no persistence change" claim).
 
+use tempfile::TempDir;
+
 #[tokio::test]
 async fn test_filter_cross_session_reload() -> anyhow::Result<()> {
-    let db_path = "/tmp/turso-ivm-aggregate-filter-reload.db";
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("aggregate-filter-reload.db");
+    let db_path = db_path.to_str().unwrap();
 
     let matview_sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS mv AS \
         SELECT g, sum(v) FILTER (WHERE v >= 10) AS s FROM t GROUP BY g";
@@ -96,10 +97,9 @@ async fn test_filter_blob_format_unchanged() -> anyhow::Result<()> {
     // must round-trip exactly as before this change. This catches a hypothetical
     // regression where an extra byte got added to the blob format for filters
     // even though no FILTER is in use.
-    let db_path = "/tmp/turso-ivm-aggregate-filter-blob-format.db";
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("aggregate-filter-blob-format.db");
+    let db_path = db_path.to_str().unwrap();
 
     let matview_sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS mv AS \
         SELECT g, sum(v) AS s, json_group_array(v) AS arr FROM t GROUP BY g";

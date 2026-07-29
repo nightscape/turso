@@ -21,13 +21,8 @@
 //!   The net change is zero, yet the `block` matview ends up with 2 identical
 //!   rows for the block.
 
+use tempfile::TempDir;
 use turso::Builder;
-
-fn fresh(path: &str) {
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{path}-wal"));
-    let _ = std::fs::remove_file(format!("{path}-shm"));
-}
 
 async fn open(path: &str) -> anyhow::Result<(turso::Database, turso::Connection)> {
     let db = Builder::new_local(path)
@@ -70,8 +65,9 @@ async fn count_block_rows(conn: &turso::Connection, id: &str) -> anyhow::Result<
 /// LEFT JOIN left-row across a reopen fails to remove the persisted output row".
 #[tokio::test]
 async fn test_ivm_chained_agg_reopen_unmatched_row_delete_reinsert() -> anyhow::Result<()> {
-    let path = "/tmp/turso-ivm-chained-agg-reopen-unmatched.db";
-    fresh(path);
+    let dir = TempDir::new()?;
+    let path = dir.path().join("chained-agg-reopen-unmatched.db");
+    let path = path.to_str().unwrap();
 
     {
         let (db, conn) = open(path).await?;
@@ -138,8 +134,9 @@ async fn setup_multiblock_views(conn: &turso::Connection) -> anyhow::Result<()> 
 
 #[tokio::test]
 async fn test_ivm_chained_agg_reopen_multiblock_reseed_no_duplicate() -> anyhow::Result<()> {
-    let path = "/tmp/turso-ivm-chained-agg-reopen-multiblock.db";
-    fresh(path);
+    let dir = TempDir::new()?;
+    let path = dir.path().join("chained-agg-reopen-multiblock.db");
+    let path = path.to_str().unwrap();
 
     // Session 1: seed parent + two children, parent tagged 'Page'.
     {
@@ -231,8 +228,9 @@ async fn test_ivm_chained_agg_reopen_multiblock_reseed_no_duplicate() -> anyhow:
 
 #[tokio::test]
 async fn test_ivm_chained_agg_reopen_reseed_no_duplicate() -> anyhow::Result<()> {
-    let path = "/tmp/turso-ivm-chained-agg-reopen-reseed.db";
-    fresh(path);
+    let dir = TempDir::new()?;
+    let path = dir.path().join("chained-agg-reopen-reseed.db");
+    let path = path.to_str().unwrap();
 
     // ── Session 1 ────────────────────────────────────────────────────────
     {

@@ -16,16 +16,10 @@
 //! Fixed by consolidating input deltas in JoinOperator::commit (matching
 //! what Antijoin/MatchCounter/Aggregate already did).
 
+use tempfile::TempDir;
 use turso::Builder;
 
-fn fresh(path: &str) {
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(format!("{path}-wal"));
-    let _ = std::fs::remove_file(format!("{path}-shm"));
-}
-
 async fn setup(db_path: &str) -> anyhow::Result<turso::Connection> {
-    fresh(db_path);
     let db = Builder::new_local(db_path)
         .experimental_materialized_views(true)
         .build()
@@ -89,7 +83,9 @@ async fn assert_single_row(conn: &turso::Connection, label: &str) -> anyhow::Res
 /// a ghost keyed by the base row's PRE-transaction updated_at.
 #[tokio::test]
 async fn test_ivm_left_join_aggregate_duplicate() -> anyhow::Result<()> {
-    let conn = setup("/tmp/turso-ivm-ljagg-dup-min.db").await?;
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("ljagg-dup-min.db");
+    let conn = setup(db_path.to_str().unwrap()).await?;
 
     conn.execute("BEGIN", ()).await?;
     conn.execute("UPDATE base SET updated_at = 1 WHERE id = 'x'", ())
@@ -111,7 +107,9 @@ async fn test_ivm_left_join_aggregate_duplicate() -> anyhow::Result<()> {
 /// holon's failing matview_duplicate_row_repro test.
 #[tokio::test]
 async fn test_ivm_left_join_aggregate_duplicate_holon_txn_pattern() -> anyhow::Result<()> {
-    let conn = setup("/tmp/turso-ivm-ljagg-dup-txn.db").await?;
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("ljagg-dup-txn.db");
+    let conn = setup(db_path.to_str().unwrap()).await?;
 
     conn.execute("BEGIN", ()).await?;
     conn.execute("UPDATE base SET updated_at = 1 WHERE id = 'x'", ())
@@ -138,7 +136,9 @@ async fn test_ivm_left_join_aggregate_duplicate_holon_txn_pattern() -> anyhow::R
 /// Control: plain autocommit inserts (no combined txn) never duplicated.
 #[tokio::test]
 async fn test_ivm_left_join_aggregate_plain_inserts_control() -> anyhow::Result<()> {
-    let conn = setup("/tmp/turso-ivm-ljagg-dup-plain.db").await?;
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("ljagg-dup-plain.db");
+    let conn = setup(db_path.to_str().unwrap()).await?;
 
     conn.execute("INSERT INTO j1 VALUES ('x', 'proj')", ())
         .await?;
@@ -153,7 +153,9 @@ async fn test_ivm_left_join_aggregate_plain_inserts_control() -> anyhow::Result<
 /// Control: second write into the SAME junction (holon matrix: tags->tags OK).
 #[tokio::test]
 async fn test_ivm_left_join_aggregate_same_junction_control() -> anyhow::Result<()> {
-    let conn = setup("/tmp/turso-ivm-ljagg-dup-samej.db").await?;
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("ljagg-dup-samej.db");
+    let conn = setup(db_path.to_str().unwrap()).await?;
 
     conn.execute("BEGIN", ()).await?;
     conn.execute("UPDATE base SET updated_at = 1 WHERE id = 'x'", ())
@@ -171,7 +173,9 @@ async fn test_ivm_left_join_aggregate_same_junction_control() -> anyhow::Result<
 /// Control: reverse junction order (j2 before j1) was observed OK in holon.
 #[tokio::test]
 async fn test_ivm_left_join_aggregate_reverse_order_control() -> anyhow::Result<()> {
-    let conn = setup("/tmp/turso-ivm-ljagg-dup-rev.db").await?;
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("ljagg-dup-rev.db");
+    let conn = setup(db_path.to_str().unwrap()).await?;
 
     conn.execute("INSERT INTO j2 VALUES ('x', 'req')", ())
         .await?;

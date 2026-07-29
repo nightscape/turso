@@ -5,12 +5,13 @@
 //! must remain connected in the DBSP dependency graph. Otherwise CDC events
 //! stop cascading and downstream matviews become stale.
 
+use tempfile::TempDir;
+
 #[tokio::test]
 async fn test_drop_create_upstream_breaks_downstream_chain() -> anyhow::Result<()> {
-    let db_path = "/tmp/turso-ivm-dbsp-chain-break-test.db";
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("dbsp-chain-break-test.db");
+    let db_path = db_path.to_str().unwrap();
 
     // Session 1: Create tables + 2-level matview chain
     {
@@ -96,18 +97,14 @@ async fn test_drop_create_upstream_breaks_downstream_chain() -> anyhow::Result<(
         drop(db);
     }
 
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
     Ok(())
 }
 
 #[tokio::test]
 async fn test_drop_create_upstream_3_level_chain() -> anyhow::Result<()> {
-    let db_path = "/tmp/turso-ivm-dbsp-chain-break-3level-test.db";
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("dbsp-chain-break-3level-test.db");
+    let db_path = db_path.to_str().unwrap();
 
     // Session 1: t1 → mv_a → mv_b → mv_c
     {
@@ -190,8 +187,5 @@ async fn test_drop_create_upstream_3_level_chain() -> anyhow::Result<()> {
         drop(db);
     }
 
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
     Ok(())
 }

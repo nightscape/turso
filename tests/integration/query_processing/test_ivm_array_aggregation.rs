@@ -5,6 +5,8 @@
 //! file-backed DB to lock down `AggregateState::to_value_vector` /
 //! `from_value_vector` for the new multiset variants.
 
+use tempfile::TempDir;
+
 #[tokio::test]
 async fn test_array_agg_create_matview_succeeds() -> anyhow::Result<()> {
     // Sanity: every variant the IVM compiler now accepts compiles to a matview.
@@ -53,10 +55,9 @@ async fn test_array_agg_create_matview_succeeds() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn test_cross_session_array_agg_restore() -> anyhow::Result<()> {
-    let db_path = "/tmp/turso-ivm-array-agg-cross-session-test.db";
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("array-agg-cross-session-test.db");
+    let db_path = db_path.to_str().unwrap();
 
     let matview_sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS mv AS \
                        SELECT g, json_group_array(v) AS arr FROM t GROUP BY g";
@@ -134,9 +135,6 @@ async fn test_cross_session_array_agg_restore() -> anyhow::Result<()> {
         drop(db);
     }
 
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
     Ok(())
 }
 
@@ -144,10 +142,9 @@ async fn test_cross_session_array_agg_restore() -> anyhow::Result<()> {
 async fn test_cross_session_group_concat_with_separator() -> anyhow::Result<()> {
     // Locks down that the group_concat separator survives the to_values
     // / from_values metadata round-trip.
-    let db_path = "/tmp/turso-ivm-group-concat-sep-cross-session-test.db";
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("group-concat-sep-cross-session-test.db");
+    let db_path = db_path.to_str().unwrap();
 
     let matview_sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS mv AS \
                        SELECT g, group_concat(v, '||') AS s FROM t GROUP BY g";
@@ -198,8 +195,5 @@ async fn test_cross_session_group_concat_with_separator() -> anyhow::Result<()> 
         drop(db);
     }
 
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
     Ok(())
 }

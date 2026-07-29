@@ -6,12 +6,13 @@
 //! matviews may be processed before their dependencies are registered,
 //! causing "Table not found in schema" errors.
 
+use tempfile::TempDir;
+
 #[tokio::test]
 async fn test_chained_matview_reopen_3_levels() -> anyhow::Result<()> {
-    let db_path = "/tmp/turso-ivm-chained-matview-reopen-test.db";
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("chained-matview-reopen-test.db");
+    let db_path = db_path.to_str().unwrap();
 
     // Session 1: Create tables and 3-level chained matviews
     {
@@ -116,9 +117,6 @@ async fn test_chained_matview_reopen_3_levels() -> anyhow::Result<()> {
         drop(db);
     }
 
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
     Ok(())
 }
 

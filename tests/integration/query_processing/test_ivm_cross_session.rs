@@ -4,12 +4,13 @@
 //! a previous session), INSERT OR REPLACE operations corrupt IVM weights.
 //! Fresh (same-session) matviews work correctly.
 
+use tempfile::TempDir;
+
 #[tokio::test]
 async fn test_cross_session_recursive_matview_insert_or_replace() -> anyhow::Result<()> {
-    let db_path = "/tmp/turso-ivm-cross-session-test.db";
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("cross-session.db");
+    let db_path = db_path.to_str().unwrap();
 
     let matview_sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS mv AS
         WITH RECURSIVE tree AS (
@@ -110,8 +111,5 @@ async fn test_cross_session_recursive_matview_insert_or_replace() -> anyhow::Res
         drop(db);
     }
 
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
     Ok(())
 }

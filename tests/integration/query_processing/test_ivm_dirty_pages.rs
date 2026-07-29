@@ -12,14 +12,14 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use tempfile::TempDir;
 
 /// Stress test matching holon PBT pattern: rapid inserts + interleaved matview DDL + CDC
 #[tokio::test]
 async fn test_dirty_pages_rapid_inserts_with_interleaved_matview_ddl() -> anyhow::Result<()> {
-    let db_path = "/tmp/turso-ivm-dirty-pages-test.db";
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
+    let dir = TempDir::new()?;
+    let db_path = dir.path().join("dirty-pages.db");
+    let db_path = db_path.to_str().unwrap();
 
     let db = turso::Builder::new_local(db_path)
         .experimental_materialized_views(true)
@@ -229,11 +229,6 @@ async fn test_dirty_pages_rapid_inserts_with_interleaved_matview_ddl() -> anyhow
 
     println!("CDC events received: {}", cdc_count.load(Ordering::Relaxed));
 
-    // Cleanup
-    let _ = std::fs::remove_file(db_path);
-    let _ = std::fs::remove_file(format!("{}-wal", db_path));
-    let _ = std::fs::remove_file(format!("{}-shm", db_path));
-
     Ok(())
 }
 
@@ -241,12 +236,13 @@ async fn test_dirty_pages_rapid_inserts_with_interleaved_matview_ddl() -> anyhow
 #[tokio::test]
 async fn test_dirty_pages_stress_loop() -> anyhow::Result<()> {
     for iteration in 0..5 {
-        let db_path = format!("/tmp/turso-ivm-dirty-pages-stress-{}.db", iteration);
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(format!("{}-wal", &db_path));
-        let _ = std::fs::remove_file(format!("{}-shm", &db_path));
+        let dir = TempDir::new()?;
+        let db_path = dir
+            .path()
+            .join(format!("dirty-pages-stress-{}.db", iteration));
+        let db_path = db_path.to_str().unwrap();
 
-        let db = turso::Builder::new_local(&db_path)
+        let db = turso::Builder::new_local(db_path)
             .experimental_materialized_views(true)
             .build()
             .await?;
@@ -344,11 +340,6 @@ async fn test_dirty_pages_stress_loop() -> anyhow::Result<()> {
             )
             .await?;
         }
-
-        // Cleanup
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(format!("{}-wal", &db_path));
-        let _ = std::fs::remove_file(format!("{}-shm", &db_path));
     }
 
     Ok(())
