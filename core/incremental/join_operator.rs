@@ -765,7 +765,7 @@ impl IncrementalOperator for JoinOperator {
                     return_and_restore_if_io!(
                         &mut self.commit_state,
                         state,
-                        write_row.write_row(cursors, index_key, record_values, *weight)
+                        write_row.write_row(cursors, index_key, record_values, *weight as i64)
                     );
 
                     self.commit_state = JoinCommitState::CommitLeftDelta {
@@ -809,7 +809,7 @@ impl IncrementalOperator for JoinOperator {
                     return_and_restore_if_io!(
                         &mut self.commit_state,
                         state,
-                        write_row.write_row(cursors, index_key, record_values, *weight)
+                        write_row.write_row(cursors, index_key, record_values, *weight as i64)
                     );
 
                     self.commit_state = JoinCommitState::CommitRightDelta {

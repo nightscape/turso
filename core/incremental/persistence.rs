@@ -79,11 +79,11 @@ pub enum WriteRow {
         sought: bool,
     },
     ComputeNewRowId {
-        final_weight: isize,
+        final_weight: i64,
     },
     InsertNew {
         rowid: i64,
-        final_weight: isize,
+        final_weight: i64,
         sought: bool,
     },
     InsertIndex {
@@ -92,7 +92,7 @@ pub enum WriteRow {
     },
     UpdateExisting {
         rowid: i64,
-        final_weight: isize,
+        final_weight: i64,
         sought: bool,
     },
     Done,
@@ -115,7 +115,7 @@ impl WriteRow {
         cursors: &mut DbspStateCursors,
         index_key: Vec<Value>,
         record_values: Vec<Value>,
-        weight: isize,
+        weight: i64,
     ) -> Result<IOResult<()>> {
         loop {
             match self {
@@ -206,7 +206,7 @@ impl WriteRow {
                         // Weight is always the last value (column 4 in our 5-column structure)
                         let existing_weight = match weight_opt {
                             Some(val) => match val.to_owned()? {
-                                Value::Numeric(Numeric::Integer(w)) => w as isize,
+                                Value::Numeric(Numeric::Integer(w)) => w,
                                 _ => {
                                     return Err(LimboError::InternalError(
                                         "Invalid weight value in storage".to_string(),
@@ -337,7 +337,7 @@ impl WriteRow {
                         };
                     } else {
                         let mut complete_record = record_values.clone();
-                        complete_record.push(Value::from_i64(final_weight_val as i64));
+                        complete_record.push(Value::from_i64(final_weight_val));
                         let immutable_record =
                             ImmutableRecord::from_values(&complete_record, complete_record.len())?;
                         let btree_key =
@@ -389,7 +389,7 @@ impl WriteRow {
                         };
                     } else {
                         let mut complete_record = record_values.clone();
-                        complete_record.push(Value::from_i64(final_weight as i64));
+                        complete_record.push(Value::from_i64(final_weight));
                         let immutable_record =
                             ImmutableRecord::from_values(&complete_record, complete_record.len())?;
                         let btree_key = BTreeKey::new_table_rowid(rowid, Some(&immutable_record));

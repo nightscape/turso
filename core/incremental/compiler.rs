@@ -1441,7 +1441,7 @@ impl DbspCircuit {
                     // drives WriteRow to delete it, or no-op if absent), then
                     // insert the fresh blob at weight 1. This keeps the stored
                     // weight at exactly 1 instead of inflating across commits.
-                    const PURGE_WEIGHT: isize = -(1 << 60);
+                    const PURGE_WEIGHT: i64 = -(1 << 60);
                     let weight = match phase {
                         RecursivePersistPhase::Delete => PURGE_WEIGHT,
                         RecursivePersistPhase::Insert => 1,

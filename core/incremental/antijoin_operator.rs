@@ -774,7 +774,7 @@ impl IncrementalOperator for AntijoinOperator {
                     return_and_restore_if_io!(
                         &mut self.commit_state,
                         state,
-                        write_row.write_row(cursors, index_key, record_values, delta_count)
+                        write_row.write_row(cursors, index_key, record_values, delta_count as i64)
                     );
                     self.commit_state = AntijoinCommitState::PersistRCount {
                         deltas: std::mem::take(deltas),
@@ -818,7 +818,7 @@ impl IncrementalOperator for AntijoinOperator {
                     return_and_restore_if_io!(
                         &mut self.commit_state,
                         state,
-                        write_row.write_row(cursors, index_key, record_values, *l_weight)
+                        write_row.write_row(cursors, index_key, record_values, *l_weight as i64)
                     );
                     self.commit_state = AntijoinCommitState::PersistLIndex {
                         deltas: std::mem::take(deltas),

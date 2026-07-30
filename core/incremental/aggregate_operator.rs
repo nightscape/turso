@@ -3448,7 +3448,7 @@ impl DistinctPersistState {
                     ];
 
                     // Write to BTree
-                    return_if_io!(write_row.write_row(cursors, index_key, record_values, *weight));
+                    return_if_io!(write_row.write_row(cursors, index_key, record_values, *weight as i64));
 
                     // Move to next value
                     let distinct_deltas = std::mem::take(distinct_deltas);
@@ -3595,7 +3595,7 @@ impl MinMaxPersistState {
                         cursors,
                         index_key.clone(),
                         record_values,
-                        *weight
+                        *weight as i64
                     ));
 
                     // Move to next value
