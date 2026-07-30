@@ -6,6 +6,7 @@ mod test_eqp_json;
 mod test_hash_join_materialization;
 mod test_in_seek;
 mod test_is_seek;
+mod test_ivm_matview_ddl_column_validation;
 mod test_materialized_subquery;
 mod test_multi_index_scan;
 mod test_read_path;
