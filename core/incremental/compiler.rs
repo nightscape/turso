@@ -1682,10 +1682,10 @@ impl DbspCompiler {
                 let (idx, _) = schema
                     .find_column(&col.name, col.table.as_deref())
                     .ok_or_else(|| {
-                        LimboError::ParseError(format!(
-                            "Column '{}' with table {:?} not found in schema",
-                            col.name, col.table
-                        ))
+                        LimboError::ParseError(match &col.table {
+                            Some(table) => format!("no such column: {}.{}", table, col.name),
+                            None => format!("no such column: {}", col.name),
+                        })
                     })?;
                 // Return a Register expression with the correct index
                 Ok(ast::Expr::Register(idx))
@@ -2106,7 +2106,7 @@ impl DbspCompiler {
                         .position(|c| c.name == left_col.name)
                         .ok_or_else(|| {
                             crate::LimboError::ParseError(format!(
-                                "Column '{}' not found in schema for filter",
+                                "no such column: {}",
                                 left_col.name
                             ))
                         })?;
@@ -2117,7 +2117,7 @@ impl DbspCompiler {
                         .position(|c| c.name == right_col.name)
                         .ok_or_else(|| {
                             crate::LimboError::ParseError(format!(
-                                "Column '{}' not found in schema for filter",
+                                "no such column: {}",
                                 right_col.name
                             ))
                         })?;
@@ -2178,10 +2178,7 @@ impl DbspCompiler {
                         .iter()
                         .position(|c| c.name == col.name)
                         .ok_or_else(|| {
-                            crate::LimboError::ParseError(format!(
-                                "Column '{}' not found in schema for filter",
-                                col.name
-                            ))
+                            crate::LimboError::ParseError(format!("no such column: {}", col.name))
                         })?;
 
                     match op {
@@ -2260,10 +2257,7 @@ impl DbspCompiler {
                         .iter()
                         .position(|c| c.name == col.name)
                         .ok_or_else(|| {
-                            LimboError::ParseError(format!(
-                                "Column '{}' not found in schema for IS NULL filter",
-                                col.name
-                            ))
+                            LimboError::ParseError(format!("no such column: {}", col.name))
                         })?;
 
                     if *negated {
