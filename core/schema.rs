@@ -756,6 +756,17 @@ pub enum SchemaObjectType {
     Index,
 }
 
+/// Why a materialized view stored in sqlite_schema could not be loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncompatibleViewReason {
+    /// No DBSP state table for the current circuit version — the view was
+    /// written by a build with a different DBSP version.
+    VersionMismatch,
+    /// The stored view SQL no longer compiles against the current schema,
+    /// e.g. a base table or one of its columns was dropped.
+    CompileFailure(String),
+}
+
 #[derive(Debug)]
 pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
@@ -784,8 +795,8 @@ pub struct Schema {
     /// Mapping from table names to the materialized views that depend on them
     pub table_to_materialized_views: HashMap<String, Vec<String>>,
 
-    /// Track views that exist but have incompatible versions
-    pub incompatible_views: HashSet<String>,
+    /// Materialized views in sqlite_schema that failed to load, mapped to why.
+    pub incompatible_views: HashMap<String, IncompatibleViewReason>,
 
     /// View rows in sqlite_schema whose stored SQL failed to parse (e.g.
     /// older versions wrote view column lists without identifier quoting).
@@ -921,7 +932,7 @@ impl Schema {
         let views: ViewsMap = HashMap::default();
         let triggers = HashMap::default();
         let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::default();
-        let incompatible_views = HashSet::default();
+        let incompatible_views = HashMap::default();
         let mut type_registry = HashMap::default();
         if enable_custom_types {
             bootstrap_builtin_types(&mut type_registry)?;
@@ -1183,7 +1194,7 @@ impl Schema {
         // Get all materialized views that depend on this table
         if let Some(v) = self.table_to_materialized_views.get(&table_name) {
             v.iter()
-                .filter(|name| self.incompatible_views.contains(&**name))
+                .filter(|name| self.incompatible_views.contains_key(&**name))
                 .for_each(|n| views.push(n));
         }
         f(&views)
@@ -1941,7 +1952,8 @@ impl Schema {
                     view_name
                 );
                 // Track this as an incompatible view
-                self.incompatible_views.insert(view_name.clone());
+                self.incompatible_views
+                    .insert(view_name.clone(), IncompatibleViewReason::VersionMismatch);
                 // Use a dummy root page - the view won't be usable anyway
                 0
             };
@@ -1964,14 +1976,26 @@ impl Schema {
                 }
             }
 
-            // Create the IncrementalView with all root pages
-            let incremental_view = IncrementalView::from_sql(
+            // Create the IncrementalView with all root pages. A view whose
+            // stored SQL no longer compiles (e.g. its base table lost a
+            // column) must not abort the whole schema load.
+            let incremental_view = match IncrementalView::from_sql(
                 &sql,
                 self,
                 main_root,
                 dbsp_state_root,
                 dbsp_state_index_root,
-            )?;
+            ) {
+                Ok(incremental_view) => incremental_view,
+                Err(e) => {
+                    tracing::warn!("Materialized view '{}' is unusable: {}", view_name, e);
+                    self.incompatible_views.insert(
+                        view_name,
+                        IncompatibleViewReason::CompileFailure(e.to_string()),
+                    );
+                    continue;
+                }
+            };
             let referenced_tables = incremental_view.get_referenced_table_names();
 
             // Create a BTreeTable for the materialized view
@@ -1996,7 +2020,7 @@ impl Schema {
             })));
 
             // Only add to schema if compatible
-            if !self.incompatible_views.contains(&view_name) {
+            if !self.incompatible_views.contains_key(&view_name) {
                 self.add_materialized_view(incremental_view, table, sql);
             }
 
