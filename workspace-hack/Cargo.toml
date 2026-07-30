@@ -1,8 +1,10 @@
-# Temporarily stubbed out — the hakari-managed original at
-# /tmp/workspace-hack-original.toml force-enables tokio full / mio /
-# hyper-server / pyo3 / rusqlite-bundled, which don't build on
-# wasm32-unknown-unknown. This empty stub lets turso_core compile for
-# the Holon browser-demo spike. Restore before running `cargo hakari`.
+# turso_core depends on this crate, so anything listed in the unconditional
+# `[dependencies]` below is compiled for every target turso_core is built for
+# — including wasm32-unknown-unknown, where tokio's "full" (via `mio`),
+# hyper/hyper-util and rusqlite "bundled" do not build. Those four therefore
+# live in the cfg-gated section after `### END HAKARI SECTION`, which
+# `cargo hakari generate` does not rewrite; `.config/hakari.toml`'s
+# `[final-excludes]` keeps the generator from re-adding them ungated.
 [package]
 name = "workspace-hack"
 version = "0.1.0"
@@ -20,10 +22,7 @@ bitflags = { version = "2", default-features = false, features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env", "unstable-ext", "wrap_help"] }
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "std", "suggestions", "unstable-ext", "usage", "wrap_help"] }
-codspeed-criterion-compat = { version = "4", features = ["async_futures", "html_reports"] }
-codspeed-criterion-compat-walltime = { version = "4", default-features = false, features = ["async_futures", "cargo_bench_support", "html_reports", "plotters", "rayon"] }
 console = { version = "0.15", default-features = false, features = ["ansi-parsing", "unicode-width"] }
-criterion = { version = "0.5", features = ["async_futures", "html_reports"] }
 crossbeam-deque = { version = "0.8" }
 crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.1", default-features = false, features = ["getrandom", "std"] }
@@ -39,8 +38,6 @@ futures-util = { version = "0.3", default-features = false, features = ["async-a
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 getrandom-6f8ce4dd05d13bba = { package = "getrandom", version = "0.2", default-features = false, features = ["std"] }
 hashbrown = { version = "0.15" }
-hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
-hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service"] }
 idna = { version = "1" }
 indexmap = { version = "1", default-features = false, features = ["serde-1"] }
 libc = { version = "0.2", features = ["extra_traits"] }
@@ -59,7 +56,6 @@ rand_core-3b31131e45eafb45 = { package = "rand_core", version = "0.6", default-f
 regex = { version = "1" }
 regex-automata = { version = "0.4" }
 regex-syntax = { version = "0.8" }
-rusqlite = { version = "0.37", default-features = false, features = ["bundled", "series"] }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
 serde_json = { version = "1", features = ["alloc"] }
@@ -67,7 +63,6 @@ similar = { version = "2", features = ["inline", "unicode"] }
 smallvec = { version = "1", default-features = false, features = ["const_new", "serde"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
-tokio = { version = "1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
@@ -242,3 +237,16 @@ windows-sys-b21d60becc0929df = { package = "windows-sys", version = "0.52", feat
 windows-sys-d4189bed749088b6 = { package = "windows-sys", version = "0.61", features = ["Win32_Security_Authentication_Identity", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_SystemInformation"] }
 
 ### END HAKARI SECTION
+
+# Native-only: unbuildable on wasm32-unknown-unknown (see the header comment).
+# Outside the hakari-managed region on purpose — `cargo hakari generate`
+# rewrites only the text between the BEGIN/END markers.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+codspeed-criterion-compat = { version = "4", features = ["async_futures", "html_reports"] }
+codspeed-criterion-compat-walltime = { version = "4", default-features = false, features = ["async_futures", "cargo_bench_support", "html_reports", "plotters", "rayon"] }
+criterion = { version = "0.5", features = ["async_futures", "html_reports"] }
+hyper = { version = "1", features = ["client", "http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "server-auto", "service"] }
+rusqlite = { version = "0.37", default-features = false, features = ["bundled", "series"] }
+tokio = { version = "1", features = ["full", "test-util", "tracing"] }
+

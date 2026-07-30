@@ -24,3 +24,19 @@ platforms = [
 
 # Write out exact versions rather than a semver range. (Defaults to false.)
 # exact-versions = true
+
+# Omitted from workspace-hack's own dependency list (still traversed, so
+# feature unification for everything below them is unchanged). Each of these
+# is unbuildable on wasm32-unknown-unknown — tokio's "full" pulls `mio`,
+# hyper/hyper-util/tokio-rustls pull it transitively, and rusqlite "bundled"
+# needs a C toolchain — and workspace-hack is a dependency of turso_core, so
+# an ungated entry here breaks every wasm consumer of the fork. Crates that
+# genuinely need them declare them directly.
+[final-excludes]
+third-party = [
+    { name = "tokio" },
+    { name = "hyper" },
+    { name = "hyper-util" },
+    { name = "tokio-rustls" },
+    { name = "rusqlite" },
+]
