@@ -1574,7 +1574,7 @@ pub fn translate_alter_table(
             let new_name_taken = resolver.with_schema(database_id, |s| {
                 s.get_object_type(&normalized_new_name).is_some()
                     || s.broken_views.contains(&normalized_new_name)
-                    || s.incompatible_views.contains(&normalized_new_name)
+                    || s.incompatible_views.contains_key(&normalized_new_name)
             });
             if new_name_taken {
                 return Err(LimboError::ParseError(format!(
