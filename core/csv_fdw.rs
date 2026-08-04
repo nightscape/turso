@@ -7,6 +7,15 @@
 //!   SERVER csv_files OPTIONS (path 'employees.csv', skip_header 'true');
 //! SELECT * FROM employees;
 //! ```
+//!
+//! The optional `identity` option names the columns that uniquely identify a
+//! row (comma-separated), which opts matviews over the table into incremental
+//! maintenance:
+//!
+//! ```sql
+//! CREATE FOREIGN TABLE messages (uuid TEXT, body TEXT)
+//!   SERVER csv_files OPTIONS (path 'msgs.csv', identity 'uuid');
+//! ```
 
 use std::collections::HashMap;
 
@@ -36,11 +45,16 @@ impl ForeignDriverFactory for CsvDriverFactory {
             .unwrap_or(false);
         let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
         let col_types: Vec<String> = columns.iter().map(|c| c.type_name.clone()).collect();
+        let identity = table_options
+            .get("identity")
+            .map(|spec| resolve_identity(spec, &col_names))
+            .transpose()?;
         Ok(Arc::new(CsvFdw {
             path: path.clone(),
             skip_header,
             col_names,
             col_types,
+            identity,
         }))
     }
 }
@@ -106,11 +120,16 @@ struct CsvFdw {
     skip_header: bool,
     col_names: Vec<String>,
     col_types: Vec<String>,
+    identity: Option<Vec<u32>>,
 }
 
 impl ForeignDataWrapper for CsvFdw {
     fn key_columns(&self) -> &[KeyColumn] {
         &[]
+    }
+
+    fn identity_columns(&self) -> Option<&[u32]> {
+        self.identity.as_deref()
     }
 
     fn schema_sql(&self) -> String {
@@ -268,6 +287,71 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], vec!["alice", "30", "berlin"]);
         assert_eq!(rows[1], vec!["bob", "25", "munich"]);
+    }
+
+    /// Build a CSV FDW over columns `uuid, session_id, body` with the given
+    /// extra table options on top of a dummy `path`.
+    fn fdw_with_options(extra: &[(&str, &str)]) -> Result<Arc<dyn ForeignDataWrapper>> {
+        let mut opts = HashMap::from([("path".to_string(), "/nonexistent.csv".to_string())]);
+        for (k, v) in extra {
+            opts.insert(k.to_string(), v.to_string());
+        }
+        let columns: Vec<ForeignColumnDef> = ["uuid", "session_id", "body"]
+            .iter()
+            .map(|n| ForeignColumnDef {
+                name: n.to_string(),
+                type_name: "TEXT".to_string(),
+            })
+            .collect();
+        CsvDriverFactory.create_fdw(&HashMap::new(), &opts, &columns)
+    }
+
+    #[test]
+    fn identity_absent_declares_no_identity() {
+        let fdw = fdw_with_options(&[]).unwrap();
+        assert_eq!(fdw.identity_columns(), None);
+    }
+
+    #[test]
+    fn identity_resolves_single_column() {
+        let fdw = fdw_with_options(&[("identity", "uuid")]).unwrap();
+        assert_eq!(fdw.identity_columns(), Some(&[0u32][..]));
+    }
+
+    /// Composite identity, tolerating whitespace and matching case-insensitively
+    /// the way the rest of SQL identifier handling does.
+    #[test]
+    fn identity_resolves_composite_column_list() {
+        let fdw = fdw_with_options(&[("identity", " SESSION_ID , uuid ")]).unwrap();
+        assert_eq!(fdw.identity_columns(), Some(&[1u32, 0u32][..]));
+    }
+
+    #[test]
+    fn identity_rejects_unknown_column() {
+        let err = fdw_with_options(&[("identity", "nope")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown column"), "unexpected error: {err}");
+        assert!(err.contains("nope"), "error should name the column: {err}");
+    }
+
+    #[test]
+    fn identity_rejects_repeated_column() {
+        let err = fdw_with_options(&[("identity", "uuid,uuid")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("repeats column"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn identity_rejects_empty_spec() {
+        let err = fdw_with_options(&[("identity", "")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("at least one column"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
