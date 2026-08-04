@@ -1,3 +1,4 @@
+use crate::incremental::fdw_mirror::{mirror_specs_for_view, MirrorSpec};
 use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, view::IncrementalView};
 use crate::schema::{
     BTreeCharacteristics, BTreeTable, SchemaObjectType, DBSP_TABLE_PREFIX, RESERVED_TABLE_PREFIXES,
@@ -55,6 +56,147 @@ fn validate_materialized(
         )));
     }
     Ok(false)
+}
+
+/// Emit creation of a view's foreign-table mirrors: one btree per mirror, its
+/// automatic primary-key index, and the sqlite_schema rows for both.
+///
+/// Returns the object names created, for the caller's `ParseSchema` filter.
+fn emit_create_fdw_mirrors(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+    sqlite_schema_cursor_id: usize,
+    specs: &[MirrorSpec],
+) -> Result<Vec<String>> {
+    let mut created = Vec::with_capacity(specs.len() * 2);
+    for spec in specs {
+        let table_root_reg = program.alloc_register();
+        program.emit_insn(Insn::CreateBtree {
+            db: database_id,
+            root: table_root_reg,
+            flags: CreateBTreeFlags::new_table(),
+        });
+        let index_root_reg = program.alloc_register();
+        program.emit_insn(Insn::CreateBtree {
+            db: database_id,
+            root: index_root_reg,
+            flags: CreateBTreeFlags::new_index(),
+        });
+
+        emit_schema_entry(
+            program,
+            resolver,
+            sqlite_schema_cursor_id,
+            None, // cdc_table_cursor_id
+            SchemaEntryType::Table,
+            &spec.mirror_table,
+            &spec.mirror_table,
+            table_root_reg,
+            Some(spec.create_sql()),
+        )?;
+
+        let index_name = spec.index_name();
+        emit_schema_entry(
+            program,
+            resolver,
+            sqlite_schema_cursor_id,
+            None, // cdc_table_cursor_id
+            SchemaEntryType::Index,
+            &index_name,
+            &spec.mirror_table,
+            index_root_reg,
+            None, // automatic indexes store no SQL
+        )?;
+
+        created.push(spec.mirror_table.clone());
+        created.push(index_name);
+    }
+    Ok(created)
+}
+
+/// Emit one pass over sqlite_schema deleting every row whose `(type, name)`
+/// matches one of `targets`.
+fn emit_delete_schema_rows(
+    program: &mut ProgramBuilder,
+    sqlite_schema_cursor_id: usize,
+    targets: &[(&'static str, String)],
+) {
+    if targets.is_empty() {
+        return;
+    }
+
+    // Materialize the comparands once, outside the scan.
+    let target_regs: Vec<(usize, usize)> = targets
+        .iter()
+        .map(|(entry_type, name)| {
+            let type_reg = program.alloc_register();
+            program.emit_insn(Insn::String8 {
+                dest: type_reg,
+                value: (*entry_type).to_string(),
+            });
+            let name_reg = program.alloc_register();
+            program.emit_insn(Insn::String8 {
+                dest: name_reg,
+                value: name.clone(),
+            });
+            (type_reg, name_reg)
+        })
+        .collect();
+
+    let col0_reg = program.alloc_register();
+    let col1_reg = program.alloc_register();
+    let rowid_reg = program.alloc_register();
+
+    let end_label = program.allocate_label();
+    let loop_label = program.allocate_label();
+    let next_row_label = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_empty: end_label,
+    });
+    program.preassign_label_to_next_insn(loop_label);
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 0, col0_reg);
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 1, col1_reg);
+
+    for (type_reg, name_reg) in &target_regs {
+        let try_next_target = program.allocate_label();
+        program.emit_insn(Insn::Ne {
+            lhs: col0_reg,
+            rhs: *type_reg,
+            target_pc: try_next_target,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+        program.emit_insn(Insn::Ne {
+            lhs: col1_reg,
+            rhs: *name_reg,
+            target_pc: try_next_target,
+            flags: CmpInsFlags::default(),
+            collation: program.curr_collation(),
+        });
+        program.emit_insn(Insn::RowId {
+            cursor_id: sqlite_schema_cursor_id,
+            dest: rowid_reg,
+        });
+        program.emit_insn(Insn::Delete {
+            cursor_id: sqlite_schema_cursor_id,
+            table_name: "sqlite_schema".to_string(),
+            is_part_of_update: false,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: next_row_label,
+        });
+        program.preassign_label_to_next_insn(try_next_target);
+    }
+
+    program.preassign_label_to_next_insn(next_row_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: sqlite_schema_cursor_id,
+        pc_if_next: loop_label,
+    });
+    program.preassign_label_to_next_insn(end_label);
 }
 
 pub fn translate_create_materialized_view(
@@ -460,15 +602,37 @@ pub fn translate_create_materialized_view(
         None, // Automatic indexes don't store SQL
     )?;
 
-    // Parse schema to load the new view and DBSP state table
+    // Mirror every identity-declaring foreign source this view reads, so its
+    // rows reach the circuit as ordinary btree DML. Sources without a declared
+    // identity produce no mirror and keep snapshot semantics.
+    let mirror_specs = resolver.with_schema(database_id, |s| -> Result<Vec<MirrorSpec>> {
+        let source_names = IncrementalView::referenced_table_names(select_stmt, s)?;
+        mirror_specs_for_view(&normalized_view_name, &source_names, s)
+    })?;
+    let mirror_object_names = emit_create_fdw_mirrors(
+        program,
+        resolver,
+        database_id,
+        sqlite_schema_cursor_id,
+        &mirror_specs,
+    )?;
+
+    // Parse schema to load the new view, DBSP state table, and any mirrors
     let escaped_view_name = escape_sql_string_literal(&normalized_view_name);
     let escaped_dbsp_table_name = escape_sql_string_literal(dbsp_table_name.as_str());
     let escaped_dbsp_index_name = escape_sql_string_literal(&dbsp_index_name);
+    let mut name_predicates = vec![
+        format!("name = '{escaped_view_name}'"),
+        format!("name = '{escaped_dbsp_table_name}'"),
+        format!("name = '{escaped_dbsp_index_name}'"),
+    ];
+    for object_name in &mirror_object_names {
+        let escaped = escape_sql_string_literal(object_name);
+        name_predicates.push(format!("name = '{escaped}'"));
+    }
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
-        where_clause: Some(format!(
-            "name = '{escaped_view_name}' OR name = '{escaped_dbsp_table_name}' OR name = '{escaped_dbsp_index_name}'"
-        )),
+        where_clause: Some(name_predicates.join(" OR ")),
         trigger_target_database_id: None,
     });
 
@@ -853,6 +1017,41 @@ pub fn translate_drop_view(
         }
     }
 
+    // Destroy the view's foreign-table mirrors, indexes first, mirroring the
+    // DBSP state table's teardown above.
+    let mirror_table_names = if is_materialized_view {
+        resolver.with_schema(database_id, |s| {
+            s.mirror_table_names_for_view(&normalized_view_name)
+        })
+    } else {
+        Vec::new()
+    };
+    for mirror_table_name in &mirror_table_names {
+        let mirror_indexes: Vec<_> = resolver.with_schema(database_id, |s| {
+            s.get_indices(mirror_table_name).cloned().collect()
+        });
+        for index in &mirror_indexes {
+            program.emit_insn(Insn::Destroy {
+                db: database_id,
+                root: index.root_page,
+                former_root_reg: 0, // No autovacuum
+                is_temp: 0,
+            });
+        }
+        if let Some(mirror_table) =
+            resolver.with_schema(database_id, |s| s.get_table(mirror_table_name))
+        {
+            if let Some(mirror_btree) = mirror_table.btree() {
+                program.emit_insn(Insn::Destroy {
+                    db: database_id,
+                    root: mirror_btree.root_page,
+                    former_root_reg: 0, // No autovacuum
+                    is_temp: 0,
+                });
+            }
+        }
+    }
+
     // Open cursor to sqlite_schema table (structure is the same for all databases)
     let schema_table =
         resolver.with_schema(MAIN_DB_ID, |s| s.get_btree_table(SQLITE_TABLEID).unwrap());
@@ -1052,6 +1251,25 @@ pub fn translate_drop_view(
 
         program.preassign_label_to_next_insn(dbsp_end_loop_label);
     }
+
+    // Delete the mirrors' sqlite_schema rows. Their btrees were destroyed above.
+    let mirror_schema_targets: Vec<(&'static str, String)> = mirror_table_names
+        .iter()
+        .flat_map(|name| {
+            [
+                ("table", name.clone()),
+                (
+                    "index",
+                    format!("{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{name}_1"),
+                ),
+            ]
+        })
+        .collect();
+    emit_delete_schema_rows(
+        program,
+        sqlite_schema_cursor_id,
+        &mirror_schema_targets,
+    );
 
     // Remove the view from the in-memory schema
     program.emit_insn(Insn::DropView {

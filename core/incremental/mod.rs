@@ -4,6 +4,7 @@ pub mod compiler;
 pub mod cursor;
 pub mod dbsp;
 pub mod expr_compiler;
+pub mod fdw_mirror;
 pub mod filter_operator;
 pub mod input_operator;
 pub mod join_operator;

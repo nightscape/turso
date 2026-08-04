@@ -176,6 +176,9 @@ pub const TEMP_SCHEMA_TABLE_NAME_ALT: &str = "sqlite_temp_master";
 pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const TURSO_TYPES_TABLE_NAME: &str = "__turso_internal_types";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
+/// Prefix of the per-view btree shadowing a foreign table's rows.
+/// Full name: `{prefix}{view_name}__{foreign_table_name}`.
+pub const FDW_MIRROR_TABLE_PREFIX: &str = "__turso_internal_fdw_mirror_v1_";
 pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 pub const SEQ_BACKING_TABLE_PREFIX: &str = "__turso_internal_seq_";
 // Prefix for the hidden sequence *name* owned by an AUTOINCREMENT table.
@@ -1214,6 +1217,13 @@ impl Schema {
             self.remove_table(&dbsp_table_name);
             self.remove_indices_for_table(&dbsp_table_name);
 
+            // Same for any foreign-table mirrors this view owns. Their count
+            // depends on the view's sources, so they are found by prefix.
+            for mirror_name in self.mirror_table_names_for_view(&name) {
+                self.remove_table(&mirror_name);
+                self.remove_indices_for_table(&mirror_name);
+            }
+
             // Remove from materialized view tracking
             self.materialized_view_names.remove(&name);
             self.materialized_view_sql.remove(&name);
@@ -1232,6 +1242,20 @@ impl Schema {
                 "no such view: {name}"
             )))
         }
+    }
+
+    /// Names of the foreign-table mirrors owned by `view_name`.
+    ///
+    /// A view owns one mirror per identity-declaring foreign table it reads, so
+    /// the set is discovered by prefix rather than reconstructed from the view's
+    /// definition (which may no longer parse by the time it is dropped).
+    pub fn mirror_table_names_for_view(&self, view_name: &str) -> Vec<String> {
+        let prefix = format!("{FDW_MIRROR_TABLE_PREFIX}{}__", normalize_ident(view_name));
+        self.tables
+            .keys()
+            .filter(|name| name.starts_with(&prefix))
+            .cloned()
+            .collect()
     }
 
     /// Register that a materialized view depends on a table

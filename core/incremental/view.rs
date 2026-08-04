@@ -1052,6 +1052,27 @@ impl IncrementalView {
 
     /// Extract all tables and their aliases from the SELECT statement, handling CTEs
     /// Deduplicates tables and accumulates WHERE conditions
+    /// Names of the tables this SELECT reads.
+    ///
+    /// Unlike [`Self::from_stmt`] this neither builds the DBSP circuit nor
+    /// validates the view, so DDL translation can ask "which sources does this
+    /// read" without inheriting circuit-compilation failure modes.
+    pub fn referenced_table_names(select: &ast::Select, schema: &Schema) -> Result<Vec<String>> {
+        let mut tables = Vec::new();
+        let mut aliases = HashMap::default();
+        let mut qualified_names = HashMap::default();
+        let mut table_conditions = HashMap::default();
+        Self::extract_all_tables(
+            select,
+            schema,
+            &mut tables,
+            &mut aliases,
+            &mut qualified_names,
+            &mut table_conditions,
+        )?;
+        Ok(tables.into_iter().map(|t| t.name).collect())
+    }
+
     fn extract_all_tables(
         select: &ast::Select,
         schema: &Schema,

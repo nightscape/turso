@@ -42,12 +42,10 @@ impl VirtualTable {
     }
 
     /// The foreign data wrapper this table reads from, if it is a foreign table.
-    // Exercised only by tests until materialized-view maintenance consults the
-    // identity contract; the lib target therefore sees no caller yet.
-    #[allow(dead_code)]
     pub(crate) fn foreign_wrapper(&self) -> Option<&Arc<dyn crate::foreign::ForeignDataWrapper>> {
         self.foreign.as_ref()
     }
+
     pub(crate) fn readonly(&self) -> bool {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => true,
