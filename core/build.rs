@@ -1,3 +1,7 @@
+#![allow(semicolon_in_expressions_from_macros)]
+// cfg_aliases 0.2.1 expands with a trailing semicolon in expression position;
+// current nightly makes that lint a hard error when --cap-lints allow is not
+// applied to the build script. Remove when cfg_aliases or the toolchain moves.
 use cfg_aliases::cfg_aliases;
 use std::path::PathBuf;
 use std::process::Command;
