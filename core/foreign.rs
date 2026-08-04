@@ -53,6 +53,26 @@ pub trait ForeignDataWrapper: std::fmt::Debug + Send + Sync {
     /// the scan returns rows.
     fn key_columns(&self) -> &[KeyColumn];
 
+    /// Zero-based indices of the columns whose combined values uniquely
+    /// identify a row across separate scans.
+    ///
+    /// This is *not* [`Self::key_columns`]: that declares which operators the
+    /// source can evaluate server-side, and its columns need not be unique
+    /// (a `session_id` is a fine key column and a terrible identity). Identity
+    /// is about recognising the same row again on a later scan, so that a
+    /// retraction can be matched to the insertion it cancels.
+    ///
+    /// Declaring it opts the table into incremental materialized-view
+    /// maintenance. `None` (the default) keeps snapshot semantics: matviews
+    /// over the table are rebuilt from scratch by `REFRESH MATERIALIZED VIEW`.
+    ///
+    /// The engine trusts this declaration; a source that returns two rows with
+    /// equal identity values in one scan is rejected rather than silently
+    /// collapsed.
+    fn identity_columns(&self) -> Option<&[u32]> {
+        None
+    }
+
     /// Schema declaration as a CREATE TABLE statement.
     ///
     /// Example: `"CREATE TABLE gmail_email(msg_id TEXT, subject TEXT, ...)"`
@@ -422,6 +442,57 @@ mod tests {
         )
         .unwrap();
         db.connect().unwrap()
+    }
+
+    /// An FDW that declares nothing but an identity, for the plumbing tests.
+    #[derive(Debug)]
+    struct IdentityFdw {
+        identity: Option<Vec<u32>>,
+    }
+
+    impl ForeignDataWrapper for IdentityFdw {
+        fn key_columns(&self) -> &[KeyColumn] {
+            &[]
+        }
+
+        fn identity_columns(&self) -> Option<&[u32]> {
+            self.identity.as_deref()
+        }
+
+        fn schema_sql(&self) -> String {
+            "CREATE TABLE ident_fdw(uuid TEXT, body TEXT)".to_string()
+        }
+
+        fn open_cursor(&self, _conn: Arc<Connection>) -> Result<Box<dyn ForeignCursor>> {
+            unreachable!("plumbing tests never scan")
+        }
+    }
+
+    /// The identity contract must survive the trip through `VirtualTable`'s
+    /// erased `vtab_type`, since that is how `core/incremental` reaches it.
+    #[test]
+    fn virtual_table_exposes_foreign_wrapper_identity() {
+        let fdw = Arc::new(IdentityFdw {
+            identity: Some(crate::alloc::vec![0]),
+        });
+        let vtab = crate::VirtualTable::new_foreign("ident_fdw", fdw).unwrap();
+
+        let wrapper = vtab
+            .foreign_wrapper()
+            .expect("a foreign table must expose its wrapper");
+        assert_eq!(wrapper.identity_columns(), Some(&[0u32][..]));
+    }
+
+    #[test]
+    fn foreign_wrapper_defaults_to_no_identity() {
+        let fdw = Arc::new(IdentityFdw { identity: None });
+        let vtab = crate::VirtualTable::new_foreign("ident_fdw", fdw).unwrap();
+
+        assert_eq!(
+            vtab.foreign_wrapper().unwrap().identity_columns(),
+            None,
+            "a driver that declares no identity must stay on snapshot semantics"
+        );
     }
 
     /// A trivial FDW that returns static rows, filtering by equality on column 0.
