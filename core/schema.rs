@@ -2976,6 +2976,7 @@ impl TryClone for VirtualTable {
             vtab_id: self.vtab_id,
             is_droppable: self.is_droppable,
             innocuous: self.innocuous,
+            foreign: self.foreign.clone(),
         })
     }
 }
