@@ -1164,7 +1164,7 @@ impl IncrementalView {
     /// Generate SQL queries for populating the view from each source table
     /// Returns a vector of SQL statements, one for each referenced table
     /// Each query includes the WHERE conditions accumulated from all occurrences
-    fn sql_for_populate(&self) -> crate::Result<Vec<String>> {
+    pub(crate) fn sql_for_populate(&self) -> crate::Result<Vec<String>> {
         Self::generate_populate_queries(
             &self.select_stmt,
             &self.referenced_tables,
@@ -1172,6 +1172,28 @@ impl IncrementalView {
             &self.qualified_table_names,
             &self.table_conditions,
         )
+    }
+
+    /// The populate scan of each referenced table, paired with that table's name.
+    ///
+    /// A mirror is filled from exactly the scan its view would run, so the
+    /// mirror holds the view's predicate-scoped subset of the foreign rows and
+    /// nothing wider.
+    pub(crate) fn source_scan_queries(&self) -> crate::Result<Vec<(String, String)>> {
+        let queries = self.sql_for_populate()?;
+        if queries.len() != self.referenced_tables.len() {
+            return Err(LimboError::InternalError(format!(
+                "populate produced {} queries for {} referenced tables",
+                queries.len(),
+                self.referenced_tables.len()
+            )));
+        }
+        Ok(self
+            .referenced_tables
+            .iter()
+            .map(|t| t.name.clone())
+            .zip(queries)
+            .collect())
     }
 
     pub fn generate_populate_queries(

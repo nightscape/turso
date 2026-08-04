@@ -11,9 +11,7 @@
 
 use crate::common::{self, ExecRows, TempDatabase};
 use std::sync::Arc;
-use turso_core::foreign::{
-    ForeignCursor, ForeignDataWrapper, KeyColumn, PushedConstraint,
-};
+use turso_core::foreign::{ForeignCursor, ForeignDataWrapper, KeyColumn, PushedConstraint};
 use turso_core::{Connection, Value};
 use turso_ext::ConstraintOp;
 
@@ -26,9 +24,7 @@ struct RequiredKeyFdw {
 impl RequiredKeyFdw {
     fn new() -> Self {
         Self {
-            key_columns: vec![
-                KeyColumn::new("session_id", 0, vec![ConstraintOp::Eq]).required(),
-            ],
+            key_columns: vec![KeyColumn::new("session_id", 0, vec![ConstraintOp::Eq]).required()],
         }
     }
 }
@@ -104,8 +100,13 @@ fn test_required_key_query_with_qualifier(tmp_db: TempDatabase) -> anyhow::Resul
     let conn = tmp_db.connect_limbo();
     conn.register_foreign_table("msg_req", Arc::new(RequiredKeyFdw::new()))?;
 
-    let rows: Vec<(String, String)> = conn.exec_rows("SELECT uuid, body FROM msg_req WHERE session_id = 's1'");
-    assert_eq!(rows.len(), 2, "qualified scan should return the session's rows");
+    let rows: Vec<(String, String)> =
+        conn.exec_rows("SELECT uuid, body FROM msg_req WHERE session_id = 's1'");
+    assert_eq!(
+        rows.len(),
+        2,
+        "qualified scan should return the session's rows"
+    );
     Ok(())
 }
 
@@ -137,8 +138,7 @@ fn test_required_key_matview_with_qualifier(tmp_db: TempDatabase) -> anyhow::Res
          SELECT uuid, body FROM msg_req WHERE session_id = 's1'",
     )?;
 
-    let rows: Vec<(String, String)> =
-        conn.exec_rows("SELECT uuid, body FROM mv_req");
+    let rows: Vec<(String, String)> = conn.exec_rows("SELECT uuid, body FROM mv_req");
     assert_eq!(rows.len(), 2);
     Ok(())
 }

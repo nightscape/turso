@@ -14979,6 +14979,93 @@ fn drive_init_cdc_version(
     }
 }
 
+/// Fill every not-yet-filled FDW mirror of `view_name` from the scan its view
+/// will run, so the mirror records exactly the foreign rows the view was built
+/// from.
+///
+/// The inner INSERTs run nested for the same reason
+/// `IncrementalView::populate_from_table` does: they must join the enclosing
+/// DDL transaction rather than commit its dirty pages. The counter is balanced
+/// on every exit, I/O yields included.
+fn populate_fdw_mirrors(
+    conn: &Arc<Connection>,
+    state: &mut ProgramState,
+    view_name: &str,
+) -> Result<IOResult<()>> {
+    conn.start_nested();
+    let result = populate_fdw_mirrors_inner(conn, state, view_name);
+    conn.end_nested();
+    result
+}
+
+fn populate_fdw_mirrors_inner(
+    conn: &Arc<Connection>,
+    state: &mut ProgramState,
+    view_name: &str,
+) -> Result<IOResult<()>> {
+    let mirror_work: Vec<(String, String)> = {
+        let schema = conn.schema.read();
+        match schema.get_materialized_view(view_name) {
+            None => Vec::new(),
+            Some(view) => view
+                .lock()
+                .source_scan_queries()?
+                .into_iter()
+                .filter_map(|(source_table, scan_query)| {
+                    let mirror =
+                        crate::incremental::fdw_mirror::mirror_table_name(view_name, &source_table);
+                    // Sources whose driver declares no identity have no mirror.
+                    schema.get_table(&mirror).map(|_| (mirror, scan_query))
+                })
+                .collect(),
+        }
+    };
+
+    for (mirror, scan_query) in mirror_work {
+        if state.fdw_mirror_populate.done.contains(&mirror) {
+            continue;
+        }
+        // The opcode restarts at its first view after every yield, so the first
+        // unfilled mirror it reaches is always the one it left in flight.
+        let mut stmt = match state.fdw_mirror_populate.in_flight.take() {
+            Some((in_flight_mirror, stmt)) => {
+                turso_assert!(
+                    in_flight_mirror == mirror,
+                    "in-flight mirror {in_flight_mirror} is not the first unfilled one ({mirror})"
+                );
+                stmt
+            }
+            None => {
+                // A mirror's columns are the foreign table's columns in order,
+                // so the scan's `SELECT *` aligns positionally.
+                let ident = turso_parser::ast::Name::exact(mirror.clone()).as_ident();
+                Box::new(conn.prepare(format!("INSERT INTO {ident} {scan_query}"))?)
+            }
+        };
+        loop {
+            match stmt.step()? {
+                // An INSERT emits no rows; keep stepping.
+                StepResult::Row => {}
+                StepResult::Done => {
+                    state.fdw_mirror_populate.done.insert(mirror);
+                    break;
+                }
+                StepResult::IO | StepResult::Yield => {
+                    state.fdw_mirror_populate.in_flight = Some((mirror, stmt));
+                    return Ok(IOResult::IO(crate::types::IOCompletions(
+                        crate::io::Completion::new_yield(),
+                    )));
+                }
+                StepResult::Interrupt | StepResult::Busy => {
+                    state.fdw_mirror_populate.in_flight = Some((mirror, stmt));
+                    return Err(LimboError::Busy);
+                }
+            }
+        }
+    }
+    Ok(IOResult::Done(()))
+}
+
 pub fn op_populate_materialized_views(
     program: &Program,
     state: &mut ProgramState,
@@ -15017,6 +15104,11 @@ pub fn op_populate_materialized_views(
 
     // Now populate the views (after releasing the schema borrow)
     for (view_name, _root_page, cursor_id) in view_info {
+        // A view's mirrors are filled before the view reads its sources, so a
+        // mirror is a faithful record of the foreign rows the view was built
+        // from and later syncs have something to diff against.
+        return_if_io!(populate_fdw_mirrors(&conn, state, &view_name));
+
         let schema = conn.schema.read();
         if let Some(view) = schema.get_materialized_view(&view_name) {
             let mut view = view.lock();

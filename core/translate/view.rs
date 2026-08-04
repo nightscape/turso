@@ -58,6 +58,69 @@ fn validate_materialized(
     Ok(false)
 }
 
+/// Emit teardown of any mirror left behind by a view of this name that no
+/// longer exists.
+///
+/// A mirror is owned by its view, so one present when the view is being created
+/// is garbage — from a crash between deleting the view's schema row and
+/// dropping its mirror. Left in place it makes the name collide and CREATE
+/// fails forever.
+fn emit_drop_orphaned_fdw_mirrors(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    database_id: usize,
+    sqlite_schema_cursor_id: usize,
+    specs: &[MirrorSpec],
+) {
+    let mut orphans = Vec::new();
+    for spec in specs {
+        let Some(table) = resolver.with_schema(database_id, |s| s.get_table(&spec.mirror_table))
+        else {
+            continue;
+        };
+        let indexes: Vec<_> = resolver.with_schema(database_id, |s| {
+            s.get_indices(&spec.mirror_table).cloned().collect()
+        });
+        for index in &indexes {
+            program.emit_insn(Insn::Destroy {
+                db: database_id,
+                root: index.root_page,
+                former_root_reg: 0, // No autovacuum
+                is_temp: 0,
+            });
+        }
+        if let Some(btree) = table.btree() {
+            program.emit_insn(Insn::Destroy {
+                db: database_id,
+                root: btree.root_page,
+                former_root_reg: 0, // No autovacuum
+                is_temp: 0,
+            });
+        }
+        orphans.push(spec);
+    }
+
+    let schema_targets: Vec<(&'static str, String)> = orphans
+        .iter()
+        .flat_map(|spec| {
+            [
+                ("table", spec.mirror_table.clone()),
+                ("index", spec.index_name()),
+            ]
+        })
+        .collect();
+    emit_delete_schema_rows(program, sqlite_schema_cursor_id, &schema_targets);
+
+    for spec in orphans {
+        program.emit_insn(Insn::DropTable {
+            db: database_id,
+            _p2: 0,
+            _p3: 0,
+            table_name: spec.mirror_table.clone(),
+        });
+    }
+}
+
 /// Emit creation of a view's foreign-table mirrors: one btree per mirror, its
 /// automatic primary-key index, and the sqlite_schema rows for both.
 ///
@@ -609,6 +672,13 @@ pub fn translate_create_materialized_view(
         let source_names = IncrementalView::referenced_table_names(select_stmt, s)?;
         mirror_specs_for_view(&normalized_view_name, &source_names, s)
     })?;
+    emit_drop_orphaned_fdw_mirrors(
+        program,
+        resolver,
+        database_id,
+        sqlite_schema_cursor_id,
+        &mirror_specs,
+    );
     let mirror_object_names = emit_create_fdw_mirrors(
         program,
         resolver,
@@ -1265,11 +1335,7 @@ pub fn translate_drop_view(
             ]
         })
         .collect();
-    emit_delete_schema_rows(
-        program,
-        sqlite_schema_cursor_id,
-        &mirror_schema_targets,
-    );
+    emit_delete_schema_rows(program, sqlite_schema_cursor_id, &mirror_schema_targets);
 
     // Remove the view from the in-memory schema
     program.emit_insn(Insn::DropView {
