@@ -46,12 +46,14 @@ mod test_vacuum;
 mod test_write_path;
 
 mod encryption;
+mod fdw_test_driver;
 mod test_expr_index;
 mod test_fdw_csv_quoted_columns;
 mod test_fdw_integer_identity;
 mod test_fdw_matview;
 mod test_fdw_matview_holon_shape;
 mod test_fdw_mirror;
+mod test_fdw_null_identity;
 mod test_fdw_required_key;
 mod test_fdw_scan_cost;
 mod test_fdw_sweep_hazards;
