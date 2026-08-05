@@ -118,6 +118,10 @@ fn test_null_identity_refused_by_refresh(tmp_db: TempDatabase) -> anyhow::Result
 /// reads a single NULL-identity row as a duplicate and sends the user looking
 /// for two rows that do not exist. Two NULLs are used because that is the case
 /// the naive count is most confidently wrong about.
+///
+/// This pins the user-visible classification only: the mirror's `NOT NULL` says
+/// the same thing, so it passes with the guard removed. The guard's own NULL
+/// branch is pinned by `guard_separates_null_identities_from_repeated_ones`.
 #[turso_macros::test(views)]
 fn test_null_identities_are_not_reported_as_duplicates_at_refresh(
     tmp_db: TempDatabase,
@@ -157,6 +161,10 @@ fn test_null_identities_are_not_reported_as_duplicates_at_refresh(
 /// A scan that breaks both promises at once is reported as the NULL, because a
 /// NULL identity is the one the user cannot work around: a duplicate names two
 /// rows that exist, a NULL names a row nothing can refer to again.
+///
+/// This pins the user-visible classification only: the mirror's `NOT NULL` says
+/// the same thing, so it passes with the guard removed. The guard's own NULL
+/// branch is pinned by `guard_separates_null_identities_from_repeated_ones`.
 #[turso_macros::test(views)]
 fn test_a_null_identity_outranks_a_duplicate_at_refresh(
     tmp_db: TempDatabase,
