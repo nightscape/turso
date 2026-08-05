@@ -146,22 +146,54 @@ impl MirrorSync {
         ast::Name::exact(self.mirror_table.clone()).as_ident()
     }
 
-    /// What to say when the mirror's identity constraint rejects a row.
+    /// Restate a constraint violation on the mirror in terms of the source.
     ///
-    /// The constraint fires on an internal table the user never wrote, so the
-    /// raw message names something they cannot act on. The actionable fact is
-    /// that the driver's declared identity does not identify its rows.
-    pub fn duplicate_identity_error(&self) -> crate::LimboError {
-        let columns = self
-            .identity
+    /// The mirror carries exactly two constraints, both on the identity: the
+    /// columns are `NOT NULL` and together they are the `PRIMARY KEY`. Each
+    /// means a different broken promise by the driver and has a different fix,
+    /// so they are reported apart. Anything else cannot arise, and is passed
+    /// through rather than guessed at.
+    pub fn identity_violation(&self, violation: LimboError) -> LimboError {
+        let LimboError::Constraint(message) = &violation else {
+            return violation;
+        };
+        // The wording is `op_halt`'s, which is where every constraint failure
+        // on a btree write is turned into this error.
+        if message.starts_with("NOT NULL constraint failed") {
+            self.null_identity_error()
+        } else {
+            self.duplicate_identity_error()
+        }
+    }
+
+    fn identity_column_list(&self) -> String {
+        self.identity
             .iter()
             .map(|i| self.columns[*i].as_str())
             .collect::<Vec<_>>()
-            .join(", ");
-        crate::LimboError::Constraint(format!(
-            "foreign table '{}' returned more than one row with the same identity ({columns}); \
+            .join(", ")
+    }
+
+    /// The driver returned a row with no identity at all.
+    ///
+    /// Such a row cannot be recognised on a later scan, so neither its update
+    /// nor its removal could ever be propagated to the view.
+    pub fn null_identity_error(&self) -> LimboError {
+        LimboError::Constraint(format!(
+            "foreign table '{}' returned a row whose declared identity ({}) is NULL; \
+             a NULL identity cannot be matched across scans and is not supported",
+            self.source_table,
+            self.identity_column_list()
+        ))
+    }
+
+    /// The driver returned two rows the engine cannot tell apart.
+    pub fn duplicate_identity_error(&self) -> LimboError {
+        LimboError::Constraint(format!(
+            "foreign table '{}' returned more than one row with the same identity ({}); \
              a declared identity must identify a row uniquely within a scan",
-            self.source_table
+            self.source_table,
+            self.identity_column_list()
         ))
     }
 
@@ -527,6 +559,22 @@ mod tests {
         let sql = sync(crate::alloc::vec![0]).rebuild_sql();
         assert!(sql[0].starts_with("DELETE FROM"), "{}", sql[0]);
         assert!(sql[1].starts_with("INSERT INTO"), "{}", sql[1]);
+    }
+
+    #[test]
+    fn a_not_null_violation_is_not_read_as_a_duplicate() {
+        let sync = sync(crate::alloc::vec![0]);
+        let null = sync.identity_violation(LimboError::Constraint(
+            "NOT NULL constraint failed: t.uuid (19)".to_string(),
+        ));
+        assert!(null.to_string().contains("is NULL"), "{null}");
+        let duplicate = sync.identity_violation(LimboError::Constraint(
+            "UNIQUE constraint failed: t.uuid (19)".to_string(),
+        ));
+        assert!(
+            duplicate.to_string().contains("more than one row"),
+            "{duplicate}"
+        );
     }
 
     #[test]
