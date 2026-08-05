@@ -73,6 +73,7 @@ limbo/
 | New SQL tests | `sqlite/conformance/sqlite-sqltests/` | `.sqltest` format preferred |
 | Quick sqlite3 diff | `scripts/diff.sh` | Compare sqlite3 vs tursodb output for a query |
 | MVCC testing REPL | `cli/mvcc_repl.rs` | Multi-conn concurrent txn testing REPL        |
+| IVM over foreign tables | `core/incremental/fdw_mirror.rs` | Mirror btrees feeding FDW-sourced matviews |
 
 ## Guides
 
@@ -84,6 +85,7 @@ limbo/
 - **[Storage Format](docs/agent-guides/storage-format.md)** - file format, B-trees, pages
 - **[Async I/O Model](docs/agent-guides/async-io-model.md)** - IOResult, state machines, re-entrancy
 - **[MVCC](docs/agent-guides/mvcc.md)** - experimental multi-version concurrency (WIP)
+- **[FDW Mirrors](docs/agent-guides/fdw-mirrors.md)** - IVM over foreign tables: mirrors, identity contract, sweep, push
 
 ## Commit Messages
 

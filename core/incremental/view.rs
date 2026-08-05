@@ -545,18 +545,6 @@ impl IncrementalView {
             })
     }
 
-    /// Check if this view has the same SQL definition as the provided SQL string
-    pub fn has_same_sql(&self, sql: &str) -> bool {
-        // Parse the SQL to extract just the SELECT statement
-        if let Ok(Some(Cmd::Stmt(Stmt::CreateMaterializedView { select, .. }))) =
-            Parser::new(sql.as_bytes()).next_cmd()
-        {
-            // Compare the SELECT statements as SQL strings
-            return self.select_stmt == select;
-        }
-        false
-    }
-
     /// Validate a SELECT statement and extract the columns it would produce
     /// This is used during CREATE MATERIALIZED VIEW to validate the view before storing it
     pub fn validate_and_extract_columns(
