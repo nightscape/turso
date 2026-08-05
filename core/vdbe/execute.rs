@@ -15010,6 +15010,23 @@ fn sync_fdw_mirrors(
     result
 }
 
+/// Prepare one statement of a mirror sync.
+///
+/// The statement subtransaction is suppressed because the enclosing statement
+/// already owns one, and the subjournal that backs it admits a single owner —
+/// a nested writer asking for its own gets `Busy`. Inside an explicit
+/// transaction the parent is always a writer, so this is the only case that
+/// reaches the contention. The parent's savepoint covers these writes, which
+/// is what makes suppressing it correct rather than merely quiet.
+fn prepare_mirror_stmt(conn: &Arc<Connection>, sql: &str) -> Result<Box<Statement>> {
+    let stmt = conn.prepare(sql)?;
+    stmt.program
+        .prepared
+        .needs_stmt_subtransactions
+        .store(false, Ordering::Relaxed);
+    Ok(Box::new(stmt))
+}
+
 fn sync_fdw_mirrors_inner(
     conn: &Arc<Connection>,
     state: &mut ProgramState,
@@ -15059,7 +15076,7 @@ fn sync_fdw_mirrors_inner(
                 );
                 (phase, stmt)
             }
-            None => (0, Box::new(conn.prepare(&sql[0])?)),
+            None => (0, prepare_mirror_stmt(conn, &sql[0])?),
         };
         loop {
             // The only constraint on a mirror is its identity, so a violation
@@ -15076,7 +15093,7 @@ fn sync_fdw_mirrors_inner(
                 StepResult::Done => {
                     phase += 1;
                     match sql.get(phase) {
-                        Some(next) => stmt = Box::new(conn.prepare(next)?),
+                        Some(next) => stmt = prepare_mirror_stmt(conn, next)?,
                         None => {
                             state.fdw_mirror_sync.done.insert(mirror);
                             break;
