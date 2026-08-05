@@ -5184,6 +5184,12 @@ impl Connection {
         self.index_methods_on_transaction_rolled_back();
         self.set_tx_state(TransactionState::None);
         self.clear_tx_poison();
+        // Staged IVM deltas describe writes this rollback just undid. A
+        // statement savepoint only covers the deltas of the statement that owns
+        // it, and deltas staged by nested statements have already outlived
+        // theirs, so undoing the transaction is the only point that can undo all
+        // of them. Keeping any would merge phantom rows into the matview.
+        self.view_transaction_states.clear();
     }
 
     /// Roll back transaction state for helpers that start a manual `BEGIN`
