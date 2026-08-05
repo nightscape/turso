@@ -227,9 +227,11 @@ fn test_duplicate_identity_is_refused_at_create(tmp_db: TempDatabase) -> anyhow:
 /// silence, while the same source at CREATE is refused outright. Detecting it
 /// needs the scan's row count against its distinct-identity count, and
 /// `test_scan_named_once_and_read_twice` measures that a scan read twice is
-/// scanned twice — so the check costs a third scan of the foreign source per
-/// REFRESH. That is a cost/diagnosability trade to rule on, not a bug to
-/// quietly fix.
+/// scanned twice, and `test_scan_row_count_metric_is_pre_predicate` measures
+/// that the one counter that could have substituted for the second read counts
+/// rows before the predicate filters them. So the check costs a third scan of
+/// the foreign source per REFRESH. That is a cost/diagnosability trade to rule
+/// on, not a bug to quietly fix.
 #[turso_macros::test(views)]
 #[ignore = "OPEN: sweep collapses duplicate identities silently; refusing costs a third foreign scan"]
 fn test_duplicate_identity_is_refused_at_refresh(tmp_db: TempDatabase) -> anyhow::Result<()> {
