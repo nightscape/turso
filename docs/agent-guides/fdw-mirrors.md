@@ -48,7 +48,10 @@ Zero-based column indices whose combined values recognise a row across scans.
   mirror is created. Drivers that decline the contract are unaffected.
 - **NULL identity refused.** The mirror declares the identity columns `NOT NULL`;
   a row with no identity could never be matched on a later scan, so its update or
-  removal could never propagate.
+  removal could never propagate. A sole identity column typed `INTEGER` is
+  redeclared `INT` (same affinity, not a rowid alias), or the `PRIMARY KEY` would
+  alias the rowid — which both hands NULLs a generated identity and creates no
+  automatic index for the one the mirror's DDL writes.
 - **Duplicate identity refused at CREATE**, with an error naming the table and
   columns (`MirrorSpec::identity_violation` splits the NOT NULL and PRIMARY KEY
   constraint failures apart, because they are different broken promises).
