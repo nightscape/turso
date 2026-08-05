@@ -110,6 +110,9 @@ impl MirrorSpec {
 /// the view's pre-redirect statement.
 #[derive(Debug, Clone)]
 pub struct MirrorSync {
+    /// The foreign table being shadowed. Carried for diagnostics: the identity
+    /// constraint fires on the mirror, but the mistake is the source's.
+    pub source_table: String,
     /// The internal btree table holding the shadowed rows.
     pub mirror_table: String,
     /// Column names of the mirror, in declaration order.
@@ -123,6 +126,7 @@ pub struct MirrorSync {
 impl MirrorSync {
     pub fn new(spec: &MirrorSpec, scan_query: String) -> Self {
         Self {
+            source_table: spec.source_table.clone(),
             mirror_table: spec.mirror_table.clone(),
             columns: spec
                 .columns
@@ -140,6 +144,25 @@ impl MirrorSync {
 
     fn table_ident(&self) -> String {
         ast::Name::exact(self.mirror_table.clone()).as_ident()
+    }
+
+    /// What to say when the mirror's identity constraint rejects a row.
+    ///
+    /// The constraint fires on an internal table the user never wrote, so the
+    /// raw message names something they cannot act on. The actionable fact is
+    /// that the driver's declared identity does not identify its rows.
+    pub fn duplicate_identity_error(&self) -> crate::LimboError {
+        let columns = self
+            .identity
+            .iter()
+            .map(|i| self.columns[*i].as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        crate::LimboError::Constraint(format!(
+            "foreign table '{}' returned more than one row with the same identity ({columns}); \
+             a declared identity must identify a row uniquely within a scan",
+            self.source_table
+        ))
     }
 
     fn ident(name: &str) -> String {

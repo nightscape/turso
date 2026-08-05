@@ -15016,9 +15016,10 @@ fn sync_fdw_mirrors_inner(
     view_name: &str,
     mode: MirrorSyncMode,
 ) -> Result<IOResult<()>> {
-    // (mirror, the statements that sync it), in the view's own fixed order so
-    // re-entry after a yield walks the same sequence.
-    let mirror_work: Vec<(String, Vec<String>)> = {
+    // (mirror, the statements that sync it, what a duplicate identity means),
+    // in the view's own fixed order so re-entry after a yield walks the same
+    // sequence.
+    let mirror_work: Vec<(String, Vec<String>, LimboError)> = {
         let schema = conn.schema.read();
         match schema.get_materialized_view(view_name) {
             None => Vec::new(),
@@ -15031,7 +15032,11 @@ fn sync_fdw_mirrors_inner(
                         MirrorSyncMode::Rebuild => sync.rebuild_sql(),
                         MirrorSyncMode::Sweep => sync.sweep_sql(),
                     };
-                    (sync.mirror_table.clone(), sql)
+                    (
+                        sync.mirror_table.clone(),
+                        sql,
+                        sync.duplicate_identity_error(),
+                    )
                 })
                 .collect(),
         }
@@ -15040,7 +15045,7 @@ fn sync_fdw_mirrors_inner(
         return Ok(IOResult::Done(()));
     }
 
-    for (mirror, sql) in mirror_work {
+    for (mirror, sql, duplicate_identity) in mirror_work {
         if state.fdw_mirror_sync.done.contains(&mirror) {
             continue;
         }
@@ -15057,7 +15062,15 @@ fn sync_fdw_mirrors_inner(
             None => (0, Box::new(conn.prepare(&sql[0])?)),
         };
         loop {
-            match stmt.step()? {
+            // The only constraint on a mirror is its identity, so a violation
+            // here always means the same thing and is always the source's
+            // fault. Reporting the internal table's name instead would name
+            // something the user never wrote.
+            let step = stmt.step().map_err(|err| match err {
+                LimboError::Constraint(_) => duplicate_identity.clone(),
+                other => other,
+            })?;
+            match step {
                 // DML emits no rows; keep stepping.
                 StepResult::Row => {}
                 StepResult::Done => {
