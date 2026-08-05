@@ -165,6 +165,98 @@ fn test_integer_identity_null_push_is_refused(tmp_db: TempDatabase) -> anyhow::R
     Ok(())
 }
 
+/// Pushed i64 identities must survive the round trip through the mirror as
+/// integers, and the matview must track every batch.
+///
+/// The `INT` redeclaration that keeps the column off the rowid changes nothing
+/// about its affinity, so a pushed identity must come back out of the view the
+/// integer it went in as — not a string, and not the rowid the engine would
+/// have generated for it. Large magnitudes are included because that is where
+/// a lossy hop through `REAL` would show.
+#[turso_macros::test(views)]
+fn test_integer_identity_push_round_trips(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let (fdw, rows) = MemFdw::new(
+        "CREATE TABLE msg_rt_int(id INTEGER, seq INTEGER, body TEXT)",
+        vec![0],
+    );
+    let row = |id: i64, seq: i64, body: &str| {
+        vec![
+            Value::from_i64(id),
+            Value::from_i64(seq),
+            Value::build_text(body.to_string()),
+        ]
+    };
+    let change =
+        |values: Vec<Value>, weight: i64| turso_core::foreign::FdwChange { values, weight };
+    // i64::MIN is left out: text of it converts lossily to REAL, a known defect
+    // of the value path that has nothing to do with the mirror.
+    const BIG: i64 = i64::MAX;
+    const SMALL: i64 = i64::MIN + 1;
+
+    rows.set(vec![row(1, 10, "one")]);
+    conn.register_foreign_table("msg_rt_int", fdw.clone())?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_rt_int AS SELECT id, seq, body FROM msg_rt_int",
+    )?;
+    let stream = turso_core::foreign::StreamingForeignData::subscribe(fdw.as_ref(), &[])?;
+
+    let view = |conn: &std::sync::Arc<turso_core::Connection>| -> Vec<(i64, i64, String)> {
+        conn.exec_rows("SELECT id, seq, body FROM mv_rt_int ORDER BY id")
+    };
+
+    // Insert a batch spanning the whole i64 range the mirror must carry.
+    fdw.push(change(row(BIG, 20, "biggest"), 1));
+    fdw.push(change(row(SMALL, 30, "smallest"), 1));
+    fdw.push(change(row(0, 40, "zero"), 1));
+    conn.drain_fdw_stream("msg_rt_int", &stream)?;
+    assert_eq!(
+        view(&conn),
+        vec![
+            (SMALL, 30, "smallest".to_string()),
+            (0, 40, "zero".to_string()),
+            (1, 10, "one".to_string()),
+            (BIG, 20, "biggest".to_string()),
+        ],
+        "pushed i64 identities must reach the view as the integers they were"
+    );
+
+    // Update by identity: the row is replaced, not duplicated.
+    fdw.push(change(row(BIG, 21, "biggest v2"), 1));
+    conn.drain_fdw_stream("msg_rt_int", &stream)?;
+    assert_eq!(
+        view(&conn).last().cloned(),
+        Some((BIG, 21, "biggest v2".to_string())),
+        "an update keyed on an i64 identity must land on the row it names"
+    );
+    assert_eq!(view(&conn).len(), 4, "an update must not add a row");
+
+    // The engine must have stored integers, not text that merely prints alike.
+    let types: Vec<(String, String)> =
+        conn.exec_rows("SELECT typeof(id), typeof(seq) FROM mv_rt_int ORDER BY id LIMIT 1");
+    assert_eq!(
+        types,
+        vec![("integer".to_string(), "integer".to_string())],
+        "an INT-declared identity must keep integer affinity through the mirror"
+    );
+
+    // Delete by identity, at the extreme where a REAL round trip would miss.
+    fdw.push(change(row(SMALL, 30, "smallest"), -1));
+    conn.drain_fdw_stream("msg_rt_int", &stream)?;
+    assert_eq!(
+        view(&conn),
+        vec![
+            (0, 40, "zero".to_string()),
+            (1, 10, "one".to_string()),
+            (BIG, 21, "biggest v2".to_string()),
+        ],
+        "a retraction keyed on an i64 identity must remove exactly that row"
+    );
+    Ok(())
+}
+
 /// Two source rows sharing an `INTEGER` identity are still a duplicate, not two
 /// rows the engine invents rowids for.
 #[turso_macros::test(views)]
