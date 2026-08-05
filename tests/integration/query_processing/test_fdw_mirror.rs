@@ -422,3 +422,215 @@ fn test_mirror_survives_reopen() {
         conn.close().unwrap();
     }
 }
+
+/// Rewrite the CSV the foreign table reads.
+fn rewrite_csv(csv_path: &std::path::Path, rows: &[(&str, &str, &str)]) {
+    let mut f = std::fs::File::create(csv_path).unwrap();
+    writeln!(f, "uuid,session_id,body").unwrap();
+    for (uuid, session, body) in rows {
+        writeln!(f, "{uuid},{session},{body}").unwrap();
+    }
+}
+
+/// REFRESH over a mirrored source must rebuild the mirror rather than insert
+/// into it a second time, and must stay repeatable.
+#[turso_macros::test(views)]
+fn test_refresh_rebuilds_mirror(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let csv_path = tmp_db.path.parent().unwrap().join("mirror_refresh.csv");
+    setup_fdw_rows(&tmp_db, &conn, &csv_path, &[("m1", "s1", "one")]);
+
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_refresh AS SELECT uuid, body FROM msg_fdw",
+    )?;
+
+    rewrite_csv(&csv_path, &[("m1", "s1", "changed"), ("m2", "s1", "two")]);
+    common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_refresh")?;
+
+    let rows: Vec<(String, String)> =
+        conn.exec_rows("SELECT uuid, body FROM mv_refresh ORDER BY uuid");
+    assert_eq!(
+        rows,
+        vec![
+            ("m1".to_string(), "changed".to_string()),
+            ("m2".to_string(), "two".to_string()),
+        ]
+    );
+    assert_eq!(
+        mirror_rows(&conn, "mv_refresh"),
+        vec![
+            ("m1".to_string(), "s1".to_string(), "changed".to_string()),
+            ("m2".to_string(), "s1".to_string(), "two".to_string()),
+        ],
+        "mirror must track the source across REFRESH, not accumulate"
+    );
+
+    // A second REFRESH over an unchanged source must be a no-op, not a
+    // duplicate-key failure.
+    common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_refresh")?;
+    let rows: Vec<(String, String)> =
+        conn.exec_rows("SELECT uuid, body FROM mv_refresh ORDER BY uuid");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(mirror_rows(&conn, "mv_refresh").len(), 2);
+
+    // A row leaving the source must leave the mirror too.
+    rewrite_csv(&csv_path, &[("m2", "s1", "two")]);
+    common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_refresh")?;
+    assert_eq!(
+        mirror_rows(&conn, "mv_refresh"),
+        vec![("m2".to_string(), "s1".to_string(), "two".to_string())]
+    );
+    let rows: Vec<(String, String)> = conn.exec_rows("SELECT uuid, body FROM mv_refresh");
+    assert_eq!(rows, vec![("m2".to_string(), "two".to_string())]);
+
+    Ok(())
+}
+
+/// A view built through its mirror must hold exactly the source rows. The
+/// redirect happens between the user's SQL and the circuit, so this is the
+/// end-to-end guard that nothing was lost in translation.
+#[turso_macros::test(views)]
+fn test_view_content_through_mirror(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let csv_path = tmp_db.path.parent().unwrap().join("mirror_reads.csv");
+    setup_fdw_rows(
+        &tmp_db,
+        &conn,
+        &csv_path,
+        &[("m1", "s1", "one"), ("m2", "s1", "two")],
+    );
+
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_reads AS SELECT uuid, body FROM msg_fdw",
+    )?;
+    let rows: Vec<(String, String)> =
+        conn.exec_rows("SELECT uuid, body FROM mv_reads ORDER BY uuid");
+    assert_eq!(
+        rows,
+        vec![
+            ("m1".to_string(), "one".to_string()),
+            ("m2".to_string(), "two".to_string()),
+        ]
+    );
+    Ok(())
+}
+
+/// Reading through the mirror must not disturb view shapes that keep state:
+/// an aggregate is where a doubled or dropped input delta shows up first, and
+/// the mirror fill stages deltas of its own alongside the population.
+///
+/// REFRESH is not exercised here: `REFRESH MATERIALIZED VIEW` over *any*
+/// aggregate view is broken at this base (it clears the DBSP state table
+/// without its automatic index, leaving "Index points to non-existent table
+/// row"), independently of foreign tables. Increment 5 routes mirrored views
+/// around that path entirely.
+#[turso_macros::test(views)]
+fn test_mirrored_aggregate_view_counts_each_row_once(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let csv_path = tmp_db.path.parent().unwrap().join("mirror_agg.csv");
+    setup_fdw_rows(
+        &tmp_db,
+        &conn,
+        &csv_path,
+        &[
+            ("m1", "s1", "one"),
+            ("m2", "s1", "two"),
+            ("m3", "s2", "three"),
+        ],
+    );
+
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_agg AS \
+         SELECT session_id, count(*) AS n FROM msg_fdw GROUP BY session_id",
+    )?;
+    let counts: Vec<(String, i64)> =
+        conn.exec_rows("SELECT session_id, n FROM mv_agg ORDER BY session_id");
+    assert_eq!(
+        counts,
+        vec![("s1".to_string(), 2), ("s2".to_string(), 1)],
+        "population through the mirror must count every source row exactly once"
+    );
+    Ok(())
+}
+
+/// A predicate-scoped view keeps its scope once it reads the mirror.
+#[turso_macros::test(views)]
+fn test_mirrored_view_keeps_its_predicate(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let csv_path = tmp_db.path.parent().unwrap().join("mirror_pred.csv");
+    setup_fdw_rows(
+        &tmp_db,
+        &conn,
+        &csv_path,
+        &[
+            ("m1", "s1", "one"),
+            ("m2", "s2", "two"),
+            ("m3", "s1", "three"),
+        ],
+    );
+
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_pred AS \
+         SELECT uuid, body FROM msg_fdw WHERE session_id = 's1'",
+    )?;
+    let rows: Vec<(String, String)> =
+        conn.exec_rows("SELECT uuid, body FROM mv_pred ORDER BY uuid");
+    assert_eq!(
+        rows,
+        vec![
+            ("m1".to_string(), "one".to_string()),
+            ("m3".to_string(), "three".to_string()),
+        ]
+    );
+    Ok(())
+}
+
+/// A qualified column reference must keep resolving after the source under it
+/// becomes the mirror.
+#[turso_macros::test(views)]
+fn test_mirrored_view_resolves_qualified_columns(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let csv_path = tmp_db.path.parent().unwrap().join("mirror_qual.csv");
+    setup_fdw_rows(&tmp_db, &conn, &csv_path, &[("m1", "s1", "one")]);
+
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_qual AS \
+         SELECT msg_fdw.uuid, msg_fdw.body FROM msg_fdw WHERE msg_fdw.session_id = 's1'",
+    )?;
+    let rows: Vec<(String, String)> = conn.exec_rows("SELECT uuid, body FROM mv_qual");
+    assert_eq!(rows, vec![("m1".to_string(), "one".to_string())]);
+    Ok(())
+}
+
+/// An aliased source must keep its user-written alias after the redirect.
+#[turso_macros::test(views)]
+fn test_mirrored_view_keeps_user_alias(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let csv_path = tmp_db.path.parent().unwrap().join("mirror_alias.csv");
+    setup_fdw_rows(
+        &tmp_db,
+        &conn,
+        &csv_path,
+        &[("m1", "s1", "one"), ("m2", "s2", "two")],
+    );
+
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_alias AS \
+         SELECT m.uuid, m.body FROM msg_fdw m WHERE m.session_id = 's1'",
+    )?;
+    let rows: Vec<(String, String)> = conn.exec_rows("SELECT uuid, body FROM mv_alias");
+    assert_eq!(rows, vec![("m1".to_string(), "one".to_string())]);
+    Ok(())
+}
