@@ -300,3 +300,49 @@ fn test_scan_named_once_and_read_twice(tmp_db: TempDatabase) -> anyhow::Result<(
     );
     Ok(())
 }
+
+/// A statement's `rows_read` counts the rows the foreign cursor YIELDED, not
+/// the rows that survived the scan's predicate.
+///
+/// This is why the sweep cannot detect a source that repeats an identity by
+/// comparing that counter against its mirror's row count: for any view whose
+/// predicate the driver cannot push down — every driver declaring no key
+/// columns — the two differ with no duplicate in sight, and the check would
+/// refuse a perfectly good source.
+#[turso_macros::test(views)]
+fn test_scan_row_count_metric_is_pre_predicate(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    register(
+        &conn,
+        &[
+            ("p1", "s1", "a"),
+            ("p2", "s2", "b"),
+            ("p3", "s1", "c"),
+            ("p4", "s2", "d"),
+        ],
+    );
+    // Stands in for a mirror: same shape, same identity, writable from a test.
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE TABLE mirror_like(uuid TEXT NOT NULL, session_id TEXT, body TEXT, \
+         PRIMARY KEY(uuid))",
+    )?;
+
+    let mut stmt = conn.prepare(
+        "INSERT INTO mirror_like \
+         SELECT * FROM (SELECT * FROM msg_count WHERE session_id = 's1') WHERE true \
+         ON CONFLICT(uuid) DO NOTHING",
+    )?;
+    stmt.run_ignore_rows()?;
+
+    let kept: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM mirror_like");
+    assert_eq!(kept[0].0, 2, "the predicate keeps half the source");
+    assert_eq!(
+        stmt.metrics().rows_read,
+        4,
+        "the counter must be shown to be pre-predicate, or the reasoning above \
+         stops applying"
+    );
+    Ok(())
+}
