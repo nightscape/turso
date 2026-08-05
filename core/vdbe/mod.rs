@@ -48,7 +48,7 @@ use crate::{
     mvcc::{database::CommitStateMachine, MvccClock},
     numeric::Numeric,
     return_if_io,
-    schema::Trigger,
+    schema::{Schema, Trigger},
     state_machine::StateMachine,
     translate::plan::TableReferences,
     types::{IOCompletions, IOResult},
@@ -913,6 +913,16 @@ pub struct ProgramState {
     /// When a statement subtransaction rolls back, the connection's deferred foreign key violations counter
     /// is reset to this value.
     fk_deferred_violations_when_stmt_started: AtomicIsize,
+    /// The connection's main-database schema when the statement started.
+    ///
+    /// DDL mutates the schema in memory (`SetCookie` bumps `schema_version`,
+    /// `ParseSchema` installs the new objects) before the statement can still
+    /// fail — a materialized view populating from a foreign source, say. Rolling
+    /// the statement's pages back to its savepoint restores the on-disk cookie,
+    /// so the in-memory schema must go back with them; otherwise the connection
+    /// carries a version no cookie will ever match and the enclosing `COMMIT`
+    /// publishes it to every other connection.
+    schema_when_stmt_started: Option<Arc<Schema>>,
     /// Number of immediate foreign key violations that occurred during the active statement. If nonzero,
     /// the statement subtransactionwill roll back.
     fk_immediate_violations_during_stmt: AtomicIsize,
@@ -988,6 +998,7 @@ impl ProgramState {
             fdw_mirror_sync: FdwMirrorSyncState::default(),
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
+            schema_when_stmt_started: None,
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
             rowsets: HashMap::default(),
             bloom_filters: HashMap::default(),
@@ -1140,6 +1151,7 @@ impl ProgramState {
             .store(0, Ordering::SeqCst);
         self.fk_deferred_violations_when_stmt_started
             .store(0, Ordering::SeqCst);
+        self.schema_when_stmt_started = None;
         self.rowsets.clear();
         self.bloom_filters.clear();
         self.hash_tables.clear();
@@ -1372,6 +1384,12 @@ impl ProgramState {
             connection.fk_deferred_violations.load(Ordering::Acquire),
             Ordering::SeqCst,
         );
+
+        // Snapshot the schema this statement starts from, so a statement
+        // rollback can put it back alongside the pages it undoes.
+        if self.schema_when_stmt_started.is_none() {
+            self.schema_when_stmt_started = Some(connection.schema.read().clone());
+        }
         // Reset the immediate foreign key violations counter to 0. If this is nonzero when the statement completes, the statement subtransaction will roll back.
         self.fk_immediate_violations_during_stmt
             .store(0, Ordering::Release);
@@ -1415,6 +1433,32 @@ impl ProgramState {
                     .view_transaction_states
                     .rollback_to(&view_savepoint);
             }
+        }
+
+        // Undo any in-memory schema mutation this statement made, for the same
+        // reason its pages are undone: a DDL statement bumps `schema_version`
+        // and installs its objects before it can still fail, and a schema
+        // version no cookie matches wedges every later statement on the
+        // database once the enclosing transaction publishes it.
+        if let Some(schema) = self.schema_when_stmt_started.take() {
+            if matches!(end_statement, EndStatement::RollbackSavepoint) {
+                *connection.schema.write() = schema;
+                connection.bump_prepare_context_generation();
+            }
+        }
+
+        // Pages, in-memory schema and cached cookie are undone together: a
+        // rollback that undoes page 1 must invalidate every cached summary of
+        // page 1, or `CheckSchemaCookie` compares a cookie the pages no longer
+        // carry and every later statement reprepares forever.
+        // `None` lets the next header read repopulate from the restored pages.
+        if matches!(end_statement, EndStatement::RollbackSavepoint) {
+            connection.with_all_attached_pagers_with_index(|pagers| {
+                for (_db_id, attached_pager) in pagers {
+                    attached_pager.set_schema_cookie(None);
+                }
+            });
+            pager.set_schema_cookie(None);
         }
 
         // Drain attached pagers upfront so we can clean them up regardless of path.
