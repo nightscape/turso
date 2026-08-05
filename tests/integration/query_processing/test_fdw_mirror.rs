@@ -1106,3 +1106,62 @@ fn test_refresh_mirrored_view_rolled_back(tmp_db: TempDatabase) -> anyhow::Resul
     );
     Ok(())
 }
+
+/// A `CREATE MATERIALIZED VIEW` that fails while populating from a foreign
+/// source is one aborted statement, not a poisoned database. It fails after its
+/// own `SetCookie`, so the connection's in-memory schema version is one ahead of
+/// the cookie the statement rolled back; committing the surrounding transaction
+/// publishes that phantom version to every connection, and each of them then
+/// compares it against the real cookie and reprepares forever.
+///
+/// What this pins is that the abort leaves the schema where the statement found
+/// it, so the transaction it ran in stays usable and so does the database.
+#[turso_macros::test(views)]
+fn test_failed_mirror_create_in_transaction_leaves_the_database_usable(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    use crate::query_processing::fdw_test_driver::MemFdw;
+    use turso_core::Value;
+
+    let conn = tmp_db.connect_limbo();
+    let (fdw, rows) = MemFdw::new("CREATE TABLE msg_wedge(uuid TEXT, body TEXT)", vec![0]);
+    // A good row first, so the failure lands mid-populate rather than on the
+    // very first row the scan sees.
+    rows.set(vec![
+        vec![Value::build_text("u1"), Value::build_text("one")],
+        vec![Value::Null, Value::build_text("orphan")],
+    ]);
+    conn.register_foreign_table("msg_wedge", fdw)?;
+    common::run_query(&tmp_db, &conn, "CREATE TABLE existing (x)")?;
+    common::run_query(&tmp_db, &conn, "INSERT INTO existing VALUES (1)")?;
+
+    common::run_query(&tmp_db, &conn, "BEGIN")?;
+    common::run_query(&tmp_db, &conn, "CREATE TABLE marker (x)")?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_wedge AS SELECT uuid, body FROM msg_wedge",
+    )
+    .expect_err("a NULL identity must fail the create");
+    common::run_query(&tmp_db, &conn, "COMMIT")?;
+
+    common::run_query(&tmp_db, &conn, "CREATE TABLE probe_after (x)")
+        .expect("DDL must still work after the failed create");
+    let existing: Vec<(i64,)> = conn.exec_rows("SELECT x FROM existing");
+    assert_eq!(
+        existing,
+        vec![(1,)],
+        "reading an existing table must still work"
+    );
+
+    let fresh = tmp_db.connect_limbo();
+    let from_fresh: Vec<(i64,)> = fresh.exec_rows("SELECT x FROM existing");
+    assert_eq!(
+        from_fresh,
+        vec![(1,)],
+        "a connection opened after the failure must not inherit a stale schema version"
+    );
+    common::run_query(&tmp_db, &fresh, "CREATE TABLE probe_fresh (x)")
+        .expect("DDL on a fresh connection must work too");
+    Ok(())
+}
