@@ -104,5 +104,87 @@ fn test_null_identity_refused_by_refresh(tmp_db: TempDatabase) -> anyhow::Result
         msg.contains("msg_late") && msg.to_lowercase().contains("null"),
         "the sweep must diagnose the NULL identity: {msg}"
     );
+    assert!(
+        !msg.contains("more than one row"),
+        "a NULL identity is not a duplicate identity: {msg}"
+    );
+    Ok(())
+}
+
+/// A scan holding one NULL identity and nothing repeated is a NULL, and the
+/// sweep must say so.
+///
+/// The trap is `count(DISTINCT x)`, which ignores NULLs: against `count(*)` it
+/// reads a single NULL-identity row as a duplicate and sends the user looking
+/// for two rows that do not exist. Two NULLs are used because that is the case
+/// the naive count is most confidently wrong about.
+#[turso_macros::test(views)]
+fn test_null_identities_are_not_reported_as_duplicates_at_refresh(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let (fdw, rows) = MemFdw::new("CREATE TABLE msg_nulls(uuid TEXT, body TEXT)", vec![0]);
+    rows.set(vec![vec![
+        Value::build_text("u1"),
+        Value::build_text("one"),
+    ]]);
+    conn.register_foreign_table("msg_nulls", fdw)?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_nulls AS SELECT uuid, body FROM msg_nulls",
+    )?;
+
+    rows.set(vec![
+        vec![Value::build_text("u1"), Value::build_text("one")],
+        vec![Value::Null, Value::build_text("orphan")],
+        vec![Value::Null, Value::build_text("another orphan")],
+    ]);
+    let err = common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_nulls")
+        .expect_err("a NULL identity must be refused by the sweep");
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("null"),
+        "the sweep must diagnose the NULL identity: {msg}"
+    );
+    assert!(
+        !msg.contains("more than one row"),
+        "NULL identities are not duplicates, however many of them there are: {msg}"
+    );
+    Ok(())
+}
+
+/// A scan that breaks both promises at once is reported as the NULL, because a
+/// NULL identity is the one the user cannot work around: a duplicate names two
+/// rows that exist, a NULL names a row nothing can refer to again.
+#[turso_macros::test(views)]
+fn test_a_null_identity_outranks_a_duplicate_at_refresh(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let (fdw, rows) = MemFdw::new("CREATE TABLE msg_both(uuid TEXT, body TEXT)", vec![0]);
+    rows.set(vec![vec![
+        Value::build_text("u1"),
+        Value::build_text("one"),
+    ]]);
+    conn.register_foreign_table("msg_both", fdw)?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_both AS SELECT uuid, body FROM msg_both",
+    )?;
+
+    rows.set(vec![
+        vec![Value::build_text("u1"), Value::build_text("one")],
+        vec![Value::build_text("u1"), Value::build_text("again")],
+        vec![Value::Null, Value::build_text("orphan")],
+    ]);
+    let err = common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_both")
+        .expect_err("a scan breaking the identity contract must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.to_lowercase().contains("null") && !msg.contains("more than one row"),
+        "the NULL identity must be the diagnosis: {msg}"
+    );
     Ok(())
 }
