@@ -14979,11 +14979,27 @@ fn drive_init_cdc_version(
     }
 }
 
-/// Fill every not-yet-filled FDW mirror of `view_name` from the scan its view
-/// will run, so the mirror records exactly the foreign rows the view was built
-/// from.
+/// The statements that rebuild one mirror from its source scan.
 ///
-/// The inner INSERTs run nested for the same reason
+/// The clear precedes the fill because REFRESH re-enters this path against a
+/// mirror that is already full, where re-inserting would collide on the
+/// identity index. It is expressed as DML rather than a btree wipe so that
+/// index is maintained along with the table.
+fn mirror_rebuild_sql(mirror: &str, scan_query: &str) -> [String; 2] {
+    let ident = turso_parser::ast::Name::exact(mirror.to_string()).as_ident();
+    [
+        format!("DELETE FROM {ident}"),
+        // A mirror's columns are the foreign table's columns in order, so the
+        // scan's `SELECT *` aligns positionally.
+        format!("INSERT INTO {ident} {scan_query}"),
+    ]
+}
+
+/// Rebuild every not-yet-rebuilt FDW mirror of `view_name` from the scan its
+/// view will run, so the mirror records exactly the foreign rows the view was
+/// built from.
+///
+/// The inner statements run nested for the same reason
 /// `IncrementalView::populate_from_table` does: they must join the enclosing
 /// DDL transaction rather than commit its dirty pages. The counter is balanced
 /// on every exit, I/O yields included.
@@ -15007,62 +15023,62 @@ fn populate_fdw_mirrors_inner(
         let schema = conn.schema.read();
         match schema.get_materialized_view(view_name) {
             None => Vec::new(),
-            Some(view) => view
-                .lock()
-                .source_scan_queries()?
-                .into_iter()
-                .filter_map(|(source_table, scan_query)| {
-                    let mirror =
-                        crate::incremental::fdw_mirror::mirror_table_name(view_name, &source_table);
-                    // Sources whose driver declares no identity have no mirror.
-                    schema.get_table(&mirror).map(|_| (mirror, scan_query))
-                })
-                .collect(),
+            Some(view) => view.lock().mirror_fills().to_vec(),
         }
     };
+    if mirror_work.is_empty() {
+        return Ok(IOResult::Done(()));
+    }
 
     for (mirror, scan_query) in mirror_work {
         if state.fdw_mirror_populate.done.contains(&mirror) {
             continue;
         }
+        let sql = mirror_rebuild_sql(&mirror, &scan_query);
         // The opcode restarts at its first view after every yield, so the first
-        // unfilled mirror it reaches is always the one it left in flight.
-        let mut stmt = match state.fdw_mirror_populate.in_flight.take() {
-            Some((in_flight_mirror, stmt)) => {
+        // unrebuilt mirror it reaches is always the one it left in flight.
+        let (mut phase, mut stmt) = match state.fdw_mirror_populate.in_flight.take() {
+            Some((in_flight_mirror, phase, stmt)) => {
                 turso_assert!(
                     in_flight_mirror == mirror,
-                    "in-flight mirror {in_flight_mirror} is not the first unfilled one ({mirror})"
+                    "in-flight mirror {in_flight_mirror} is not the first unrebuilt one ({mirror})"
                 );
-                stmt
+                (phase, stmt)
             }
-            None => {
-                // A mirror's columns are the foreign table's columns in order,
-                // so the scan's `SELECT *` aligns positionally.
-                let ident = turso_parser::ast::Name::exact(mirror.clone()).as_ident();
-                Box::new(conn.prepare(format!("INSERT INTO {ident} {scan_query}"))?)
-            }
+            None => (0, Box::new(conn.prepare(&sql[0])?)),
         };
         loop {
             match stmt.step()? {
-                // An INSERT emits no rows; keep stepping.
+                // DML emits no rows; keep stepping.
                 StepResult::Row => {}
                 StepResult::Done => {
-                    state.fdw_mirror_populate.done.insert(mirror);
-                    break;
+                    phase += 1;
+                    match sql.get(phase) {
+                        Some(next) => stmt = Box::new(conn.prepare(next)?),
+                        None => {
+                            state.fdw_mirror_populate.done.insert(mirror);
+                            break;
+                        }
+                    }
                 }
                 StepResult::IO | StepResult::Yield => {
-                    state.fdw_mirror_populate.in_flight = Some((mirror, stmt));
+                    state.fdw_mirror_populate.in_flight = Some((mirror, phase, stmt));
                     return Ok(IOResult::IO(crate::types::IOCompletions(
                         crate::io::Completion::new_yield(),
                     )));
                 }
                 StepResult::Interrupt | StepResult::Busy => {
-                    state.fdw_mirror_populate.in_flight = Some((mirror, stmt));
+                    state.fdw_mirror_populate.in_flight = Some((mirror, phase, stmt));
                     return Err(LimboError::Busy);
                 }
             }
         }
     }
+
+    // The rebuild is initial state, not a change: `populate_from_table` is
+    // about to read these same rows and build the view from scratch. Applying
+    // the rebuild's deltas at commit as well would count every row twice.
+    conn.view_transaction_states.remove(view_name);
     Ok(IOResult::Done(()))
 }
 

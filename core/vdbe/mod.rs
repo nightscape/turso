@@ -121,17 +121,18 @@ pub enum ViewDeltaCommitState {
     Done,
 }
 
-/// Progress of the initial fill of a view's FDW mirrors, which spans the I/O
-/// yields of `Insn::PopulateMaterializedViews`.
+/// Progress of the rebuild of a view's FDW mirrors, which spans the I/O yields
+/// of `Insn::PopulateMaterializedViews`.
 ///
 /// The opcode restarts from its first view on every re-entry, so `done` is what
-/// keeps an already-filled mirror from being inserted into twice.
+/// keeps an already-rebuilt mirror from being cleared and refilled twice.
 #[derive(Default)]
 pub(crate) struct FdwMirrorPopulateState {
-    /// Mirrors already filled during this program run.
+    /// Mirrors already rebuilt during this program run.
     pub(crate) done: std::collections::HashSet<String>,
-    /// The in-flight INSERT, preserved across I/O yields.
-    pub(crate) in_flight: Option<(String, Box<Statement>)>,
+    /// The in-flight statement and its index in that mirror's rebuild
+    /// sequence, preserved across I/O yields.
+    pub(crate) in_flight: Option<(String, usize, Box<Statement>)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

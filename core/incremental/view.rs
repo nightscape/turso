@@ -339,6 +339,11 @@ impl AllViewsTxState {
         self.states.lock().clear();
     }
 
+    /// Drop one view's transaction state, discarding its staged deltas.
+    pub fn remove(&self, view_name: &str) {
+        self.states.lock().remove(view_name);
+    }
+
     /// Check if there are no transaction states
     pub fn is_empty(&self) -> bool {
         self.states.lock().is_empty()
@@ -436,7 +441,10 @@ impl ReferencedTable {
 #[derive(Debug)]
 pub struct IncrementalView {
     name: String,
-    // The SELECT statement that defines how to transform input data
+    // The SELECT statement that defines how to transform input data.
+    // Identity-declaring foreign sources are redirected to their mirrors here,
+    // so this can differ from the SQL the user wrote; see
+    // `redirect_foreign_sources_to_mirrors`.
     pub select_stmt: ast::Select,
 
     // DBSP circuit that encapsulates the computation
@@ -444,6 +452,9 @@ pub struct IncrementalView {
 
     // All tables referenced by this view (from FROM clause and JOINs)
     referenced_tables: Vec<ReferencedTable>,
+    // (mirror table, scan of the foreign table it shadows), one per redirected
+    // source. Empty for every view without an identity-declaring foreign source.
+    mirror_fills: Vec<(String, String)>,
     // Mapping from table aliases to actual table names (e.g., "c" -> "customers")
     table_aliases: HashMap<String, String>,
     // Mapping from table name to fully qualified name (e.g., "customers" -> "main.customers")
@@ -594,15 +605,7 @@ impl IncrementalView {
         internal_state_index_root: i64,
     ) -> Result<Self> {
         let name = view_name.name.as_str().to_string();
-
-        // Extract output columns using the shared function
-        let column_schema = extract_view_columns(&select, schema)?;
-
-        // Parse ORDER BY and LIMIT from the SELECT
-        let (order_by, limit) = Self::parse_order_by_and_limit(&select, &column_schema)?;
-
-        // Check for matview-on-matview upstream LIMIT restriction
-        // (will be validated after we check referenced tables below)
+        let mut select = select;
 
         let mut referenced_tables = Vec::new();
         let mut table_aliases = HashMap::default();
@@ -616,6 +619,22 @@ impl IncrementalView {
             &mut qualified_table_names,
             &mut table_conditions,
         )?;
+
+        let mirror_fills = Self::redirect_foreign_sources_to_mirrors(
+            &name,
+            &mut select,
+            schema,
+            &mut referenced_tables,
+            &mut table_aliases,
+            &mut qualified_table_names,
+            &mut table_conditions,
+        )?;
+
+        // Extract output columns using the shared function
+        let column_schema = extract_view_columns(&select, schema)?;
+
+        // Parse ORDER BY and LIMIT from the SELECT
+        let (order_by, limit) = Self::parse_order_by_and_limit(&select, &column_schema)?;
 
         // Matview-on-matview restriction: an upstream matview that uses
         // ORDER BY or LIMIT is stored in a different btree shape (index vs
@@ -637,9 +656,9 @@ impl IncrementalView {
             }
         }
 
-        Self::new_with_order_by(
+        let mut view = Self::new_with_order_by(
             name,
-            select.clone(),
+            select,
             referenced_tables,
             table_aliases,
             qualified_table_names,
@@ -651,7 +670,90 @@ impl IncrementalView {
             internal_state_index_root,
             order_by,
             limit,
-        )
+        )?;
+        view.mirror_fills = mirror_fills;
+        Ok(view)
+    }
+
+    /// Rewrite the view to read its identity-declaring foreign sources through
+    /// their mirrors, and report how each mirror is filled from its source.
+    ///
+    /// A foreign table can only be rescanned, never written to, so the circuit
+    /// cannot be fed from one; the mirror is an ordinary btree that ordinary
+    /// DML drives. Redirecting at the statement level rather than only at the
+    /// `ReferencedTable` keeps the circuit's input name, the populate scan and
+    /// the delta routing all agreeing on the mirror — they are all derived from
+    /// this statement, and a delta is keyed by the table the DML touched.
+    ///
+    /// Sources whose driver declares no identity are left alone and keep
+    /// snapshot semantics.
+    #[allow(clippy::too_many_arguments)]
+    fn redirect_foreign_sources_to_mirrors(
+        view_name: &str,
+        select: &mut ast::Select,
+        schema: &Schema,
+        referenced_tables: &mut Vec<ReferencedTable>,
+        table_aliases: &mut HashMap<String, String>,
+        qualified_table_names: &mut HashMap<String, String>,
+        table_conditions: &mut HashMap<String, Vec<Option<ast::Expr>>>,
+    ) -> Result<Vec<(String, String)>> {
+        let source_names: Vec<String> = referenced_tables.iter().map(|t| t.name.clone()).collect();
+        let specs = crate::incremental::fdw_mirror::mirror_specs_for_view(
+            view_name,
+            &source_names,
+            schema,
+        )?;
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // The scan of the *foreign* table, taken before the redirect: it is how
+        // the mirror gets filled, and after the redirect the view's own scans
+        // read the mirror instead.
+        let source_scans = Self::generate_populate_queries(
+            select,
+            referenced_tables,
+            table_aliases,
+            qualified_table_names,
+            table_conditions,
+        )?;
+
+        let mut mirror_fills = Vec::with_capacity(specs.len());
+        let mut redirects = HashMap::default();
+        for spec in &specs {
+            if schema.get_table(&spec.mirror_table).is_none() {
+                // Phrased for the multi-pass view loader, which defers a view
+                // whose sources are not registered yet and reports it as
+                // permanently broken if they never are.
+                return Err(LimboError::ParseError(format!(
+                    "mirror '{}' of foreign table '{}' not found in schema",
+                    spec.mirror_table, spec.source_table
+                )));
+            }
+            let position = referenced_tables
+                .iter()
+                .position(|t| t.name == spec.source_table)
+                .expect("mirror specs are built from referenced_tables");
+            mirror_fills.push((spec.mirror_table.clone(), source_scans[position].clone()));
+            redirects.insert(spec.source_table.clone(), spec.mirror_table.clone());
+        }
+
+        crate::incremental::fdw_mirror::rewrite_sources_to_mirrors(select, &redirects);
+
+        referenced_tables.clear();
+        table_aliases.clear();
+        qualified_table_names.clear();
+        table_conditions.clear();
+        Self::extract_all_tables(
+            select,
+            schema,
+            referenced_tables,
+            table_aliases,
+            qualified_table_names,
+            table_conditions,
+        )?;
+
+        Ok(mirror_fills)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -725,6 +827,7 @@ impl IncrementalView {
             select_stmt,
             circuit,
             referenced_tables,
+            mirror_fills: Vec::new(),
             table_aliases,
             qualified_table_names,
             table_conditions,
@@ -1174,26 +1277,14 @@ impl IncrementalView {
         )
     }
 
-    /// The populate scan of each referenced table, paired with that table's name.
+    /// Each mirror this view reads, paired with the scan that fills it from the
+    /// foreign table it shadows.
     ///
-    /// A mirror is filled from exactly the scan its view would run, so the
-    /// mirror holds the view's predicate-scoped subset of the foreign rows and
-    /// nothing wider.
-    pub(crate) fn source_scan_queries(&self) -> crate::Result<Vec<(String, String)>> {
-        let queries = self.sql_for_populate()?;
-        if queries.len() != self.referenced_tables.len() {
-            return Err(LimboError::InternalError(format!(
-                "populate produced {} queries for {} referenced tables",
-                queries.len(),
-                self.referenced_tables.len()
-            )));
-        }
-        Ok(self
-            .referenced_tables
-            .iter()
-            .map(|t| t.name.clone())
-            .zip(queries)
-            .collect())
+    /// The scan is the one the view itself would have run against the foreign
+    /// table, so a mirror holds the view's predicate-scoped subset of the
+    /// foreign rows and nothing wider.
+    pub(crate) fn mirror_fills(&self) -> &[(String, String)] {
+        &self.mirror_fills
     }
 
     pub fn generate_populate_queries(
@@ -3744,5 +3835,152 @@ fn extract_integer_literal(expr: &ast::Expr) -> Option<i64> {
             }
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod fdw_mirror_redirect_tests {
+    use super::IncrementalView;
+    use crate::foreign::{ForeignCursor, ForeignDataWrapper, KeyColumn};
+    use crate::schema::{BTreeCharacteristics, BTreeTable, Column as SchemaColumn, Schema};
+    use crate::sync::Arc;
+    use crate::Result;
+    use turso_parser::ast;
+    use turso_parser::parser::Parser;
+
+    fn parse_select(sql: &str) -> ast::Select {
+        let mut parser = Parser::new(sql.as_bytes());
+        match parser.next().unwrap().unwrap() {
+            ast::Cmd::Stmt(ast::Stmt::Select(select)) => select,
+            _ => panic!("Expected SELECT statement"),
+        }
+    }
+
+    #[derive(Debug)]
+    struct IdentityFdw;
+
+    impl ForeignDataWrapper for IdentityFdw {
+        fn key_columns(&self) -> &[KeyColumn] {
+            &[]
+        }
+
+        fn identity_columns(&self) -> Option<&[u32]> {
+            Some(&[0])
+        }
+
+        fn schema_sql(&self) -> String {
+            "CREATE TABLE msg_fdw(uuid TEXT, session_id TEXT, body TEXT)".to_string()
+        }
+
+        fn open_cursor(&self, _conn: Arc<crate::Connection>) -> Result<Box<dyn ForeignCursor>> {
+            unreachable!("the redirect is decided without scanning")
+        }
+    }
+
+    const MIRROR: &str = "__turso_internal_fdw_mirror_v1_mv_ident__msg_fdw";
+
+    /// Schema with the foreign table and the mirror the DDL would have
+    /// created for `mv_ident`.
+    fn schema_with_mirror(include_mirror: bool) -> Schema {
+        let mut schema = Schema::new();
+        schema
+            .add_virtual_table(
+                crate::vtab::VirtualTable::new_foreign("msg_fdw", Arc::new(IdentityFdw)).unwrap(),
+            )
+            .unwrap();
+        if include_mirror {
+            let columns = vec![
+                SchemaColumn::new_default_text(Some("uuid".to_string()), "TEXT".to_string(), None),
+                SchemaColumn::new_default_text(
+                    Some("session_id".to_string()),
+                    "TEXT".to_string(),
+                    None,
+                ),
+                SchemaColumn::new_default_text(Some("body".to_string()), "TEXT".to_string(), None),
+            ];
+            schema
+                .add_btree_table(Arc::new(BTreeTable::new(
+                    7,
+                    MIRROR.to_string(),
+                    vec![],
+                    columns,
+                    BTreeCharacteristics::HAS_ROWID,
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                )))
+                .unwrap();
+        }
+        schema
+    }
+
+    fn build_view(schema: &Schema, sql: &str) -> Result<IncrementalView> {
+        IncrementalView::from_stmt(
+            ast::QualifiedName {
+                db_name: None,
+                name: ast::Name::exact("mv_ident".to_string()),
+                alias: None,
+            },
+            parse_select(sql),
+            schema,
+            1,
+            2,
+            3,
+        )
+    }
+
+    /// The view must be fed by the mirror, not by the foreign table: the
+    /// circuit's input is keyed by the table a delta's DML touched, and a
+    /// foreign table never produces one.
+    #[test]
+    fn identity_declaring_source_is_redirected_to_its_mirror() {
+        let schema = schema_with_mirror(true);
+        let view = build_view(
+            &schema,
+            "SELECT uuid, body FROM msg_fdw WHERE session_id = 's1'",
+        )
+        .unwrap();
+
+        assert_eq!(view.get_referenced_table_names(), vec![MIRROR.to_string()]);
+        assert_eq!(
+            view.sql_for_populate().unwrap(),
+            vec![format!(
+                "SELECT *, rowid FROM {MIRROR} WHERE session_id = 's1'"
+            )],
+            "the view populates from the mirror, by rowid like any btree source"
+        );
+    }
+
+    /// The mirror is filled from the foreign scan the view would otherwise
+    /// have run itself, predicate included.
+    #[test]
+    fn mirror_is_filled_from_the_view_scoped_foreign_scan() {
+        let schema = schema_with_mirror(true);
+        let view = build_view(
+            &schema,
+            "SELECT uuid, body FROM msg_fdw WHERE session_id = 's1'",
+        )
+        .unwrap();
+
+        assert_eq!(
+            view.mirror_fills(),
+            &[(
+                MIRROR.to_string(),
+                "SELECT * FROM msg_fdw WHERE session_id = 's1'".to_string()
+            )]
+        );
+    }
+
+    /// A missing mirror is a broken view, never a silent fall back to
+    /// snapshot semantics.
+    #[test]
+    fn a_view_whose_mirror_is_missing_refuses_to_load() {
+        let schema = schema_with_mirror(false);
+        let err = build_view(&schema, "SELECT uuid FROM msg_fdw").unwrap_err();
+        assert!(
+            err.to_string().contains("not found in schema"),
+            "the loader defers on this wording: {err}"
+        );
     }
 }
