@@ -456,3 +456,98 @@ fn test_sweep_mixes_insert_update_and_delete_in_one_pass(
     );
     Ok(())
 }
+
+/// A view over two mirrored sources, refused because of the second one.
+///
+/// One `REFRESH` sweeps both mirrors, so the guard for the source that lies is
+/// not the first thing the statement does — the other source's sweep can have
+/// run already. What this pins is that it did not land: the refusal is
+/// all-or-nothing across every mirror the view has, not per-mirror. A per-mirror
+/// refusal would leave the honest source's change durably applied against a view
+/// that never saw it, and no later `REFRESH` would put that back, because the
+/// mirror already agrees with the source.
+#[turso_macros::test(views)]
+fn test_a_refusal_in_one_mirror_rolls_back_the_other(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let left = register(
+        &conn,
+        "msg_left",
+        vec![row("l1", "g1", 1), row("l2", "g2", 2)],
+    );
+    let right = register(&conn, "msg_right", vec![row("r1", "g1", 10)]);
+
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_two AS \
+         SELECT l.uuid AS lu, r.uuid AS ru, l.val AS lv, r.val AS rv \
+         FROM msg_left l JOIN msg_right r ON l.grp = r.grp",
+    )?;
+
+    let mirror_of = |table: &str| format!("__turso_internal_fdw_mirror_v1_mv_two__{table}");
+    let mirror_state = |conn: &Arc<Connection>, table: &str| -> Vec<(i64, String, String, i64)> {
+        conn.exec_rows(&format!(
+            "SELECT rowid, uuid, grp, val FROM \"{}\" ORDER BY rowid",
+            mirror_of(table)
+        ))
+    };
+    let view_state = |conn: &Arc<Connection>| -> Vec<(String, String, i64, i64)> {
+        conn.exec_rows("SELECT lu, ru, lv, rv FROM mv_two ORDER BY lu")
+    };
+
+    let left_before = mirror_state(&conn, "msg_left");
+    let right_before = mirror_state(&conn, "msg_right");
+    let view_before = view_state(&conn);
+    assert_eq!(
+        view_before,
+        vec![("l1".to_string(), "r1".to_string(), 1, 10)]
+    );
+
+    // The honest source changes for real; the other repeats an identity.
+    *left.lock().unwrap() = vec![row("l1", "g1", 100), row("l2", "g2", 2)];
+    *right.lock().unwrap() = vec![row("r1", "g1", 10), row("r1", "g1", 999)];
+
+    for attempt in 1..=2 {
+        let err = common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_two")
+            .expect_err("a source repeating an identity must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("msg_right") && message.contains("uuid"),
+            "attempt {attempt}: the error must name the offending table: {message}"
+        );
+        assert!(
+            !message.contains("msg_left"),
+            "attempt {attempt}: the honest source is not the problem: {message}"
+        );
+        assert!(
+            message.contains("more than one row"),
+            "attempt {attempt}: {message}"
+        );
+
+        assert_eq!(
+            mirror_state(&conn, "msg_left"),
+            left_before,
+            "attempt {attempt}: the honest source's change landed despite the refusal"
+        );
+        assert_eq!(
+            mirror_state(&conn, "msg_right"),
+            right_before,
+            "attempt {attempt}: the refused mirror was written"
+        );
+        assert_eq!(
+            view_state(&conn),
+            view_before,
+            "attempt {attempt}: a refused sweep moved the view"
+        );
+    }
+
+    // With the lie removed, the change the refusal held back applies.
+    *right.lock().unwrap() = vec![row("r1", "g1", 10)];
+    common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_two")?;
+    assert_eq!(
+        view_state(&conn),
+        vec![("l1".to_string(), "r1".to_string(), 100, 10)],
+        "the honest source's change must survive the refusals and apply on recovery"
+    );
+    Ok(())
+}
