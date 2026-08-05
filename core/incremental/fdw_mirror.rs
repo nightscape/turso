@@ -103,6 +103,141 @@ impl MirrorSpec {
     }
 }
 
+/// One mirror of a live view, with everything needed to keep it in step with
+/// the foreign table it shadows.
+///
+/// Built once when the view is loaded, because the scan is only derivable from
+/// the view's pre-redirect statement.
+#[derive(Debug, Clone)]
+pub struct MirrorSync {
+    /// The internal btree table holding the shadowed rows.
+    pub mirror_table: String,
+    /// Column names of the mirror, in declaration order.
+    pub columns: Vec<String>,
+    /// Indices into `columns` whose values identify a row across scans.
+    pub identity: Vec<usize>,
+    /// Scan of the foreign table, scoped by the view's predicate.
+    pub scan_query: String,
+}
+
+impl MirrorSync {
+    pub fn new(spec: &MirrorSpec, scan_query: String) -> Self {
+        Self {
+            mirror_table: spec.mirror_table.clone(),
+            columns: spec
+                .columns
+                .iter()
+                .map(|c| {
+                    c.name
+                        .clone()
+                        .expect("mirrored foreign columns are always named")
+                })
+                .collect(),
+            identity: spec.identity.iter().map(|i| *i as usize).collect(),
+            scan_query,
+        }
+    }
+
+    fn table_ident(&self) -> String {
+        ast::Name::exact(self.mirror_table.clone()).as_ident()
+    }
+
+    fn ident(name: &str) -> String {
+        ast::Name::exact(name.to_string()).as_ident()
+    }
+
+    /// `c1, c2` over the identity columns.
+    fn identity_list(&self) -> String {
+        self.identity
+            .iter()
+            .map(|i| Self::ident(&self.columns[*i]))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn non_identity_columns(&self) -> Vec<&str> {
+        self.columns
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.identity.contains(i))
+            .map(|(_, name)| name.as_str())
+            .collect()
+    }
+
+    /// Statements that discard the mirror and refill it from the source.
+    ///
+    /// The clear precedes the fill because this runs again on a mirror that is
+    /// already full, where re-inserting would collide on the identity index. It
+    /// is DML rather than a btree wipe so that index is maintained along with
+    /// the table.
+    ///
+    /// Every row is retracted and re-inserted, so this is only usable where the
+    /// view is rebuilt from scratch anyway. `sweep_sql` is the incremental form.
+    pub fn rebuild_sql(&self) -> Vec<String> {
+        let table = self.table_ident();
+        crate::alloc::vec![
+            format!("DELETE FROM {table}"),
+            // A mirror's columns are the foreign table's columns in order, so
+            // the scan's `SELECT *` aligns positionally.
+            format!("INSERT INTO {table} {}", self.scan_query),
+        ]
+    }
+
+    /// Statements that bring the mirror in step with the source, touching only
+    /// the rows that actually differ.
+    ///
+    /// An unchanged row produces no DML at all — the `DO UPDATE` is guarded by
+    /// a value comparison — and therefore no delta, which is what keeps a
+    /// no-change sync from churning the view's state and spamming CDC. Changed
+    /// rows keep their rowid, so their retraction carries the identity their
+    /// insertion had.
+    ///
+    /// Costs two scans of the foreign source: one to upsert, one to bound the
+    /// anti-join. The alternative — materialising the first scan into a staging
+    /// table — trades that for a second copy of the data and per-sync DDL.
+    pub fn sweep_sql(&self) -> Vec<String> {
+        let table = self.table_ident();
+        let identity = self.identity_list();
+        let scan = &self.scan_query;
+
+        let changed = self.non_identity_columns();
+        // `WHERE true` disambiguates `ON CONFLICT` from a SELECT's own tail.
+        let upsert = if changed.is_empty() {
+            // Nothing to update: the row *is* its identity.
+            format!("INSERT INTO {table} SELECT * FROM ({scan}) WHERE true ON CONFLICT({identity}) DO NOTHING")
+        } else {
+            let assignments = changed
+                .iter()
+                .map(|c| {
+                    let c = Self::ident(c);
+                    format!("{c} = excluded.{c}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            // `IS NOT` rather than `<>` so a NULL on either side compares.
+            let differs = changed
+                .iter()
+                .map(|c| {
+                    let c = Self::ident(c);
+                    format!("{table}.{c} IS NOT excluded.{c}")
+                })
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            format!(
+                "INSERT INTO {table} SELECT * FROM ({scan}) WHERE true \
+                 ON CONFLICT({identity}) DO UPDATE SET {assignments} WHERE {differs}"
+            )
+        };
+
+        crate::alloc::vec![
+            upsert,
+            format!(
+                "DELETE FROM {table} WHERE ({identity}) NOT IN (SELECT {identity} FROM ({scan}))"
+            ),
+        ]
+    }
+}
+
 /// Build the mirror specs for a view over `referenced_tables`.
 ///
 /// Returns an empty vec when the view reads no identity-declaring foreign
@@ -301,6 +436,74 @@ mod tests {
         assert!(sql.contains("PRIMARY KEY (session_id, uuid)"), "{sql}");
         assert!(sql.contains("uuid TEXT NOT NULL"), "{sql}");
         assert!(sql.contains("session_id TEXT NOT NULL"), "{sql}");
+    }
+
+    fn sync(identity: Vec<u32>) -> MirrorSync {
+        MirrorSync::new(
+            &spec(identity),
+            "SELECT * FROM cc_message_fdw WHERE session_id = 's1'".to_string(),
+        )
+    }
+
+    #[test]
+    fn sweep_upsert_updates_only_the_columns_that_differ() {
+        let sql = sync(crate::alloc::vec![0]).sweep_sql();
+        assert!(
+            sql[0].contains("ON CONFLICT(uuid) DO UPDATE SET session_id = excluded.session_id, body = excluded.body"),
+            "{}", sql[0]
+        );
+        assert!(
+            sql[0].contains(
+                "WHERE __turso_internal_fdw_mirror_v1_mv__cc_message_fdw.session_id IS NOT excluded.session_id"
+            ),
+            "the update must be guarded, or an unchanged row emits a delta: {}",
+            sql[0]
+        );
+        assert!(
+            !sql[0].contains("uuid = excluded.uuid"),
+            "identity columns are equal by construction: {}",
+            sql[0]
+        );
+    }
+
+    /// The scan is wrapped so `ON CONFLICT` cannot be read as the SELECT's own
+    /// tail, and it is the view-scoped scan, not a whole-table one.
+    #[test]
+    fn sweep_upsert_reads_the_view_scoped_scan() {
+        let sql = sync(crate::alloc::vec![0]).sweep_sql();
+        assert!(
+            sql[0].contains(
+                "SELECT * FROM (SELECT * FROM cc_message_fdw WHERE session_id = 's1') WHERE true"
+            ),
+            "{}",
+            sql[0]
+        );
+    }
+
+    /// Rows that left the source are found by anti-join against the same scan.
+    #[test]
+    fn sweep_deletes_rows_the_scan_no_longer_returns() {
+        let sql = sync(crate::alloc::vec![1, 0]).sweep_sql();
+        assert!(
+            sql[1].contains("WHERE (session_id, uuid) NOT IN (SELECT session_id, uuid FROM ("),
+            "composite identity must compare as a row value: {}",
+            sql[1]
+        );
+    }
+
+    /// A mirror that is all identity has nothing to update.
+    #[test]
+    fn sweep_upsert_does_nothing_when_every_column_identifies() {
+        let sql = sync(crate::alloc::vec![0, 1, 2]).sweep_sql();
+        assert!(sql[0].ends_with("DO NOTHING"), "{}", sql[0]);
+    }
+
+    /// A rebuild clears before it fills, or the identity index rejects the refill.
+    #[test]
+    fn rebuild_clears_before_it_fills() {
+        let sql = sync(crate::alloc::vec![0]).rebuild_sql();
+        assert!(sql[0].starts_with("DELETE FROM"), "{}", sql[0]);
+        assert!(sql[1].starts_with("INSERT INTO"), "{}", sql[1]);
     }
 
     #[test]
