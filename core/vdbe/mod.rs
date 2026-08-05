@@ -2290,6 +2290,20 @@ impl Program {
                         return Ok(IOResult::Done(()));
                     }
 
+                    // View maintenance writes the view btrees through the pager, but
+                    // an MVCC commit persists only MV-store state, so the maintenance
+                    // would be served to this session and then silently dropped —
+                    // permanent divergence for every later reader. Refuse instead.
+                    // Checked here rather than at translate time because switching
+                    // journal modes does not bump the schema cookie, so a statement
+                    // prepared under WAL is never reprepared.
+                    if self.connection.mv_store_for_db(crate::MAIN_DB_ID).is_some() {
+                        return Err(LimboError::InternalError(
+                            "Materialized views are not supported in MVCC mode: cannot modify a table with dependent materialized views"
+                                .to_string(),
+                        ));
+                    }
+
                     // Not a rollback - proceed with processing
                     let schema = self.connection.schema.read();
                     // Collect all affected views via BFS from direct changes,
