@@ -349,28 +349,19 @@ fn test_sweep_abandoned_at_each_yield_converges() {
     }
 }
 
-/// REFUTED PROPERTY — red, awaiting its own fix pair.
+/// A sweep abandoned mid-flight must leave the view in step with its mirror.
 ///
-/// A sweep abandoned at its first suspension rolls the mirror back but leaves
-/// the view carrying the deltas of the roll-back writes, so the connection
-/// reads a view that matches neither the old source nor the new one:
+/// The sweep's mirror writes are what the view's deltas describe, and the two
+/// are undone by different machinery: the writes by the pager's transaction
+/// rollback, the deltas by the connection's staged view-transaction state. When
+/// only the first ran, the connection read a view matching neither the old
+/// source nor the new one:
 ///
 /// ```text
 /// view   = [m1 CHANGED, m2 two, m3 three, m4 four]   <- upsert deltas kept
 /// mirror = [m1 one,     m2 two, m3 three]            <- writes rolled back
 /// ```
-///
-/// The state is per-connection, not durable: a fresh connection over the same
-/// file reads the correct rolled-back view (asserted below, and that assertion
-/// passes today). So this is leaked in-memory view-transaction state on the
-/// abandon path, not a corrupt btree — the shape of the 2026-05-08
-/// "ViewTransactionState not rolled back" bug reappearing on the sweep path.
-///
-/// It is specific to the sweep: the same abandonment against an ordinary local
-/// table keeps table and view in step, which
-/// `test_abandoned_local_dml_leaves_view_in_step` pins.
 #[test]
-#[ignore = "REFUTED Stage-2 property: abandoned sweep leaks view deltas whose mirror writes rolled back"]
 fn test_sweep_abandoned_leaves_view_in_step_with_mirror() {
     let boundaries = sweep_boundaries("sweep_torn_probe.db");
 
