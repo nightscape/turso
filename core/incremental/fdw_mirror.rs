@@ -120,6 +120,24 @@ impl MirrorSpec {
     }
 }
 
+/// What a sweep does with a source that hands it two rows sharing an identity.
+///
+/// `CREATE` has no choice — the mirror's primary key refuses them — so the seam
+/// exists to let a sweep be told to differ. Nothing constructs [`LastWins`];
+/// it is the shape a driver-facing knob would take, kept honest by
+/// [`MirrorSync::guard_sql`] being the single place the two diverge.
+///
+/// [`LastWins`]: DuplicatePolicy::LastWins
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DuplicatePolicy {
+    /// Refuse the sweep, naming the source. Symmetric with `CREATE`.
+    Refuse,
+    /// Let the upsert collapse them. Which row survives is scan order, which no
+    /// driver promises.
+    #[allow(dead_code)]
+    LastWins,
+}
+
 /// One mirror of a live view, with everything needed to keep it in step with
 /// the foreign table it shadows.
 ///
@@ -138,11 +156,23 @@ pub struct MirrorSync {
     pub identity: Vec<usize>,
     /// Scan of the foreign table, scoped by the view's predicate.
     pub scan_query: String,
+    /// How the sweep answers a source repeating an identity. Private so the
+    /// seam cannot be opened from outside this module by accident.
+    policy: DuplicatePolicy,
 }
+
+/// What the guard reports when the identity columns are NULL, and when they
+/// repeat. The guard has to say which, because the two are different broken
+/// promises with different fixes.
+const GUARD_NULL: &str = "null";
+const GUARD_DUPLICATE: &str = "duplicate";
 
 impl MirrorSync {
     pub fn new(spec: &MirrorSpec, scan_query: String) -> Self {
         Self {
+            // The only construction site, and the only place the policy is
+            // chosen: a sweep refuses what `CREATE` refuses.
+            policy: DuplicatePolicy::Refuse,
             source_table: spec.source_table.clone(),
             mirror_table: spec.mirror_table.clone(),
             columns: spec
@@ -285,24 +315,74 @@ impl MirrorSync {
     /// rows keep their rowid, so their retraction carries the identity their
     /// insertion had.
     ///
-    /// Costs two scans of the foreign source: one to upsert, one to bound the
-    /// anti-join. The alternative — materialising the first scan into a staging
-    /// table — trades that for a second copy of the data and per-sync DDL.
+    /// Costs three scans of the foreign source: one to check the identity
+    /// contract still holds, one to upsert, one to bound the anti-join. The
+    /// alternative — materialising the first scan into a staging table —
+    /// trades that for a second copy of the data and per-sync DDL.
+    ///
+    /// The guard comes first so a source that broke its promise costs the sweep
+    /// nothing but the scan: no mirror row is written, so no rowid moves and no
+    /// delta is staged.
     pub fn sweep_sql(&self) -> Vec<String> {
         let table = self.table_ident();
         let identity = self.identity_list();
         let scan = &self.scan_query;
 
-        crate::alloc::vec![
-            // `WHERE true` disambiguates `ON CONFLICT` from a SELECT's own tail.
-            format!(
-                "INSERT INTO {table} SELECT * FROM ({scan}) WHERE true {}",
-                self.upsert_tail()
-            ),
-            format!(
-                "DELETE FROM {table} WHERE ({identity}) NOT IN (SELECT {identity} FROM ({scan}))"
-            ),
-        ]
+        let mut statements = Vec::with_capacity(3);
+        statements.extend(self.guard_sql());
+        // `WHERE true` disambiguates `ON CONFLICT` from a SELECT's own tail.
+        statements.push(format!(
+            "INSERT INTO {table} SELECT * FROM ({scan}) WHERE true {}",
+            self.upsert_tail()
+        ));
+        statements.push(format!(
+            "DELETE FROM {table} WHERE ({identity}) NOT IN (SELECT {identity} FROM ({scan}))"
+        ));
+        statements
+    }
+
+    /// The statement that refuses a scan the identity contract no longer holds
+    /// for, or `None` when duplicates are allowed to collapse.
+    ///
+    /// It emits a row only to refuse, and that row says which promise broke.
+    /// `count(DISTINCT …)` cannot: it ignores NULLs, so a single NULL identity
+    /// makes it disagree with `count(*)` and report a duplicate that is not
+    /// there — and SQLite has no `count(DISTINCT a, b)` for a composite
+    /// identity anyway. Grouping answers both: a group's size counts repeats,
+    /// and a per-row NULL flag survives the grouping to be checked first.
+    ///
+    /// The scan is named once, because naming it twice would scan it twice
+    /// (`test_scan_named_once_and_read_twice`).
+    fn guard_sql(&self) -> Option<String> {
+        if self.policy == DuplicatePolicy::LastWins {
+            return None;
+        }
+        let identity = self.identity_list();
+        let any_null = self
+            .identity
+            .iter()
+            .map(|i| format!("{} IS NULL", Self::ident(&self.columns[*i])))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let scan = &self.scan_query;
+        Some(format!(
+            "SELECT CASE WHEN any_null > 0 THEN '{GUARD_NULL}' \
+             ELSE '{GUARD_DUPLICATE}' END \
+             FROM (SELECT max(identity_is_null) AS any_null, \
+             max(identity_rows) AS max_rows FROM \
+             (SELECT ({any_null}) AS identity_is_null, count(*) AS identity_rows \
+             FROM ({scan}) GROUP BY {identity})) \
+             WHERE any_null > 0 OR max_rows > 1"
+        ))
+    }
+
+    /// Read the guard's refusal row as the broken promise it stands for.
+    pub fn guard_refusal(&self, marker: &str) -> LimboError {
+        match marker {
+            GUARD_NULL => self.null_identity_error(),
+            GUARD_DUPLICATE => self.duplicate_identity_error(),
+            other => unreachable!("the mirror guard emits no marker but {other}"),
+        }
     }
 
     /// The `ON CONFLICT` clause that makes an insert of an already-mirrored
@@ -581,24 +661,33 @@ mod tests {
         )
     }
 
+    /// The sweep's upsert, whatever precedes it.
+    fn upsert(sync: &MirrorSync) -> String {
+        let sql = sync.sweep_sql();
+        sql[sql.len() - 2].clone()
+    }
+
+    /// The sweep's anti-join delete.
+    fn anti_join(sync: &MirrorSync) -> String {
+        sync.sweep_sql().last().unwrap().clone()
+    }
+
     #[test]
     fn sweep_upsert_updates_only_the_columns_that_differ() {
-        let sql = sync(crate::alloc::vec![0]).sweep_sql();
+        let sql = upsert(&sync(crate::alloc::vec![0]));
         assert!(
-            sql[0].contains("ON CONFLICT(uuid) DO UPDATE SET session_id = excluded.session_id, body = excluded.body"),
-            "{}", sql[0]
+            sql.contains("ON CONFLICT(uuid) DO UPDATE SET session_id = excluded.session_id, body = excluded.body"),
+            "{sql}"
         );
         assert!(
-            sql[0].contains(
+            sql.contains(
                 "WHERE __turso_internal_fdw_mirror_v1_mv__cc_message_fdw.session_id IS NOT excluded.session_id"
             ),
-            "the update must be guarded, or an unchanged row emits a delta: {}",
-            sql[0]
+            "the update must be guarded, or an unchanged row emits a delta: {sql}"
         );
         assert!(
-            !sql[0].contains("uuid = excluded.uuid"),
-            "identity columns are equal by construction: {}",
-            sql[0]
+            !sql.contains("uuid = excluded.uuid"),
+            "identity columns are equal by construction: {sql}"
         );
     }
 
@@ -606,32 +695,103 @@ mod tests {
     /// tail, and it is the view-scoped scan, not a whole-table one.
     #[test]
     fn sweep_upsert_reads_the_view_scoped_scan() {
-        let sql = sync(crate::alloc::vec![0]).sweep_sql();
+        let sql = upsert(&sync(crate::alloc::vec![0]));
         assert!(
-            sql[0].contains(
+            sql.contains(
                 "SELECT * FROM (SELECT * FROM cc_message_fdw WHERE session_id = 's1') WHERE true"
             ),
-            "{}",
-            sql[0]
+            "{sql}"
         );
     }
 
     /// Rows that left the source are found by anti-join against the same scan.
     #[test]
     fn sweep_deletes_rows_the_scan_no_longer_returns() {
-        let sql = sync(crate::alloc::vec![1, 0]).sweep_sql();
+        let sql = anti_join(&sync(crate::alloc::vec![1, 0]));
         assert!(
-            sql[1].contains("WHERE (session_id, uuid) NOT IN (SELECT session_id, uuid FROM ("),
-            "composite identity must compare as a row value: {}",
-            sql[1]
+            sql.contains("WHERE (session_id, uuid) NOT IN (SELECT session_id, uuid FROM ("),
+            "composite identity must compare as a row value: {sql}"
         );
     }
 
     /// A mirror that is all identity has nothing to update.
     #[test]
     fn sweep_upsert_does_nothing_when_every_column_identifies() {
-        let sql = sync(crate::alloc::vec![0, 1, 2]).sweep_sql();
-        assert!(sql[0].ends_with("DO NOTHING"), "{}", sql[0]);
+        let sql = upsert(&sync(crate::alloc::vec![0, 1, 2]));
+        assert!(sql.ends_with("DO NOTHING"), "{sql}");
+    }
+
+    /// The guard runs before the sweep writes anything, or a refusal would
+    /// leave the mirror half-swept.
+    #[test]
+    fn sweep_checks_the_identity_contract_before_it_writes() {
+        let sql = sync(crate::alloc::vec![0]).sweep_sql();
+        assert_eq!(sql.len(), 3, "{sql:?}");
+        assert!(
+            sql[0].starts_with("SELECT CASE WHEN any_null"),
+            "{}",
+            sql[0]
+        );
+    }
+
+    /// A single NULL identity must not read as a duplicate, so the guard counts
+    /// NULLs apart from repeats and reports them first.
+    #[test]
+    fn guard_separates_null_identities_from_repeated_ones() {
+        let sql = sync(crate::alloc::vec![0]).sweep_sql()[0].clone();
+        assert!(sql.contains("(uuid IS NULL) AS identity_is_null"), "{sql}");
+        assert!(
+            !sql.contains("count(DISTINCT"),
+            "count(DISTINCT) ignores NULLs and would misreport them: {sql}"
+        );
+        assert!(sql.contains("GROUP BY uuid"), "{sql}");
+        assert!(sql.ends_with("WHERE any_null > 0 OR max_rows > 1"), "{sql}");
+    }
+
+    /// The scan is named once. Naming it twice would cost a fourth read of the
+    /// foreign source.
+    #[test]
+    fn guard_reads_the_scan_once() {
+        let sql = sync(crate::alloc::vec![0]).sweep_sql()[0].clone();
+        assert_eq!(sql.matches("FROM cc_message_fdw").count(), 1, "{sql}");
+    }
+
+    /// SQLite has no `count(DISTINCT a, b)`, so a composite identity has to be
+    /// checked by grouping on every column and flagging a NULL in any of them.
+    #[test]
+    fn guard_handles_a_composite_identity() {
+        let sql = sync(crate::alloc::vec![1, 0]).sweep_sql()[0].clone();
+        assert!(
+            sql.contains("(session_id IS NULL OR uuid IS NULL) AS identity_is_null"),
+            "{sql}"
+        );
+        assert!(sql.contains("GROUP BY session_id, uuid"), "{sql}");
+    }
+
+    /// The seam: `LastWins` is exactly the absence of the guard, so opening the
+    /// knob later adds no second code path to keep in step.
+    #[test]
+    fn last_wins_omits_the_guard_and_changes_nothing_else() {
+        let refusing = sync(crate::alloc::vec![0]);
+        let mut collapsing = refusing.clone();
+        collapsing.policy = DuplicatePolicy::LastWins;
+
+        assert_eq!(collapsing.guard_sql(), None);
+        assert_eq!(collapsing.sweep_sql(), refusing.sweep_sql()[1..].to_vec());
+    }
+
+    /// The guard's marker decides which broken promise the user is told about.
+    #[test]
+    fn a_guard_refusal_names_the_promise_that_broke() {
+        let sync = sync(crate::alloc::vec![0]);
+        assert!(sync
+            .guard_refusal(GUARD_NULL)
+            .to_string()
+            .contains("is NULL"));
+        assert!(sync
+            .guard_refusal(GUARD_DUPLICATE)
+            .to_string()
+            .contains("more than one row"));
     }
 
     /// A rebuild clears before it fills, or the identity index rejects the refill.
@@ -648,7 +808,7 @@ mod tests {
     fn push_upsert_shares_the_sweeps_conflict_handling() {
         let sync = sync(crate::alloc::vec![0]);
         let push = sync.push_upsert_sql();
-        let sweep = &sync.sweep_sql()[0];
+        let sweep = &upsert(&sync);
         let tail = "ON CONFLICT(uuid) DO UPDATE SET";
         let (_, push_tail) = push.split_once(tail).expect("{push}");
         let (_, sweep_tail) = sweep.split_once(tail).expect("{sweep}");
