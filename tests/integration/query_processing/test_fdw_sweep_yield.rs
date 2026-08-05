@@ -499,3 +499,100 @@ fn test_abandoned_local_dml_leaves_view_in_step() {
         );
     }
 }
+
+/// Suspend a sweep at its `target`th boundary and hand the caller the paused
+/// statement, so it can observe the database while the sweep is mid-flight.
+fn suspend_sweep_at(
+    conn: &Arc<Connection>,
+    io: &dyn IO,
+    target: usize,
+) -> Option<turso_core::Statement> {
+    let mut stmt = conn.prepare("REFRESH MATERIALIZED VIEW mv_yield").unwrap();
+    let mut seen = 0usize;
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::IO | StepResult::Yield => {
+                seen += 1;
+                if seen == target {
+                    return Some(stmt);
+                }
+                io.step().unwrap();
+            }
+            StepResult::Row => {}
+            StepResult::Done => return None,
+            other => panic!("sweep did not complete: {other:?}"),
+        }
+    }
+}
+
+/// A push arriving while a sweep is suspended mid-flight must not slip past it.
+///
+/// A suspended sweep still holds the write lock, so the push is refused for the
+/// same reason any other writer would be — and once the sweep finishes, the
+/// same push applies and the view converges. What this rules out is the push
+/// interleaving *into* a half-applied sweep, where the mirror would carry rows
+/// from two different scans of the source.
+#[test]
+fn test_push_during_a_suspended_sweep_is_refused_then_applies() {
+    let io = Arc::new(MemoryYieldIO::new()) as Arc<dyn IO>;
+    let source = Arc::new(Mutex::new(rows_of(INITIAL)));
+    let conn = setup(io.clone(), "sweep_push_interleave.db", &source);
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        "sweep_push_interleave.db",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_views(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let pusher = db.connect().unwrap();
+
+    let pushed = turso_core::foreign::FdwChange {
+        values: vec![
+            Value::build_text("m9".to_string()),
+            Value::build_text("s1".to_string()),
+            Value::build_text("pushed".to_string()),
+        ],
+        weight: 1,
+    };
+
+    *source.lock().unwrap() = rows_of(CHANGED);
+    let mut suspended =
+        suspend_sweep_at(&conn, io.as_ref(), 1).expect("the sweep finished before suspending");
+
+    assert!(
+        pusher
+            .inject_fdw_changes("msg_yield", std::slice::from_ref(&pushed))
+            .is_err(),
+        "a push must not proceed while a suspended sweep holds the write lock"
+    );
+
+    // Finish the sweep the push could not join.
+    loop {
+        match suspended.step().unwrap() {
+            StepResult::IO | StepResult::Yield => io.step().unwrap(),
+            StepResult::Row => {}
+            StepResult::Done => break,
+            other => panic!("sweep did not complete: {other:?}"),
+        }
+    }
+    drop(suspended);
+
+    pusher
+        .inject_fdw_changes("msg_yield", std::slice::from_ref(&pushed))
+        .expect("the same push must apply once the sweep is done");
+
+    let (view, mirror, _) = observe(&conn, io.as_ref());
+    assert_eq!(
+        view,
+        vec![
+            vec!["m1".to_string(), "CHANGED".to_string()],
+            vec!["m3".to_string(), "three".to_string()],
+            vec!["m4".to_string(), "four".to_string()],
+            vec!["m9".to_string(), "pushed".to_string()],
+        ],
+        "the sweep's result and the push must both be present, exactly once each"
+    );
+    assert_eq!(mirror.len(), 4, "{mirror:?}");
+}

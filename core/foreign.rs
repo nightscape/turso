@@ -215,10 +215,10 @@ pub struct FdwChange {
 /// Opt-in extension to [`ForeignDataWrapper`] for sources that support
 /// change notifications (e.g., MCP resource subscriptions).
 ///
-/// When a materialized view is created on a streaming FDW, the caller
-/// receives a [`std::sync::mpsc::Receiver`] of changes. The caller is
-/// responsible for draining the receiver and injecting deltas into the
-/// matview via [`Connection::inject_view_delta`].
+/// The caller drains the returned [`std::sync::mpsc::Receiver`] and hands the
+/// batch to [`Connection::drain_fdw_stream`], which applies it to every mirror
+/// shadowing the table. Detection stays the caller's job; what the engine
+/// contributes is that a known change costs only that change.
 ///
 /// # Baseline implementation
 ///
