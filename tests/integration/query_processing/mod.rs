@@ -53,6 +53,8 @@ mod test_fdw_matview;
 mod test_fdw_matview_holon_shape;
 mod test_fdw_mirror;
 mod test_fdw_required_key;
+mod test_fdw_scan_cost;
+mod test_fdw_sweep_yield;
 mod test_foreign_table;
 mod test_multi_thread;
 mod test_non_utf8_text;
