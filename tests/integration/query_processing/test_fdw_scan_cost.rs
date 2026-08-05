@@ -271,3 +271,32 @@ fn test_sweep_scan_count_is_independent_of_mirror_size(tmp_db: TempDatabase) -> 
     assert_eq!(rows[0].0, 120);
     Ok(())
 }
+
+/// A scan named once and read twice costs TWO round trips: a CTE is inlined,
+/// not materialised.
+///
+/// The consequence is the sweep's, not the CTE's: checking a source for
+/// repeated identities needs the row count and the distinct-identity count of
+/// the same scan, and this is why that check cannot be folded into the two
+/// scans the sweep already pays. It would cost a third.
+#[turso_macros::test(views)]
+fn test_scan_named_once_and_read_twice(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let (counters, _store) = register(&conn, &[("m1", "s1", "one"), ("m2", "s1", "two")]);
+
+    counters.reset();
+    let rows: Vec<(i64, i64)> = conn.exec_rows(
+        "WITH s AS (SELECT * FROM msg_count) \
+         SELECT (SELECT count(*) FROM s), (SELECT count(DISTINCT uuid) FROM s)",
+    );
+    assert_eq!(rows[0], (2, 2));
+    assert_eq!(
+        counters.filters(),
+        2,
+        "if a CTE ever becomes materialised, a duplicate-identity check in the \
+         sweep becomes free and should be revisited (opens={}, rows={})",
+        counters.opens(),
+        counters.rows_read()
+    );
+    Ok(())
+}
