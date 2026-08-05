@@ -206,6 +206,10 @@ pub struct PushedConstraint {
 /// Each change carries the full row values and a DBSP weight:
 /// +1 = insert, -1 = delete. An update is represented as a delete of the
 /// old values followed by an insert of the new values.
+///
+/// `values` is positional against [`ForeignDataWrapper::schema_sql`] and must
+/// carry one value per declared column, deletes included — a delete's identity
+/// is read out of it by column index. A change of any other width is refused.
 #[derive(Debug, Clone)]
 pub struct FdwChange {
     pub values: Vec<Value>,
