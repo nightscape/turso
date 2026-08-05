@@ -187,6 +187,25 @@ impl MirrorSync {
         ))
     }
 
+    /// A pushed change carries a different number of values than the table it
+    /// claims to describe.
+    ///
+    /// A push is positional — value *i* is column *i* of the declared schema —
+    /// so a payload of the wrong width names no row the engine can act on.
+    /// Binding the values that did arrive would leave the rest NULL, which for
+    /// an insert fabricates cells the source never had and for a retraction
+    /// reads an identity column that is not there.
+    pub fn width_violation(&self, given: usize) -> LimboError {
+        LimboError::InvalidArgument(format!(
+            "foreign table '{}' pushed a change carrying {given} value(s), \
+             but the table declares {} column(s) ({}); \
+             a pushed change must carry one value per declared column",
+            self.source_table,
+            self.columns.len(),
+            self.columns.join(", ")
+        ))
+    }
+
     /// The driver returned two rows the engine cannot tell apart.
     pub fn duplicate_identity_error(&self) -> LimboError {
         LimboError::Constraint(format!(
