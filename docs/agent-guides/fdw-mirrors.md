@@ -52,13 +52,12 @@ Zero-based column indices whose combined values recognise a row across scans.
   redeclared `INT` (same affinity, not a rowid alias), or the `PRIMARY KEY` would
   alias the rowid — which both hands NULLs a generated identity and creates no
   automatic index for the one the mirror's DDL writes.
-- **Duplicate identity refused at CREATE**, with an error naming the table and
-  columns (`MirrorSpec::identity_violation` splits the NOT NULL and PRIMARY KEY
-  constraint failures apart, because they are different broken promises).
-  **OPEN:** the REFRESH sweep does *not* refuse duplicates — its
-  `ON CONFLICT … DO UPDATE` collapses them silently. Refusing would cost a third
-  foreign scan. Pinned by an `#[ignore]`d test in
-  `tests/integration/query_processing/test_fdw_sweep_hazards.rs`.
+- **Duplicate identity refused at CREATE and at REFRESH**, with an error naming
+  the table and columns. CREATE is refused by the mirror's own PRIMARY KEY
+  (`MirrorSync::identity_violation` splits the NOT NULL and PRIMARY KEY failures
+  apart, because they are different broken promises); REFRESH is refused by the
+  sweep's guard, since its `ON CONFLICT … DO UPDATE` would otherwise collapse
+  duplicates silently, last-scanned-wins over an order no driver promises.
 
 `CsvFdw` accepts an `identity` table option so the feature is provable in-repo:
 `CREATE FOREIGN TABLE … OPTIONS (path '…', identity 'uuid')`.
@@ -70,12 +69,25 @@ source with no declared identity, gets today's byte-identical clear-and-rebuild.
 An identity-declaring foreign source instead syncs its mirrors and does nothing
 else — the sync's own DML drives the view through the normal commit path.
 
-`MirrorSpec::sweep_sql` is two ordinary statements (so IO-yield resumability is
-the engine's existing behaviour, not a bespoke state machine):
+`MirrorSync::sweep_sql` is three ordinary statements (so IO-yield resumability
+is the engine's existing behaviour, not a bespoke state machine):
 
-1. `INSERT INTO <mirror> SELECT * FROM (<scan>) WHERE true
+1. the guard: a `SELECT` over `(<scan>)` grouped by the identity, emitting a row
+   only to refuse — `'null'` if any identity column is NULL, `'duplicate'` if any
+   group holds more than one row
+2. `INSERT INTO <mirror> SELECT * FROM (<scan>) WHERE true
    ON CONFLICT(<identity>) DO UPDATE SET … WHERE <any value IS NOT excluded.…>`
-2. `DELETE FROM <mirror> WHERE (<identity>) NOT IN (SELECT <identity> FROM (<scan>))`
+3. `DELETE FROM <mirror> WHERE (<identity>) NOT IN (SELECT <identity> FROM (<scan>))`
+
+The guard runs first, so a refusal costs the sweep nothing but the scan: no
+mirror row is written, no rowid moves, no delta is staged. It groups rather than
+counting `DISTINCT` for two reasons — `count(DISTINCT …)` ignores NULLs, so a
+lone NULL identity would be reported as a duplicate that is not there, and
+SQLite has no `count(DISTINCT a, b)` for a composite identity. `MirrorSync`
+carries an internal `DuplicatePolicy`, hard-wired to `Refuse` at its one
+construction site; `LastWins` is exactly the absence of the guard and nothing
+constructs it, so it is the seam a driver-facing knob would use rather than a
+live second code path.
 
 Two properties carry the design:
 
@@ -85,9 +97,14 @@ Two properties carry the design:
 - **A changed row keeps its rowid** (upsert, not `INSERT OR REPLACE`, which churns
   rowids), so its retraction carries the identity its insertion had.
 
-This costs **two foreign scans per sweep**. The alternative — materialising the
-first scan into a staging table — trades that for a second copy of the data plus
-per-sync DDL; see `core/incremental/fdw_mirror.rs` and
+This costs **three foreign scans per sweep** — guard, upsert, anti-join. The
+guard cannot ride along on the other two: a scan named once and read twice is
+scanned twice (`test_scan_named_once_and_read_twice`), and the `rows_read`
+counter that could have substituted counts rows *before* the predicate, so a
+guard built on it would refuse any view the driver cannot push down
+(`test_scan_row_count_metric_is_pre_predicate`). The alternative — materialising
+the first scan into a staging table — trades the repeats for a second copy of
+the data plus per-sync DDL; see `core/incremental/fdw_mirror.rs` and
 `tests/integration/query_processing/test_fdw_scan_cost.rs`.
 
 ## The push path
