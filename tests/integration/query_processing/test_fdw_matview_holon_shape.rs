@@ -6,7 +6,9 @@
 //! rather than "matviews don't work over FDWs".
 
 use crate::common::{self, ExecRows, TempDatabase};
+use crate::query_processing::fdw_test_driver::MemFdw;
 use std::io::Write;
+use turso_core::Value;
 
 /// Foreign table `cc_message(uuid, session_id, role, content, timestamp)` over
 /// a CSV file, mirroring the columns Holon's `cc_message_fdw` exposes.
@@ -122,35 +124,57 @@ fn test_fdw_matview_full_holon_shape(tmp_db: TempDatabase) -> anyhow::Result<()>
 }
 
 /// Rung 6: the property the chat view actually needs — the matview must STREAM.
-/// Appending a row to the foreign source must appear in the matview WITHOUT an
-/// explicit `REFRESH MATERIALIZED VIEW`. This is the IVM-over-FDW question.
+/// A message arriving at the foreign source must appear in the matview WITHOUT
+/// an explicit `REFRESH MATERIALIZED VIEW`. This is the IVM-over-FDW question.
 ///
-/// Ignored until the push path exists: the CSV driver cannot signal changes, so
-/// this rung is the Stage 3 acceptance criterion, restated as "green with a
-/// push-capable driver". CSV stays REFRESH-only by design.
+/// The source is a push-capable driver rather than the CSV file the other rungs
+/// use: streaming needs the source to *say* it changed, and a file cannot.
+/// Reading the file on every query would make a `SELECT` take the write lock
+/// and fire CDC mid-read, which is a bigger semantic commitment than this rung
+/// is asking for. CSV therefore stays REFRESH-only, as
+/// `test_refresh_matview_on_fdw` pins.
 #[turso_macros::test(views)]
-#[ignore = "Stage 3 acceptance — un-ignored by Increment 7"]
 fn test_fdw_matview_streams_new_source_rows(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
-    setup_messages(&tmp_db, &conn);
+    let (fdw, rows) = MemFdw::new(
+        "CREATE TABLE cc_message_push(uuid TEXT, session_id TEXT, role TEXT, content TEXT, ts TEXT)",
+        vec![0],
+    );
+    let message = |uuid: &str, ts: &str| {
+        vec![
+            Value::build_text(uuid.to_string()),
+            Value::build_text("s1".to_string()),
+            Value::build_text("user".to_string()),
+            Value::build_text("hello".to_string()),
+            Value::build_text(ts.to_string()),
+        ]
+    };
+    rows.set(vec![
+        message("m1", "100"),
+        message("m2", "200"),
+        message("m3", "300"),
+    ]);
+    conn.register_foreign_table("cc_message_push", fdw.clone())?;
 
     common::run_query(
         &tmp_db,
         &conn,
-        "CREATE MATERIALIZED VIEW mv_stream AS SELECT uuid FROM cc_message_fdw",
+        "CREATE MATERIALIZED VIEW mv_stream AS SELECT uuid FROM cc_message_push",
     )?;
-    let rows: Vec<(String,)> = conn.exec_rows("SELECT uuid FROM mv_stream");
-    assert_eq!(rows.len(), 3);
+    let stream = turso_core::foreign::StreamingForeignData::subscribe(fdw.as_ref(), &[])?;
+    let seen: Vec<(String,)> = conn.exec_rows("SELECT uuid FROM mv_stream");
+    assert_eq!(seen.len(), 3);
 
     // A new message arrives at the foreign source.
-    let csv_path = tmp_db.path.parent().unwrap().join("messages.csv");
-    let mut f = std::fs::OpenOptions::new().append(true).open(&csv_path)?;
-    writeln!(f, "m4,s1,user,brand new,400")?;
-    drop(f);
+    fdw.push(turso_core::foreign::FdwChange {
+        values: message("m4", "400"),
+        weight: 1,
+    });
+    conn.drain_fdw_stream("cc_message_push", &stream)?;
 
-    let rows: Vec<(String,)> = conn.exec_rows("SELECT uuid FROM mv_stream");
+    let seen: Vec<(String,)> = conn.exec_rows("SELECT uuid FROM mv_stream");
     assert_eq!(
-        rows.len(),
+        seen.len(),
         4,
         "matview over a foreign table did not pick up a new source row without REFRESH"
     );

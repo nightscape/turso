@@ -2021,13 +2021,130 @@ impl Connection {
     /// Refresh a materialized view by re-running its source query.
     ///
     /// This is the programmatic equivalent of `REFRESH MATERIALIZED VIEW <name>`.
-    /// For streaming FDW updates, the caller triggers this when the
-    /// [`crate::foreign::StreamingForeignData`] subscription signals changes.
+    /// A driver that can only signal "something changed" calls this; one that
+    /// knows *what* changed calls [`Self::inject_fdw_changes`] instead and
+    /// skips the rescan.
     ///
     /// Must be called on the same thread that owns the connection.
     pub fn refresh_materialized_view(self: &Arc<Connection>, view_name: &str) -> crate::Result<()> {
         let escaped = view_name.replace('\'', "''");
         self.execute(format!("REFRESH MATERIALIZED VIEW {escaped}"))
+    }
+
+    /// Apply row-level changes a foreign source has pushed, to every mirror
+    /// shadowing that source.
+    ///
+    /// This is `REFRESH` without the rescan: the mirror DML emits the same
+    /// deltas the sweep would have derived, so the views update through the
+    /// ordinary commit path. It is the entry point behind
+    /// [`crate::foreign::StreamingForeignData`] — see [`Self::drain_fdw_stream`].
+    ///
+    /// The whole batch commits at once, so a reader never sees part of a push.
+    /// Inside a transaction the caller opened, the batch joins it and commits
+    /// with it instead.
+    ///
+    /// Must be called on the same thread that owns the connection, and never
+    /// from inside a running statement.
+    pub fn inject_fdw_changes(
+        self: &Arc<Connection>,
+        foreign_table: &str,
+        changes: &[crate::foreign::FdwChange],
+    ) -> crate::Result<()> {
+        turso_assert!(
+            !self.is_nested_stmt(),
+            "inject_fdw_changes drives its own transaction and cannot run inside a statement"
+        );
+        let syncs: Vec<crate::incremental::fdw_mirror::MirrorSync> = self
+            .schema
+            .read()
+            .incremental_views
+            .values()
+            .flat_map(|view| {
+                view.lock()
+                    .mirror_syncs()
+                    .iter()
+                    .filter(|sync| sync.source_table.eq_ignore_ascii_case(foreign_table))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        if syncs.is_empty() || changes.is_empty() {
+            return Ok(());
+        }
+
+        // Own the transaction only when there is none to join, so a caller
+        // batching pushes with its own writes keeps one commit boundary.
+        let owns_txn = self.get_auto_commit();
+        if owns_txn {
+            self.execute("BEGIN IMMEDIATE")?;
+        }
+        let result = (|| -> crate::Result<()> {
+            for sync in &syncs {
+                for change in changes {
+                    self.apply_fdw_change(sync, change)?;
+                }
+            }
+            Ok(())
+        })();
+        match (owns_txn, result) {
+            (false, result) => result,
+            (true, Ok(())) => self.execute("COMMIT"),
+            (true, Err(err)) => {
+                // A half-applied mirror would outlive the failed push and be
+                // read as the source's real contents.
+                self.execute("ROLLBACK")?;
+                Err(err)
+            }
+        }
+    }
+
+    /// Apply one change to one mirror.
+    ///
+    /// The statement is *prepared* nested so the reserved-prefix guard admits
+    /// DML on an internal table, but *stepped* top-level: the guard is a
+    /// translation-time check, while nesting at step time would hand the commit
+    /// to an enclosing statement that does not exist here.
+    fn apply_fdw_change(
+        self: &Arc<Connection>,
+        sync: &crate::incremental::fdw_mirror::MirrorSync,
+        change: &crate::foreign::FdwChange,
+    ) -> crate::Result<()> {
+        let (sql, params): (String, Vec<Value>) = if change.weight >= 0 {
+            (sync.push_upsert_sql(), change.values.clone())
+        } else {
+            (
+                sync.push_delete_sql(),
+                sync.identity
+                    .iter()
+                    .map(|column| change.values[*column].clone())
+                    .collect(),
+            )
+        };
+
+        self.start_nested();
+        let prepared = self.prepare(&sql);
+        self.end_nested();
+        let mut stmt = prepared?;
+        for (position, value) in params.into_iter().enumerate() {
+            stmt.bind_at(std::num::NonZero::new(position + 1).unwrap(), value)?;
+        }
+        stmt.run_ignore_rows()
+            .map_err(|err| sync.identity_violation(err))
+    }
+
+    /// Drain everything a [`crate::foreign::StreamingForeignData`] subscription
+    /// has produced so far and apply it as one batch.
+    ///
+    /// Draining is the caller's cue to act, not a schedule: nothing in the
+    /// engine polls. What the engine owns is that whatever arrives is applied
+    /// atomically and incrementally.
+    pub fn drain_fdw_stream(
+        self: &Arc<Connection>,
+        foreign_table: &str,
+        changes: &std::sync::mpsc::Receiver<crate::foreign::FdwChange>,
+    ) -> crate::Result<()> {
+        let batch: Vec<_> = changes.try_iter().collect();
+        self.inject_fdw_changes(foreign_table, &batch)
     }
 
     pub fn maybe_update_schema(&self) {

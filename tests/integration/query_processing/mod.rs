@@ -54,6 +54,7 @@ mod test_fdw_matview;
 mod test_fdw_matview_holon_shape;
 mod test_fdw_mirror;
 mod test_fdw_null_identity;
+mod test_fdw_push;
 mod test_fdw_required_key;
 mod test_fdw_scan_cost;
 mod test_fdw_sweep_hazards;
