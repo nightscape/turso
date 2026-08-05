@@ -15128,7 +15128,13 @@ fn sync_fdw_mirrors_inner(
         // Applying the rebuild's deltas at commit as well would count every row
         // twice. A sweep must never reach here — its deltas are the whole
         // mechanism, and dropping them would leave the view frozen.
-        conn.view_transaction_states.remove(view_name);
+        //
+        // Marking rather than dropping keeps `ROLLBACK TO` able to undo it.
+        // Reaching this with anything staged needs a view that already existed
+        // when the staging DML ran, which a rebuild — only ever emitted by
+        // CREATE — cannot have; the mark is shared with the REFRESH rebuild in
+        // `op_populate_materialized_views`, where that is reachable.
+        conn.view_transaction_states.mark_absorbed(view_name);
     }
     Ok(IOResult::Done(()))
 }
@@ -15230,11 +15236,18 @@ pub fn op_populate_materialized_views(
                 }
             };
 
-            // Reset populate state only for REFRESH (where state is Done from prior population).
+            // Reset only for REFRESH (where state is Done from prior population).
             // On initial CREATE it's already Start, and during I/O re-entry it's mid-population
             // — resetting would discard progress and force redundant table re-reads.
             if view.populate_state_is_done() {
-                view.reset_populate_state();
+                view.reset_for_repopulate();
+                // The rebuild reads its sources on this connection, so inside a
+                // transaction it already sees every row this view has staged.
+                // Leaving those deltas queued would apply them a second time at
+                // commit and count each row twice. Only this view's are marked;
+                // a sibling view over the same tables still needs its own.
+                // (`sync_fdw_mirrors` marks the same for a mirror-fed rebuild.)
+                conn.view_transaction_states.mark_absorbed(&view_name);
             }
             // Now populate it with the cursor for writing
             return_if_io!(view.populate_from_table(&conn, pager, btree_cursor.as_mut()));

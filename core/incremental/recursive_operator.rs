@@ -356,7 +356,6 @@ impl RecursiveOperator {
 
     /// Reset state for a new transaction/computation.
     /// Clears all accumulated state while preserving configuration.
-    #[allow(dead_code)]
     pub fn reset_for_new_transaction(&mut self) {
         self.state = RecursiveState::Init;
         self.accumulated_output = Delta::new();
@@ -740,6 +739,16 @@ impl IncrementalOperator for RecursiveOperator {
             self.accumulated_output.consolidate();
         }
         Ok(IOResult::Done(self.accumulated_output.clone()))
+    }
+
+    fn discard_in_flight_commit(&mut self) {
+        // Every field this clears is commit-scoped: the accumulated output, and
+        // the rowid bookkeeping the aborted run assigned to rows that no longer
+        // exist. Dropping `restored_from_persisted` too makes the next commit
+        // reload the maps from the state blob, which the abort rolled back to
+        // its pre-statement contents — so the reload lands exactly on the state
+        // the operator should have had.
+        self.reset_for_new_transaction();
     }
 
     fn set_tracker(&mut self, _tracker: Arc<Mutex<ComputationTracker>>) {

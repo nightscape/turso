@@ -149,7 +149,7 @@ pub(crate) struct NamedSavepointFrame {
     /// SAVEPOINT begin. A materialized view's rows for the open transaction are
     /// these deltas merged over its btree, so rolling the btree back without
     /// them would leave the view reporting writes whose pages are gone.
-    pub(crate) view_tx_state_snapshot: HashMap<String, HashMap<String, usize>>,
+    pub(crate) view_tx_state_snapshot: HashMap<String, crate::incremental::view::ViewTxSnapshot>,
 }
 
 /// Info returned by `rollback_named_savepoint_frame` so callers can
@@ -158,7 +158,7 @@ pub(crate) struct RollbackFrameInfo {
     pub(crate) main_schema_snapshot: Arc<Schema>,
     pub(crate) temp_schema_snapshot: Option<Arc<Schema>>,
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
-    pub(crate) view_tx_state_snapshot: HashMap<String, HashMap<String, usize>>,
+    pub(crate) view_tx_state_snapshot: HashMap<String, crate::incremental::view::ViewTxSnapshot>,
 }
 
 struct SchemaReparseGuard {

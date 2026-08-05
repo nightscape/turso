@@ -936,7 +936,7 @@ pub struct ProgramState {
     /// states are truncated back to these lengths so partial IVM deltas from a
     /// failed UPDATE/INSERT/DELETE don't leak into the matview at commit time.
     view_tx_state_savepoint:
-        Option<rustc_hash::FxHashMap<String, rustc_hash::FxHashMap<String, usize>>>,
+        Option<rustc_hash::FxHashMap<String, crate::incremental::view::ViewTxSnapshot>>,
     pub n_change: AtomicI64,
     pub n_total_change: AtomicI64,
 }

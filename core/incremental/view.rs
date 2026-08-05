@@ -134,11 +134,14 @@ pub enum PopulateState {
         accumulated_deltas: DeltaSet,
     },
     /// Executing the recursive circuit after all data has been collected.
-    /// On first entry, input_map contains the data to pass to the circuit.
-    /// On resume (after I/O yield), input_map is None and the circuit uses its internal state.
+    /// The input is kept for as long as this state lives, so the step can be
+    /// restarted from it. Handing it to the circuit and keeping nothing would
+    /// tie this state's meaning to the circuit's commit progress, and a commit
+    /// the circuit discards (statement abort) would leave this step committing
+    /// an empty input and reporting a successful, empty population.
     ExecutingRecursiveCircuit {
-        /// Input data for the circuit (Some on first entry, None on resume)
-        input_map: Option<HashMap<String, Delta>>,
+        /// Collected source rows the recursive circuit is fed
+        input_map: HashMap<String, Delta>,
     },
     /// Population complete
     Done,
@@ -187,7 +190,7 @@ impl fmt::Debug for PopulateState {
                 .finish(),
             PopulateState::ExecutingRecursiveCircuit { input_map } => f
                 .debug_struct("ExecutingRecursiveCircuit")
-                .field("has_input", &input_map.is_some())
+                .field("input_tables", &input_map.len())
                 .finish(),
             PopulateState::Done => write!(f, "Done"),
         }
@@ -201,6 +204,9 @@ pub struct ViewTransactionState {
     // Per-table deltas for uncommitted changes (input to the view)
     // Maps table_name -> Delta for that table
     table_deltas: ParkingLotMutex<HashMap<String, Delta>>,
+    // How many leading changes of each table's delta a rebuild has already
+    // folded into the view itself. See `mark_absorbed`.
+    absorbed: ParkingLotMutex<HashMap<String, usize>>,
     // Output delta for the view (the actual changes to the view's result set)
     // Computed when merge_delta is called
     output_delta: ParkingLotMutex<Option<Delta>>,
@@ -210,9 +216,18 @@ impl Clone for ViewTransactionState {
     fn clone(&self) -> Self {
         Self {
             table_deltas: ParkingLotMutex::new(self.table_deltas.lock().clone()),
+            absorbed: ParkingLotMutex::new(self.absorbed.lock().clone()),
             output_delta: ParkingLotMutex::new(self.output_delta.lock().clone()),
         }
     }
+}
+
+/// What a savepoint has to restore about one view's staged deltas: how long
+/// each table's delta was, and how much of each a rebuild had already absorbed.
+#[derive(Debug, Clone, Default)]
+pub struct ViewTxSnapshot {
+    lengths: HashMap<String, usize>,
+    absorbed: HashMap<String, usize>,
 }
 
 impl ViewTransactionState {
@@ -220,6 +235,7 @@ impl ViewTransactionState {
     pub fn new() -> Self {
         Self {
             table_deltas: ParkingLotMutex::new(HashMap::default()),
+            absorbed: ParkingLotMutex::new(HashMap::default()),
             output_delta: ParkingLotMutex::new(None),
         }
     }
@@ -241,12 +257,44 @@ impl ViewTransactionState {
     /// Clear all changes in the delta
     pub fn clear(&self) {
         self.table_deltas.lock().clear();
+        self.absorbed.lock().clear();
         *self.output_delta.lock() = None;
     }
 
-    /// Get deltas organized by table (input deltas)
+    /// Record that a rebuild has read every row staged so far and folded it
+    /// into the view's own btree, so applying these deltas again would count
+    /// each of those rows twice.
+    ///
+    /// Marked as a prefix length rather than by dropping the deltas: a
+    /// savepoint undoes the rebuild by restoring this mark, and deltas that had
+    /// been dropped could not be brought back — `rollback_to` can only shrink.
+    pub fn mark_absorbed(&self) {
+        let deltas = self.table_deltas.lock();
+        let mut absorbed = self.absorbed.lock();
+        for (table, delta) in deltas.iter() {
+            absorbed.insert(table.clone(), delta.changes.len());
+        }
+    }
+
+    /// Get deltas organized by table (input deltas), less any prefix a rebuild
+    /// already absorbed. Every consumer merges these over the view's btree,
+    /// which already holds the absorbed rows.
     pub fn get_table_deltas(&self) -> HashMap<String, Delta> {
-        self.table_deltas.lock().clone()
+        let deltas = self.table_deltas.lock();
+        let absorbed = self.absorbed.lock();
+        deltas
+            .iter()
+            .map(|(table, delta)| {
+                let mut delta = delta.clone();
+                let skip = Self::absorbed_prefix(&absorbed, table, delta.changes.len());
+                delta.changes.drain(..skip);
+                (table.clone(), delta)
+            })
+            .collect()
+    }
+
+    fn absorbed_prefix(absorbed: &HashMap<String, usize>, table: &str, staged: usize) -> usize {
+        absorbed.get(table).copied().unwrap_or(0).min(staged)
     }
 
     /// Set the output delta (the actual changes to the view's result set)
@@ -261,39 +309,52 @@ impl ViewTransactionState {
 
     /// Check if the delta is empty
     pub fn is_empty(&self) -> bool {
-        self.table_deltas.lock().values().all(|d| d.is_empty())
+        self.len() == 0
     }
 
-    /// Returns how many elements exist in the delta.
+    /// Returns how many elements exist in the delta, absorbed rows excluded.
     pub fn len(&self) -> usize {
-        self.table_deltas.lock().values().map(|d| d.len()).sum()
-    }
-
-    /// Capture per-table delta lengths for later statement-level rollback.
-    /// Returns a snapshot that records how many `changes` each table delta has
-    /// at the moment of the call. Pass to `rollback_to` to discard any deltas
-    /// appended after the snapshot was taken.
-    pub fn snapshot_lengths(&self) -> HashMap<String, usize> {
-        self.table_deltas
-            .lock()
+        let deltas = self.table_deltas.lock();
+        let absorbed = self.absorbed.lock();
+        deltas
             .iter()
-            .map(|(table, delta)| (table.clone(), delta.changes.len()))
-            .collect()
+            .map(|(table, delta)| {
+                let staged = delta.changes.len();
+                staged - Self::absorbed_prefix(&absorbed, table, staged)
+            })
+            .sum()
     }
 
-    /// Truncate each table delta back to the lengths recorded in `snapshot`.
-    /// Tables absent from the snapshot are dropped entirely (they were created
-    /// after the snapshot). The output delta is cleared since it is rebuilt
-    /// from input deltas at commit time.
-    pub fn rollback_to(&self, snapshot: &HashMap<String, usize>) {
+    /// Capture what a later `rollback_to` needs: how many `changes` each table
+    /// delta has at the moment of the call, and how much of each a rebuild has
+    /// absorbed. Restoring both undoes deltas appended after the snapshot and
+    /// any rebuild that ran after it.
+    pub fn snapshot_lengths(&self) -> ViewTxSnapshot {
+        ViewTxSnapshot {
+            lengths: self
+                .table_deltas
+                .lock()
+                .iter()
+                .map(|(table, delta)| (table.clone(), delta.changes.len()))
+                .collect(),
+            absorbed: self.absorbed.lock().clone(),
+        }
+    }
+
+    /// Truncate each table delta back to the lengths recorded in `snapshot` and
+    /// restore its absorbed marks. Tables absent from the snapshot are dropped
+    /// entirely (they were created after the snapshot). The output delta is
+    /// cleared since it is rebuilt from input deltas at commit time.
+    pub fn rollback_to(&self, snapshot: &ViewTxSnapshot) {
         let mut deltas = self.table_deltas.lock();
-        deltas.retain(|table, delta| match snapshot.get(table) {
+        deltas.retain(|table, delta| match snapshot.lengths.get(table) {
             Some(&len) => {
                 delta.changes.truncate(len);
                 !delta.changes.is_empty() || len > 0
             }
             None => false,
         });
+        self.absorbed.lock().clone_from(&snapshot.absorbed);
         *self.output_delta.lock() = None;
     }
 }
@@ -340,9 +401,14 @@ impl AllViewsTxState {
         self.states.lock().clear();
     }
 
-    /// Drop one view's transaction state, discarding its staged deltas.
-    pub fn remove(&self, view_name: &str) {
-        self.states.lock().remove(view_name);
+    /// Record that a rebuild of `view_name` has folded every delta staged for
+    /// it so far into the view itself. Only that view's are marked; a sibling
+    /// view over the same tables still needs its own applied.
+    pub fn mark_absorbed(&self, view_name: &str) {
+        let state = self.states.lock().get(view_name).cloned();
+        if let Some(state) = state {
+            state.mark_absorbed();
+        }
     }
 
     /// Check if there are no transaction states
@@ -357,7 +423,7 @@ impl AllViewsTxState {
 
     /// Snapshot the current per-view, per-table delta lengths so that a
     /// failed statement can roll back its partial deltas via `rollback_to`.
-    pub fn snapshot_lengths(&self) -> HashMap<String, HashMap<String, usize>> {
+    pub fn snapshot_lengths(&self) -> HashMap<String, ViewTxSnapshot> {
         self.states
             .lock()
             .iter()
@@ -367,7 +433,7 @@ impl AllViewsTxState {
 
     /// Restore each view's deltas to the lengths captured in `snapshot`.
     /// Views created after the snapshot are removed entirely.
-    pub fn rollback_to(&self, snapshot: &HashMap<String, HashMap<String, usize>>) {
+    pub fn rollback_to(&self, snapshot: &HashMap<String, ViewTxSnapshot>) {
         let mut states = self.states.lock();
         states.retain(|view, state| match snapshot.get(view) {
             Some(view_snapshot) => {
@@ -899,20 +965,19 @@ impl IncrementalView {
         ))
     }
 
-    /// Reset the populate state so the view can be repopulated (used by REFRESH).
     pub fn populate_state_is_done(&self) -> bool {
         matches!(self.populate_state, PopulateState::Done)
     }
 
-    pub fn reset_populate_state(&mut self) {
+    /// Ready the view for a fresh population from its sources, as REFRESH does
+    /// after emptying the view and its DBSP state btrees. The circuit has to
+    /// forget what it holds in memory too: state left over from the previous
+    /// population describes rows that were just deleted, and an operator that
+    /// still remembers them rebuilds nothing — a recursive CTE, for one, filters
+    /// every rebuilt row back out as already seen.
+    pub fn reset_for_repopulate(&mut self) {
         self.populate_state = PopulateState::Start;
-    }
-
-    /// Reset DBSP circuit state after a ROLLBACK so that recursive operator
-    /// state (seen_rows, union_all_rowids, etc.) is rebuilt from the btree on
-    /// the next execution.
-    pub fn reset_circuit_for_rollback(&mut self) {
-        self.circuit.reset_recursive_operators_for_rollback();
+        self.circuit.discard_in_flight_commit();
     }
 
     /// Execute the circuit with uncommitted changes to get processed delta
@@ -2044,27 +2109,29 @@ impl IncrementalView {
                     }
 
                     // All tables collected, transition to circuit execution
-                    let input_map = accumulated_deltas.into_map();
                     self.populate_state = PopulateState::ExecutingRecursiveCircuit {
-                        input_map: Some(input_map),
+                        input_map: accumulated_deltas.into_map(),
                     };
                     continue 'outer;
                 }
 
                 PopulateState::ExecutingRecursiveCircuit { input_map } => {
-                    // Run circuit with input data (first call) or empty map (resume after I/O)
-                    let data = input_map.unwrap_or_default();
+                    // A commit already under way carries its own progress and
+                    // ignores the input; it only needs feeding when it starts
+                    // one, which is also the only time the copy costs anything.
+                    let data = if self.circuit.has_in_flight_commit() {
+                        HashMap::default()
+                    } else {
+                        input_map.clone()
+                    };
                     match self.circuit.commit(data, pager.clone())? {
                         IOResult::Done(_) => {
                             self.populate_state = PopulateState::Done;
                             return Ok(IOResult::Done(()));
                         }
                         IOResult::IO(io) => {
-                            // Save state for resume — the circuit stores its commit progress
-                            // internally in self.circuit.commit_state, so it resumes correctly
-                            // even though we pass None for input_map on re-entry.
                             self.populate_state =
-                                PopulateState::ExecutingRecursiveCircuit { input_map: None };
+                                PopulateState::ExecutingRecursiveCircuit { input_map };
                             return Ok(IOResult::IO(io));
                         }
                     }
@@ -3972,6 +4039,105 @@ mod fdw_mirror_redirect_tests {
         assert!(
             err.to_string().contains("not found in schema"),
             "the loader defers on this wording: {err}"
+        );
+    }
+}
+
+/// A `REFRESH MATERIALIZED VIEW` empties the view and its DBSP state btrees and
+/// rebuilds both. Whatever the circuit still holds in memory has to go with
+/// them: a recursive CTE that remembers the rows it emitted last time filters
+/// every rebuilt row back out, and the rebuild "succeeds" with nothing in it.
+#[cfg(test)]
+mod recursive_repopulate {
+    use super::*;
+    use crate::sync::Arc;
+    use crate::{Connection, Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect, IO};
+
+    fn seeded_conn() -> Arc<Connection> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new().with_views(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+
+        conn.execute("CREATE TABLE edges (src INTEGER, dst INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO edges VALUES (1,2),(2,3)")
+            .unwrap();
+        conn.execute(
+            "CREATE MATERIALIZED VIEW mv AS WITH RECURSIVE reachable AS (\
+             SELECT src, dst FROM edges UNION \
+             SELECT reachable.src, edges.dst FROM reachable JOIN edges ON reachable.dst = edges.src\
+             ) SELECT src, dst FROM reachable",
+        )
+        .unwrap();
+
+        // 1->2, 2->3 and the transitive 1->3.
+        assert_eq!(count(&conn, "SELECT count(*) FROM mv"), 3);
+        conn
+    }
+
+    fn count(conn: &Arc<Connection>, sql: &str) -> i64 {
+        let mut stmt = conn.query(sql).unwrap().unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        match &rows[0][0] {
+            Value::Numeric(crate::numeric::Numeric::Integer(i)) => *i,
+            other => panic!("expected an integer from {sql}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refresh_rebuilds_a_recursive_view() {
+        let conn = seeded_conn();
+        conn.execute("REFRESH MATERIALIZED VIEW mv").unwrap();
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM mv"),
+            3,
+            "REFRESH reported success but left the view empty"
+        );
+    }
+
+    /// The recursive circuit step is entered again after every I/O yield, and
+    /// may find the commit it started already discarded. It has to be able to
+    /// run the population from its own stored input rather than committing
+    /// nothing and calling the view populated.
+    #[test]
+    fn a_parked_recursive_populate_finishes_from_its_own_input() {
+        let conn = seeded_conn();
+
+        {
+            let schema = conn.schema.read();
+            let view = schema.get_materialized_view("mv").unwrap();
+            let mut view = view.lock();
+
+            // What REFRESH does before populating...
+            view.reset_for_repopulate();
+            // ...and where an I/O yield inside the recursive circuit parks it.
+            let mut edges = Delta::new();
+            edges.insert(
+                1,
+                crate::alloc::vec![Value::from_i64(1), Value::from_i64(2)],
+            );
+            edges.insert(
+                2,
+                crate::alloc::vec![Value::from_i64(2), Value::from_i64(3)],
+            );
+            let mut input_map = HashMap::default();
+            input_map.insert("edges".to_string(), edges);
+            view.populate_state = PopulateState::ExecutingRecursiveCircuit { input_map };
+        }
+
+        conn.execute("REFRESH MATERIALIZED VIEW mv").unwrap();
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM mv"),
+            3,
+            "the parked step committed nothing and reported the view populated"
         );
     }
 }

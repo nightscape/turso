@@ -843,24 +843,6 @@ impl DbspCircuit {
         }
     }
 
-    /// Reset all recursive operators so their state will be rebuilt from the
-    /// btree on the next `execute()` or `commit()` call.  Used after ROLLBACK
-    /// to bring the in-memory DBSP state back in sync with the (rolled-back)
-    /// matview btree.
-    pub fn reset_recursive_operators_for_rollback(&mut self) {
-        for node in self.nodes.values_mut() {
-            if let DbspOperator::Recursive { .. } = &node.operator {
-                if let Some(op) = node
-                    .executable
-                    .as_any_mut()
-                    .downcast_mut::<RecursiveOperator>()
-                {
-                    op.reset_for_new_transaction();
-                }
-            }
-        }
-    }
-
     /// Set the root node and update the output schema
     fn set_root(&mut self, root_id: i64, schema: SchemaRef) {
         self.root = Some(root_id);
@@ -1119,6 +1101,37 @@ impl DbspCircuit {
     /// * `input_data` - The deltas to commit (same as what was passed to execute)
     /// * `pager` - Pager for creating cursors to the btrees
     pub fn commit(
+        &mut self,
+        input_data: HashMap<String, Delta>,
+        pager: Arc<Pager>,
+    ) -> Result<IOResult<Delta>> {
+        let result = self.commit_inner(input_data, pager);
+        if result.is_err() {
+            self.discard_in_flight_commit();
+        }
+        result
+    }
+
+    /// True while a `commit` is part-way through, and so will resume from its
+    /// own stored progress and ignore any input handed to it.
+    pub fn has_in_flight_commit(&self) -> bool {
+        !matches!(self.commit_state, CommitState::Init)
+    }
+
+    /// Drop everything the circuit holds in memory about work it has not
+    /// finished. Two callers need it: a commit that ended in an error, whose
+    /// statement is aborted and btree writes rolled back; and a caller that
+    /// empties the state btrees underneath the circuit, which leaves the
+    /// in-memory state describing rows that no longer exist either way.
+    pub(crate) fn discard_in_flight_commit(&mut self) {
+        self.commit_state = CommitState::Init;
+        self.exec_node_cache.clear();
+        for node in self.nodes.values_mut() {
+            node.executable.discard_in_flight_commit();
+        }
+    }
+
+    fn commit_inner(
         &mut self,
         input_data: HashMap<String, Delta>,
         pager: Arc<Pager>,
@@ -4675,6 +4688,142 @@ mod tests {
             pager.io.block(|| btree_cursor.next()).unwrap();
         }
         Ok(delta)
+    }
+
+    fn users_delta(rows: &[(i64, &str, i64)]) -> HashMap<String, Delta> {
+        let mut delta = Delta::new();
+        for (id, name, age) in rows {
+            delta.insert(
+                *id,
+                vec![
+                    Value::from_i64(*id),
+                    Value::Text((*name).into()),
+                    Value::from_i64(*age),
+                ],
+            );
+        }
+        let mut inputs = HashMap::default();
+        inputs.insert("users".to_string(), delta);
+        inputs
+    }
+
+    fn clear_btree_root(pager: &Arc<Pager>, root: i64) {
+        let mut cursor = BTreeCursor::new(pager.clone(), root, 0);
+        pager.io.block(|| cursor.clear_btree()).unwrap();
+    }
+
+    /// A commit that fails part-way through must not leave its progress behind
+    /// for the next commit to resume. The failing statement is rolled back, so
+    /// resuming replays a delta the database no longer knows about — and
+    /// persists it, silently, in place of the next statement's own changes.
+    #[test]
+    fn test_failed_commit_is_not_resumed_by_the_next_one() {
+        let (mut circuit, pager) =
+            compile_sql!("SELECT age, COUNT(*) as cnt FROM users GROUP BY age");
+
+        let seed = users_delta(&[(1, "Alice", 25), (2, "Bob", 30)]);
+        pager
+            .io
+            .block(|| circuit.commit(seed.clone(), pager.clone()))
+            .unwrap();
+
+        // Drop the state rows but keep the index entries, so each one points at
+        // a rowid that no longer exists. This is the state an un-fixed REFRESH
+        // left behind, and the shape of any failure inside a state write.
+        clear_btree_root(&pager, circuit.internal_state_root);
+
+        let doomed = users_delta(&[(3, "Charlie", 25)]);
+        let err = pager
+            .io
+            .block(|| circuit.commit(doomed.clone(), pager.clone()))
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Index points to non-existent table row"),
+            "expected the orphaned index error, got: {err}"
+        );
+
+        // Repair the state the way REFRESH does, table and index together.
+        clear_btree_root(&pager, circuit.internal_state_index_root);
+
+        let next = users_delta(&[(4, "David", 40)]);
+        let delta = pager
+            .io
+            .block(|| circuit.commit(next.clone(), pager.clone()))
+            .unwrap();
+
+        let ages: Vec<Value> = delta
+            .changes
+            .iter()
+            .map(|(row, _)| row.values[0].clone())
+            .collect();
+        assert_eq!(
+            ages,
+            vec![Value::from_i64(40)],
+            "the failed commit's delta was replayed instead of the new one"
+        );
+    }
+
+    /// Same invariant for a circuit with a `RecursiveOperator`, which keeps its
+    /// own accumulated output and rowid bookkeeping outside any commit state
+    /// machine: a failed commit must leave none of it behind either.
+    #[test]
+    fn test_failed_commit_on_recursive_circuit_is_not_resumed() {
+        let sql = r#"
+            WITH RECURSIVE reachable AS (
+                SELECT src, dst FROM edges
+                UNION
+                SELECT reachable.src, edges.dst FROM reachable INNER JOIN edges ON reachable.dst = edges.src
+            )
+            SELECT src, dst FROM reachable
+        "#;
+        let (mut circuit, pager) = compile_sql!(sql);
+
+        let edges_delta = |rows: &[(i64, i64, i64)]| {
+            let mut delta = Delta::new();
+            for (rowid, src, dst) in rows {
+                delta.insert(*rowid, vec![Value::from_i64(*src), Value::from_i64(*dst)]);
+            }
+            let mut inputs = HashMap::default();
+            inputs.insert("edges".to_string(), delta);
+            inputs
+        };
+
+        let seed = edges_delta(&[(1, 1, 2)]);
+        pager
+            .io
+            .block(|| circuit.commit(seed.clone(), pager.clone()))
+            .unwrap();
+
+        clear_btree_root(&pager, circuit.internal_state_root);
+
+        let doomed = edges_delta(&[(2, 2, 3)]);
+        pager
+            .io
+            .block(|| circuit.commit(doomed.clone(), pager.clone()))
+            .expect_err("the orphaned state index should fail this commit");
+
+        clear_btree_root(&pager, circuit.internal_state_index_root);
+
+        // The doomed run recorded its rows in the operator's `seen_rows` /
+        // `seen_counts` bookkeeping. Those rows were rolled back, so committing
+        // them again has to emit them; a leaked "already seen" entry silently
+        // swallows the row instead.
+        let delta = pager
+            .io
+            .block(|| circuit.commit(doomed.clone(), pager.clone()))
+            .unwrap();
+
+        let edges: Vec<(Value, Value)> = delta
+            .changes
+            .iter()
+            .map(|(row, _)| (row.values[0].clone(), row.values[1].clone()))
+            .collect();
+        assert_eq!(
+            edges,
+            vec![(Value::from_i64(2), Value::from_i64(3))],
+            "the failed commit's rows survived in the recursive operator"
+        );
     }
 
     #[test]

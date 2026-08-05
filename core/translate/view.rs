@@ -824,6 +824,22 @@ pub fn translate_refresh_materialized_view(
             db: database_id,
         });
         emit_clear_btree(program, dbsp_cursor_id, &dbsp_table_name);
+
+        // The state table carries an automatic index over its primary key, and
+        // the row-by-row table clear above leaves every entry of it behind,
+        // pointing at a rowid that no longer exists. Repopulation reaches each
+        // state row through that index, so the stale entries have to go too.
+        let dbsp_index_roots: Vec<i64> = resolver.with_schema(database_id, |s| {
+            s.get_indices(&dbsp_table_name)
+                .map(|index| index.root_page)
+                .collect()
+        });
+        for root in dbsp_index_roots {
+            program.emit_insn(Insn::ClearBtree {
+                db: database_id,
+                root,
+            });
+        }
     }
 
     // Repopulate
