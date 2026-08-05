@@ -19,11 +19,14 @@
 
 use crate::schema::{Column, Schema, Table, FDW_MIRROR_TABLE_PREFIX};
 use crate::{LimboError, Result};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use turso_parser::ast;
 
 /// Everything needed to create and sync one view's mirror of one foreign table.
 #[derive(Debug, Clone)]
 pub struct MirrorSpec {
+    /// The foreign table being shadowed.
+    pub source_table: String,
     /// The internal btree table holding the shadowed rows.
     pub mirror_table: String,
     /// Columns of the foreign table, mirrored verbatim.
@@ -142,12 +145,85 @@ pub fn mirror_specs_for_view(
         }
 
         specs.push(MirrorSpec {
+            source_table: source_table.clone(),
             mirror_table: mirror_table_name(view_name, source_table),
             columns,
             identity: identity.to_vec(),
         });
     }
     Ok(specs)
+}
+
+/// Point every source named in `mirrors` at its mirror table.
+///
+/// The source's name is kept as an alias, so column qualifiers written against
+/// it (`msg_fdw.uuid`) still resolve once the table underneath has changed.
+///
+/// This visits exactly the table positions
+/// `IncrementalView::extract_all_tables` reads, which is what keeps the
+/// rewritten statement's referenced tables, its compiled circuit and its
+/// populate scan naming the same thing.
+pub fn rewrite_sources_to_mirrors(select: &mut ast::Select, mirrors: &HashMap<String, String>) {
+    rewrite_select(select, mirrors, &HashSet::default());
+}
+
+fn rewrite_select(
+    select: &mut ast::Select,
+    mirrors: &HashMap<String, String>,
+    parent_cte_names: &HashSet<String>,
+) {
+    let mut cte_names = parent_cte_names.clone();
+    if let Some(with) = select.with.as_mut() {
+        for cte in with.ctes.iter() {
+            cte_names.insert(cte.tbl_name.as_str().to_string());
+        }
+        for cte in with.ctes.iter_mut() {
+            rewrite_select(&mut cte.select, mirrors, &cte_names);
+        }
+    }
+
+    rewrite_one_statement(&mut select.body.select, mirrors, &cte_names);
+    for compound in select.body.compounds.iter_mut() {
+        rewrite_one_statement(&mut compound.select, mirrors, &cte_names);
+    }
+}
+
+fn rewrite_one_statement(
+    select: &mut ast::OneSelect,
+    mirrors: &HashMap<String, String>,
+    cte_names: &HashSet<String>,
+) {
+    let ast::OneSelect::Select {
+        from: Some(from), ..
+    } = select
+    else {
+        return;
+    };
+    rewrite_select_table(from.select.as_mut(), mirrors, cte_names);
+    for join in from.joins.iter_mut() {
+        rewrite_select_table(join.table.as_mut(), mirrors, cte_names);
+    }
+}
+
+fn rewrite_select_table(
+    table: &mut ast::SelectTable,
+    mirrors: &HashMap<String, String>,
+    cte_names: &HashSet<String>,
+) {
+    let ast::SelectTable::Table(name, alias, _) = table else {
+        return;
+    };
+    let source = name.name.as_str().to_string();
+    if cte_names.contains(&source) {
+        return;
+    }
+    let Some(mirror) = mirrors.get(&source) else {
+        return;
+    };
+    name.name = ast::Name::exact(mirror.clone());
+    if alias.is_none() {
+        *alias = Some(ast::As::As(ast::Name::exact(source)));
+    }
 }
 
 #[cfg(test)]
@@ -169,6 +245,7 @@ mod tests {
 
     fn spec(identity: Vec<u32>) -> MirrorSpec {
         MirrorSpec {
+            source_table: "cc_message_fdw".to_string(),
             mirror_table: mirror_table_name("mv", "cc_message_fdw"),
             columns: crate::alloc::vec![
                 col("uuid", "TEXT"),
