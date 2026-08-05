@@ -1,11 +1,12 @@
 //! What a mirror sync costs the foreign source, counted at the driver.
 //!
 //! The sweep deliberately does not stage its first scan into a temp table, so
-//! it reads the source twice per REFRESH: once to upsert, once to bound the
-//! anti-join that deletes vanished rows. That is a deliberate trade (no
-//! per-sync DDL, no second copy of the data) and it is only defensible if the
-//! cost is *constant* — in particular if the `NOT IN (<subquery>)` materialises
-//! its subquery once rather than re-running it per mirror row.
+//! it reads the source three times per REFRESH: once to check the identity
+//! contract still holds, once to upsert, once to bound the anti-join that
+//! deletes vanished rows. That is a deliberate trade (no per-sync DDL, no
+//! second copy of the data) and it is only defensible if the cost is
+//! *constant* — in particular if the `NOT IN (<subquery>)` materialises its
+//! subquery once rather than re-running it per mirror row.
 //!
 //! These tests pin the counts so a regression in either direction is loud.
 
@@ -177,7 +178,7 @@ fn test_scan_count_at_create(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A REFRESH that changes nothing still costs the two sweep scans and no more.
+/// A REFRESH that changes nothing still costs the three sweep scans and no more.
 #[turso_macros::test(views)]
 fn test_scan_count_per_no_change_refresh(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -193,8 +194,9 @@ fn test_scan_count_per_no_change_refresh(tmp_db: TempDatabase) -> anyhow::Result
 
     assert_eq!(
         counters.filters(),
-        2,
-        "the sweep is an upsert scan plus an anti-join scan (opens={}, rows={})",
+        3,
+        "the sweep is a guard scan, an upsert scan and an anti-join scan \
+         (opens={}, rows={})",
         counters.opens(),
         counters.rows_read()
     );
@@ -220,7 +222,7 @@ fn test_scan_count_per_changed_refresh(tmp_db: TempDatabase) -> anyhow::Result<(
 
     assert_eq!(
         counters.filters(),
-        2,
+        3,
         "a changed sweep must cost no more scans than an unchanged one (opens={}, rows={})",
         counters.opens(),
         counters.rows_read()
@@ -278,7 +280,7 @@ fn test_sweep_scan_count_is_independent_of_mirror_size(tmp_db: TempDatabase) -> 
 /// The consequence is the sweep's, not the CTE's: checking a source for
 /// repeated identities needs the row count and the distinct-identity count of
 /// the same scan, and this is why that check cannot be folded into the two
-/// scans the sweep already pays. It would cost a third.
+/// scans the sweep's DML already pays. It is why the guard costs a third.
 #[turso_macros::test(views)]
 fn test_scan_named_once_and_read_twice(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -293,8 +295,8 @@ fn test_scan_named_once_and_read_twice(tmp_db: TempDatabase) -> anyhow::Result<(
     assert_eq!(
         counters.filters(),
         2,
-        "if a CTE ever becomes materialised, a duplicate-identity check in the \
-         sweep becomes free and should be revisited (opens={}, rows={})",
+        "if a CTE ever becomes materialised, the sweep's guard becomes free and \
+         its third scan should be reclaimed (opens={}, rows={})",
         counters.opens(),
         counters.rows_read()
     );
@@ -304,11 +306,11 @@ fn test_scan_named_once_and_read_twice(tmp_db: TempDatabase) -> anyhow::Result<(
 /// A statement's `rows_read` counts the rows the foreign cursor YIELDED, not
 /// the rows that survived the scan's predicate.
 ///
-/// This is why the sweep cannot detect a source that repeats an identity by
-/// comparing that counter against its mirror's row count: for any view whose
-/// predicate the driver cannot push down — every driver declaring no key
-/// columns — the two differ with no duplicate in sight, and the check would
-/// refuse a perfectly good source.
+/// This is why the sweep's guard is a scan rather than a counter comparison:
+/// for any view whose predicate the driver cannot push down — every driver
+/// declaring no key columns — this counter and the mirror's row count differ
+/// with no duplicate in sight, and a guard built on it would refuse a perfectly
+/// good source.
 #[turso_macros::test(views)]
 fn test_scan_row_count_metric_is_pre_predicate(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
