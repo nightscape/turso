@@ -1007,3 +1007,102 @@ fn test_sweep_maintains_a_mixed_source_view(tmp_db: TempDatabase) -> anyhow::Res
     );
     Ok(())
 }
+
+/// A mirror sync is DML like any other, so it must be able to run inside a
+/// transaction the user opened, joining it rather than demanding its own.
+#[turso_macros::test(views)]
+fn test_create_mirrored_view_inside_transaction(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let csv_path = tmp_db.path.parent().unwrap().join("intx_create.csv");
+    setup_fdw_rows(
+        &tmp_db,
+        &conn,
+        &csv_path,
+        &[("m1", "s1", "one"), ("m2", "s1", "two")],
+    );
+
+    common::run_query(&tmp_db, &conn, "BEGIN")?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_intx_create AS SELECT uuid, body FROM msg_fdw",
+    )?;
+    common::run_query(&tmp_db, &conn, "COMMIT")?;
+
+    let rows: Vec<(String, String)> =
+        conn.exec_rows("SELECT uuid, body FROM mv_intx_create ORDER BY uuid");
+    assert_eq!(
+        rows,
+        vec![
+            ("m1".to_string(), "one".to_string()),
+            ("m2".to_string(), "two".to_string()),
+        ]
+    );
+    Ok(())
+}
+
+/// The same for the sweep: `REFRESH` inside an explicit transaction must apply
+/// with the enclosing `COMMIT`.
+#[turso_macros::test(views)]
+fn test_refresh_mirrored_view_inside_transaction(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let csv_path = tmp_db.path.parent().unwrap().join("intx_refresh.csv");
+    setup_fdw_rows(&tmp_db, &conn, &csv_path, &[("m1", "s1", "one")]);
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_intx_refresh AS SELECT uuid, body FROM msg_fdw",
+    )?;
+
+    rewrite_csv(&csv_path, &[("m1", "s1", "one"), ("m2", "s1", "two")]);
+    common::run_query(&tmp_db, &conn, "BEGIN")?;
+    common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_intx_refresh")?;
+    common::run_query(&tmp_db, &conn, "COMMIT")?;
+
+    let rows: Vec<(String, String)> =
+        conn.exec_rows("SELECT uuid, body FROM mv_intx_refresh ORDER BY uuid");
+    assert_eq!(
+        rows,
+        vec![
+            ("m1".to_string(), "one".to_string()),
+            ("m2".to_string(), "two".to_string()),
+        ],
+        "a sweep inside a transaction must apply when that transaction commits"
+    );
+    Ok(())
+}
+
+/// A swept mirror is transaction state like any other: rolling back must undo
+/// the mirror's rows *and* the view's, leaving both as they were.
+#[turso_macros::test(views)]
+fn test_refresh_mirrored_view_rolled_back(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let csv_path = tmp_db.path.parent().unwrap().join("intx_rollback.csv");
+    setup_fdw_rows(&tmp_db, &conn, &csv_path, &[("m1", "s1", "one")]);
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_intx_rb AS SELECT uuid, body FROM msg_fdw",
+    )?;
+    let mirror_before = mirror_rows(&conn, "mv_intx_rb");
+    let view_before: Vec<(String, String)> =
+        conn.exec_rows("SELECT uuid, body FROM mv_intx_rb ORDER BY uuid");
+
+    rewrite_csv(&csv_path, &[("m1", "s1", "changed"), ("m2", "s1", "two")]);
+    common::run_query(&tmp_db, &conn, "BEGIN")?;
+    common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_intx_rb")?;
+    common::run_query(&tmp_db, &conn, "ROLLBACK")?;
+
+    assert_eq!(
+        mirror_rows(&conn, "mv_intx_rb"),
+        mirror_before,
+        "a rolled-back sweep must leave the mirror untouched"
+    );
+    let view_after: Vec<(String, String)> =
+        conn.exec_rows("SELECT uuid, body FROM mv_intx_rb ORDER BY uuid");
+    assert_eq!(
+        view_after, view_before,
+        "a rolled-back sweep must leave the view untouched"
+    );
+    Ok(())
+}
