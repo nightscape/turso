@@ -72,11 +72,7 @@ impl MirrorSpec {
                 .as_deref()
                 .expect("mirrored foreign columns are always named");
             let ident = ast::Name::exact(name.to_string()).as_ident();
-            let ty = if column.ty_str.is_empty() {
-                "TEXT"
-            } else {
-                column.ty_str.as_str()
-            };
+            let ty = self.declared_type(idx, column);
             let not_null = if self.identity.contains(&(idx as u32)) {
                 " NOT NULL"
             } else {
@@ -100,6 +96,27 @@ impl MirrorSpec {
 
         let table_ident = ast::Name::exact(self.mirror_table.clone()).as_ident();
         format!("CREATE TABLE {table_ident} ({})", defs.join(", "))
+    }
+
+    /// The type the mirror declares for column `idx`, which is the source's own
+    /// except where that would make the column an alias of the rowid.
+    ///
+    /// A sole identity column typed exactly `INTEGER` would be one, and a rowid
+    /// alias breaks the mirror twice over: it gets no automatic index, so the
+    /// index the creation path writes is an orphan the schema layer refuses to
+    /// reparse; and a NULL in it is handed a generated rowid instead of being
+    /// refused. `INT` has the same affinity and is not an alias.
+    fn declared_type<'a>(&self, idx: usize, column: &'a Column) -> &'a str {
+        let ty = if column.ty_str.is_empty() {
+            "TEXT"
+        } else {
+            column.ty_str.as_str()
+        };
+        let sole_identity = self.identity.as_slice() == [idx as u32];
+        if sole_identity && crate::util::type_from_name(ty).1 {
+            return "INT";
+        }
+        ty
     }
 }
 
@@ -149,10 +166,12 @@ impl MirrorSync {
     /// Restate a constraint violation on the mirror in terms of the source.
     ///
     /// The mirror carries exactly two constraints, both on the identity: the
-    /// columns are `NOT NULL` and together they are the `PRIMARY KEY`. Each
-    /// means a different broken promise by the driver and has a different fix,
-    /// so they are reported apart. Anything else cannot arise, and is passed
-    /// through rather than guessed at.
+    /// columns are `NOT NULL` and together they are the `PRIMARY KEY`. Both are
+    /// always enforced, including for a single `INTEGER` identity — which
+    /// [`MirrorSpec::declared_type`] keeps from becoming a rowid alias, where
+    /// neither would be. Each means a different broken promise by the driver and
+    /// has a different fix, so they are reported apart. Anything else cannot
+    /// arise, and is passed through rather than guessed at.
     pub fn identity_violation(&self, violation: LimboError) -> LimboError {
         let LimboError::Constraint(message) = &violation else {
             return violation;
@@ -660,6 +679,41 @@ mod tests {
             duplicate.to_string().contains("more than one row"),
             "{duplicate}"
         );
+    }
+
+    fn int_spec(identity: Vec<u32>) -> MirrorSpec {
+        MirrorSpec {
+            source_table: "msg_fdw".to_string(),
+            mirror_table: mirror_table_name("mv", "msg_fdw"),
+            columns: crate::alloc::vec![
+                col("id", "INTEGER"),
+                col("seq", "INTEGER"),
+                col("body", "TEXT")
+            ],
+            identity,
+        }
+    }
+
+    /// A lone `INTEGER PRIMARY KEY` would alias the rowid: no automatic index
+    /// for the creation path's index to match, and NULLs handed a rowid instead
+    /// of being refused.
+    #[test]
+    fn create_sql_keeps_a_single_integer_identity_off_the_rowid() {
+        let sql = int_spec(crate::alloc::vec![0]).create_sql();
+        assert!(sql.contains("id INT NOT NULL"), "{sql}");
+        assert!(sql.contains("PRIMARY KEY (id)"), "{sql}");
+        assert!(
+            sql.contains("seq INTEGER,"),
+            "only the identity moves: {sql}"
+        );
+    }
+
+    /// A composite primary key is never a rowid alias, so nothing needs doing.
+    #[test]
+    fn create_sql_leaves_composite_integer_identities_alone() {
+        let sql = int_spec(crate::alloc::vec![0, 1]).create_sql();
+        assert!(sql.contains("id INTEGER NOT NULL"), "{sql}");
+        assert!(sql.contains("seq INTEGER NOT NULL"), "{sql}");
     }
 
     #[test]
