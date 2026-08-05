@@ -1,5 +1,6 @@
 use super::compiler::{DbspCircuit, DbspCompiler, DeltaSet};
 use super::dbsp::{Delta, RowValues};
+use super::fdw_mirror::MirrorSync;
 use super::operator::ComputationTracker;
 use crate::numeric::Numeric;
 use crate::schema::{BTreeTable, Column, Schema, Table};
@@ -452,9 +453,10 @@ pub struct IncrementalView {
 
     // All tables referenced by this view (from FROM clause and JOINs)
     referenced_tables: Vec<ReferencedTable>,
-    // (mirror table, scan of the foreign table it shadows), one per redirected
-    // source. Empty for every view without an identity-declaring foreign source.
-    mirror_fills: Vec<(String, String)>,
+    // One per redirected source: the mirror and how to keep it in step with the
+    // foreign table it shadows. Empty for every view without an
+    // identity-declaring foreign source.
+    mirror_syncs: Vec<MirrorSync>,
     // Mapping from table aliases to actual table names (e.g., "c" -> "customers")
     table_aliases: HashMap<String, String>,
     // Mapping from table name to fully qualified name (e.g., "customers" -> "main.customers")
@@ -620,7 +622,7 @@ impl IncrementalView {
             &mut table_conditions,
         )?;
 
-        let mirror_fills = Self::redirect_foreign_sources_to_mirrors(
+        let mirror_syncs = Self::redirect_foreign_sources_to_mirrors(
             &name,
             &mut select,
             schema,
@@ -671,7 +673,7 @@ impl IncrementalView {
             order_by,
             limit,
         )?;
-        view.mirror_fills = mirror_fills;
+        view.mirror_syncs = mirror_syncs;
         Ok(view)
     }
 
@@ -696,7 +698,7 @@ impl IncrementalView {
         table_aliases: &mut HashMap<String, String>,
         qualified_table_names: &mut HashMap<String, String>,
         table_conditions: &mut HashMap<String, Vec<Option<ast::Expr>>>,
-    ) -> Result<Vec<(String, String)>> {
+    ) -> Result<Vec<MirrorSync>> {
         let source_names: Vec<String> = referenced_tables.iter().map(|t| t.name.clone()).collect();
         let specs = crate::incremental::fdw_mirror::mirror_specs_for_view(
             view_name,
@@ -718,7 +720,7 @@ impl IncrementalView {
             table_conditions,
         )?;
 
-        let mut mirror_fills = Vec::with_capacity(specs.len());
+        let mut mirror_syncs = Vec::with_capacity(specs.len());
         let mut redirects = HashMap::default();
         for spec in &specs {
             if schema.get_table(&spec.mirror_table).is_none() {
@@ -734,7 +736,7 @@ impl IncrementalView {
                 .iter()
                 .position(|t| t.name == spec.source_table)
                 .expect("mirror specs are built from referenced_tables");
-            mirror_fills.push((spec.mirror_table.clone(), source_scans[position].clone()));
+            mirror_syncs.push(MirrorSync::new(spec, source_scans[position].clone()));
             redirects.insert(spec.source_table.clone(), spec.mirror_table.clone());
         }
 
@@ -753,7 +755,7 @@ impl IncrementalView {
             table_conditions,
         )?;
 
-        Ok(mirror_fills)
+        Ok(mirror_syncs)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -827,7 +829,7 @@ impl IncrementalView {
             select_stmt,
             circuit,
             referenced_tables,
-            mirror_fills: Vec::new(),
+            mirror_syncs: Vec::new(),
             table_aliases,
             qualified_table_names,
             table_conditions,
@@ -1277,14 +1279,14 @@ impl IncrementalView {
         )
     }
 
-    /// Each mirror this view reads, paired with the scan that fills it from the
-    /// foreign table it shadows.
+    /// Every mirror this view reads, each carrying the scan that keeps it in
+    /// step with the foreign table it shadows.
     ///
     /// The scan is the one the view itself would have run against the foreign
     /// table, so a mirror holds the view's predicate-scoped subset of the
     /// foreign rows and nothing wider.
-    pub(crate) fn mirror_fills(&self) -> &[(String, String)] {
-        &self.mirror_fills
+    pub(crate) fn mirror_syncs(&self) -> &[MirrorSync] {
+        &self.mirror_syncs
     }
 
     pub fn generate_populate_queries(
@@ -3963,13 +3965,14 @@ mod fdw_mirror_redirect_tests {
         )
         .unwrap();
 
+        let syncs = view.mirror_syncs();
+        assert_eq!(syncs.len(), 1);
+        assert_eq!(syncs[0].mirror_table, MIRROR);
         assert_eq!(
-            view.mirror_fills(),
-            &[(
-                MIRROR.to_string(),
-                "SELECT * FROM msg_fdw WHERE session_id = 's1'".to_string()
-            )]
+            syncs[0].scan_query,
+            "SELECT * FROM msg_fdw WHERE session_id = 's1'"
         );
+        assert_eq!(syncs[0].identity, crate::alloc::vec![0]);
     }
 
     /// A missing mirror is a broken view, never a silent fall back to

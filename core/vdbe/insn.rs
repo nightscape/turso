@@ -1681,6 +1681,14 @@ pub enum Insn {
         cursors: Vec<(String, usize)>,
     },
 
+    /// Sync a materialized view's FDW mirrors incrementally, so the resulting
+    /// deltas maintain the view at commit. Only emitted for a view whose every
+    /// source is mirrored; the view's own btree and DBSP state are left alone.
+    SyncFdwMirrors {
+        /// The view whose mirrors to sync
+        view_name: String,
+    },
+
     /// Place the result of lhs >> rhs in dest register.
     ShiftRight {
         lhs: usize,
@@ -2303,6 +2311,7 @@ impl InsnVariants {
             InsnVariants::IsNull => execute::op_is_null,
             InsnVariants::ParseSchema => execute::op_parse_schema,
             InsnVariants::PopulateMaterializedViews => execute::op_populate_materialized_views,
+            InsnVariants::SyncFdwMirrors => execute::op_sync_fdw_mirrors,
             InsnVariants::ShiftRight => execute::op_shift_right,
             InsnVariants::ShiftLeft => execute::op_shift_left,
             InsnVariants::AddImm => execute::op_add_imm,
@@ -2422,6 +2431,7 @@ impl Insn {
             | Self::AddType { .. }
             | Self::ParseSchema { .. }
             | Self::PopulateMaterializedViews { .. }
+            | Self::SyncFdwMirrors { .. }
             | Self::SetCookie { .. }
             | Self::RenameTable { .. }
             | Self::DropColumn { .. }

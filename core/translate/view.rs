@@ -65,6 +65,12 @@ fn validate_materialized(
 /// is garbage — from a crash between deleting the view's schema row and
 /// dropping its mirror. Left in place it makes the name collide and CREATE
 /// fails forever.
+///
+/// The btrees are destroyed by root page read here at translate time, while
+/// their schema rows are deleted by a run-time scan. That asymmetry is safe for
+/// the same reason it is in the DBSP state table's teardown, which this
+/// mirrors: a schema change between prepare and step reprepares the statement,
+/// so a root page read here cannot go stale under the program that uses it.
 fn emit_drop_orphaned_fdw_mirrors(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -781,6 +787,24 @@ pub fn translate_refresh_materialized_view(
         root_page: root_page.into(),
         db: database_id,
     });
+
+    // A view with a mirrored source is refreshed by syncing its mirrors: the
+    // sync's deltas maintain the view through the ordinary commit path, so
+    // clearing and rebuilding it as well would apply every surviving row twice.
+    // Any local sources it also reads need no attention here — their changes
+    // are already incremental. The cursor above is still opened, so this path
+    // declares its write intent exactly as the rebuild path does.
+    let is_mirror_fed = resolver.with_schema(database_id, |s| {
+        s.get_materialized_view(&normalized_view_name)
+            .is_some_and(|view| !view.lock().mirror_syncs().is_empty())
+    });
+    if is_mirror_fed {
+        program.emit_insn(Insn::SyncFdwMirrors {
+            view_name: normalized_view_name,
+        });
+        program.epilogue(resolver.schema());
+        return Ok(());
+    }
 
     // Clear matview data
     emit_clear_btree(program, view_cursor_id, &normalized_view_name);

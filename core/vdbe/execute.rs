@@ -14979,69 +14979,78 @@ fn drive_init_cdc_version(
     }
 }
 
-/// The statements that rebuild one mirror from its source scan.
-///
-/// The clear precedes the fill because REFRESH re-enters this path against a
-/// mirror that is already full, where re-inserting would collide on the
-/// identity index. It is expressed as DML rather than a btree wipe so that
-/// index is maintained along with the table.
-fn mirror_rebuild_sql(mirror: &str, scan_query: &str) -> [String; 2] {
-    let ident = turso_parser::ast::Name::exact(mirror.to_string()).as_ident();
-    [
-        format!("DELETE FROM {ident}"),
-        // A mirror's columns are the foreign table's columns in order, so the
-        // scan's `SELECT *` aligns positionally.
-        format!("INSERT INTO {ident} {scan_query}"),
-    ]
+/// How a view's mirrors are being brought in line with their foreign sources.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MirrorSyncMode {
+    /// Discard and refill. The view is rebuilt from scratch alongside, so the
+    /// DML's deltas are redundant and are dropped.
+    Rebuild,
+    /// Touch only what differs. The DML's deltas ARE the maintenance — nothing
+    /// else updates the view — so they must survive to commit.
+    Sweep,
 }
 
-/// Rebuild every not-yet-rebuilt FDW mirror of `view_name` from the scan its
-/// view will run, so the mirror records exactly the foreign rows the view was
-/// built from.
+/// Bring every not-yet-synced FDW mirror of `view_name` in line with its
+/// foreign source.
 ///
 /// The inner statements run nested for the same reason
 /// `IncrementalView::populate_from_table` does: they must join the enclosing
-/// DDL transaction rather than commit its dirty pages. The counter is balanced
-/// on every exit, I/O yields included.
-fn populate_fdw_mirrors(
+/// statement's transaction rather than commit its dirty pages. Running nested
+/// is also what permits DML on an internal table at all (`allow_user_dml`).
+/// The counter is balanced on every exit, I/O yields included.
+fn sync_fdw_mirrors(
     conn: &Arc<Connection>,
     state: &mut ProgramState,
     view_name: &str,
+    mode: MirrorSyncMode,
 ) -> Result<IOResult<()>> {
     conn.start_nested();
-    let result = populate_fdw_mirrors_inner(conn, state, view_name);
+    let result = sync_fdw_mirrors_inner(conn, state, view_name, mode);
     conn.end_nested();
     result
 }
 
-fn populate_fdw_mirrors_inner(
+fn sync_fdw_mirrors_inner(
     conn: &Arc<Connection>,
     state: &mut ProgramState,
     view_name: &str,
+    mode: MirrorSyncMode,
 ) -> Result<IOResult<()>> {
-    let mirror_work: Vec<(String, String)> = {
+    // (mirror, the statements that sync it), in the view's own fixed order so
+    // re-entry after a yield walks the same sequence.
+    let mirror_work: Vec<(String, Vec<String>)> = {
         let schema = conn.schema.read();
         match schema.get_materialized_view(view_name) {
             None => Vec::new(),
-            Some(view) => view.lock().mirror_fills().to_vec(),
+            Some(view) => view
+                .lock()
+                .mirror_syncs()
+                .iter()
+                .map(|sync| {
+                    let sql = match mode {
+                        MirrorSyncMode::Rebuild => sync.rebuild_sql(),
+                        MirrorSyncMode::Sweep => sync.sweep_sql(),
+                    };
+                    (sync.mirror_table.clone(), sql)
+                })
+                .collect(),
         }
     };
     if mirror_work.is_empty() {
         return Ok(IOResult::Done(()));
     }
 
-    for (mirror, scan_query) in mirror_work {
-        if state.fdw_mirror_populate.done.contains(&mirror) {
+    for (mirror, sql) in mirror_work {
+        if state.fdw_mirror_sync.done.contains(&mirror) {
             continue;
         }
-        let sql = mirror_rebuild_sql(&mirror, &scan_query);
-        // The opcode restarts at its first view after every yield, so the first
-        // unrebuilt mirror it reaches is always the one it left in flight.
-        let (mut phase, mut stmt) = match state.fdw_mirror_populate.in_flight.take() {
+        // The opcode restarts at its first mirror after every yield, so the
+        // first unsynced mirror it reaches is always the one it left in flight.
+        let (mut phase, mut stmt) = match state.fdw_mirror_sync.in_flight.take() {
             Some((in_flight_mirror, phase, stmt)) => {
                 turso_assert!(
                     in_flight_mirror == mirror,
-                    "in-flight mirror {in_flight_mirror} is not the first unrebuilt one ({mirror})"
+                    "in-flight mirror {in_flight_mirror} is not the first unsynced one ({mirror})"
                 );
                 (phase, stmt)
             }
@@ -15056,30 +15065,56 @@ fn populate_fdw_mirrors_inner(
                     match sql.get(phase) {
                         Some(next) => stmt = Box::new(conn.prepare(next)?),
                         None => {
-                            state.fdw_mirror_populate.done.insert(mirror);
+                            state.fdw_mirror_sync.done.insert(mirror);
                             break;
                         }
                     }
                 }
                 StepResult::IO | StepResult::Yield => {
-                    state.fdw_mirror_populate.in_flight = Some((mirror, phase, stmt));
+                    state.fdw_mirror_sync.in_flight = Some((mirror, phase, stmt));
                     return Ok(IOResult::IO(crate::types::IOCompletions(
                         crate::io::Completion::new_yield(),
                     )));
                 }
                 StepResult::Interrupt | StepResult::Busy => {
-                    state.fdw_mirror_populate.in_flight = Some((mirror, phase, stmt));
+                    state.fdw_mirror_sync.in_flight = Some((mirror, phase, stmt));
                     return Err(LimboError::Busy);
                 }
             }
         }
     }
 
-    // The rebuild is initial state, not a change: `populate_from_table` is
-    // about to read these same rows and build the view from scratch. Applying
-    // the rebuild's deltas at commit as well would count every row twice.
-    conn.view_transaction_states.remove(view_name);
+    // The divergence between the two modes, and the only place it exists.
+    if mode == MirrorSyncMode::Rebuild {
+        // A rebuild is initial state, not a change: `populate_from_table` is
+        // about to read these same rows and build the view from scratch.
+        // Applying the rebuild's deltas at commit as well would count every row
+        // twice. A sweep must never reach here — its deltas are the whole
+        // mechanism, and dropping them would leave the view frozen.
+        conn.view_transaction_states.remove(view_name);
+    }
     Ok(IOResult::Done(()))
+}
+
+/// Sync a view's mirrors incrementally, leaving the resulting deltas to update
+/// the view at commit. This is `REFRESH MATERIALIZED VIEW` for a view whose
+/// sources are all mirrored.
+pub fn op_sync_fdw_mirrors(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(SyncFdwMirrors { view_name }, insn);
+    let conn = program.connection.clone();
+    return_if_io!(sync_fdw_mirrors(
+        &conn,
+        state,
+        view_name,
+        MirrorSyncMode::Sweep
+    ));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
 }
 
 pub fn op_populate_materialized_views(
@@ -15123,7 +15158,12 @@ pub fn op_populate_materialized_views(
         // A view's mirrors are filled before the view reads its sources, so a
         // mirror is a faithful record of the foreign rows the view was built
         // from and later syncs have something to diff against.
-        return_if_io!(populate_fdw_mirrors(&conn, state, &view_name));
+        return_if_io!(sync_fdw_mirrors(
+            &conn,
+            state,
+            &view_name,
+            MirrorSyncMode::Rebuild
+        ));
 
         let schema = conn.schema.read();
         if let Some(view) = schema.get_materialized_view(&view_name) {

@@ -121,17 +121,17 @@ pub enum ViewDeltaCommitState {
     Done,
 }
 
-/// Progress of the rebuild of a view's FDW mirrors, which spans the I/O yields
-/// of `Insn::PopulateMaterializedViews`.
+/// Progress of a view's FDW mirror sync, which spans the I/O yields of
+/// `Insn::PopulateMaterializedViews` and `Insn::SyncFdwMirrors`.
 ///
-/// The opcode restarts from its first view on every re-entry, so `done` is what
-/// keeps an already-rebuilt mirror from being cleared and refilled twice.
+/// The opcode restarts from its first mirror on every re-entry, so `done` is
+/// what keeps an already-synced mirror from being written twice.
 #[derive(Default)]
-pub(crate) struct FdwMirrorPopulateState {
-    /// Mirrors already rebuilt during this program run.
+pub(crate) struct FdwMirrorSyncState {
+    /// Mirrors already synced during this program run.
     pub(crate) done: std::collections::HashSet<String>,
-    /// The in-flight statement and its index in that mirror's rebuild
-    /// sequence, preserved across I/O yields.
+    /// The in-flight statement and its index in that mirror's sync sequence,
+    /// preserved across I/O yields.
     pub(crate) in_flight: Option<(String, usize, Box<Statement>)>,
 }
 
@@ -865,8 +865,8 @@ pub struct ProgramState {
     op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
-    /// Progress of the initial fill of FDW mirrors, across I/O yields
-    pub(crate) fdw_mirror_populate: FdwMirrorPopulateState,
+    /// Progress of the FDW mirror sync, across I/O yields
+    pub(crate) fdw_mirror_sync: FdwMirrorSyncState,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     pub(crate) auto_txn_cleanup: TxnCleanup,
@@ -985,7 +985,7 @@ impl ProgramState {
             distinct_key_values: Vec::new(),
             op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
-            fdw_mirror_populate: FdwMirrorPopulateState::default(),
+            fdw_mirror_sync: FdwMirrorSyncState::default(),
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
@@ -1134,7 +1134,7 @@ impl ProgramState {
         self.sequence_inner_commit = None;
         self.op_vacuum_state = VacuumOpState::None;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
-        self.fdw_mirror_populate = FdwMirrorPopulateState::default();
+        self.fdw_mirror_sync = FdwMirrorSyncState::default();
         self.auto_txn_cleanup = TxnCleanup::None;
         self.fk_immediate_violations_during_stmt
             .store(0, Ordering::SeqCst);
