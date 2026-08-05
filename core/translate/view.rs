@@ -277,6 +277,14 @@ pub fn translate_create_materialized_view(
     connection: Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
+    // MVCC hands out negative, non-checkpointed root pages. The IVM cursors read
+    // the matview and DBSP btrees through the pager, which rejects those, and the
+    // negative root persisted in sqlite_schema makes the file fail to reopen at
+    // all. Refuse before touching anything rather than write an unopenable file.
+    if connection.mvcc_enabled() {
+        crate::bail_parse_error!("Materialized views are not supported in MVCC mode");
+    }
+
     let database_id = resolver.resolve_database_id(view_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
