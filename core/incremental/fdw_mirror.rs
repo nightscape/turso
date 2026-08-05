@@ -255,41 +255,84 @@ impl MirrorSync {
         let identity = self.identity_list();
         let scan = &self.scan_query;
 
-        let changed = self.non_identity_columns();
-        // `WHERE true` disambiguates `ON CONFLICT` from a SELECT's own tail.
-        let upsert = if changed.is_empty() {
-            // Nothing to update: the row *is* its identity.
-            format!("INSERT INTO {table} SELECT * FROM ({scan}) WHERE true ON CONFLICT({identity}) DO NOTHING")
-        } else {
-            let assignments = changed
-                .iter()
-                .map(|c| {
-                    let c = Self::ident(c);
-                    format!("{c} = excluded.{c}")
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            // `IS NOT` rather than `<>` so a NULL on either side compares.
-            let differs = changed
-                .iter()
-                .map(|c| {
-                    let c = Self::ident(c);
-                    format!("{table}.{c} IS NOT excluded.{c}")
-                })
-                .collect::<Vec<_>>()
-                .join(" OR ");
-            format!(
-                "INSERT INTO {table} SELECT * FROM ({scan}) WHERE true \
-                 ON CONFLICT({identity}) DO UPDATE SET {assignments} WHERE {differs}"
-            )
-        };
-
         crate::alloc::vec![
-            upsert,
+            // `WHERE true` disambiguates `ON CONFLICT` from a SELECT's own tail.
+            format!(
+                "INSERT INTO {table} SELECT * FROM ({scan}) WHERE true {}",
+                self.upsert_tail()
+            ),
             format!(
                 "DELETE FROM {table} WHERE ({identity}) NOT IN (SELECT {identity} FROM ({scan}))"
             ),
         ]
+    }
+
+    /// The `ON CONFLICT` clause that makes an insert of an already-mirrored
+    /// identity land on the row it already has.
+    ///
+    /// Two things ride on it and both are why the sweep and a push must share
+    /// it: the row keeps its rowid, so a later retraction carries the identity
+    /// its insertion had; and the update is guarded by a value comparison, so a
+    /// row that did not actually change produces no DML and therefore no delta.
+    fn upsert_tail(&self) -> String {
+        let identity = self.identity_list();
+        let changed = self.non_identity_columns();
+        if changed.is_empty() {
+            // Nothing to update: the row *is* its identity.
+            return format!("ON CONFLICT({identity}) DO NOTHING");
+        }
+        let table = self.table_ident();
+        let assignments = changed
+            .iter()
+            .map(|c| {
+                let c = Self::ident(c);
+                format!("{c} = excluded.{c}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        // `IS NOT` rather than `<>` so a NULL on either side compares.
+        let differs = changed
+            .iter()
+            .map(|c| {
+                let c = Self::ident(c);
+                format!("{table}.{c} IS NOT excluded.{c}")
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        format!("ON CONFLICT({identity}) DO UPDATE SET {assignments} WHERE {differs}")
+    }
+
+    /// Applies one pushed row. Takes one parameter per mirror column, in
+    /// declaration order.
+    ///
+    /// A push may carry a row the view's predicate excludes: the mirror is
+    /// scoped by that predicate but the compiled circuit re-applies it anyway,
+    /// so an over-approximating push costs storage, never correctness.
+    pub fn push_upsert_sql(&self) -> String {
+        let params = (1..=self.columns.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "INSERT INTO {} VALUES ({params}) {}",
+            self.table_ident(),
+            self.upsert_tail()
+        )
+    }
+
+    /// Retracts one pushed row. Takes one parameter per identity column, in
+    /// identity order.
+    pub fn push_delete_sql(&self) -> String {
+        let predicate = self
+            .identity
+            .iter()
+            .enumerate()
+            .map(|(param, column)| {
+                format!("{} = ?{}", Self::ident(&self.columns[*column]), param + 1)
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        format!("DELETE FROM {} WHERE {predicate}", self.table_ident())
     }
 }
 
@@ -559,6 +602,29 @@ mod tests {
         let sql = sync(crate::alloc::vec![0]).rebuild_sql();
         assert!(sql[0].starts_with("DELETE FROM"), "{}", sql[0]);
         assert!(sql[1].starts_with("INSERT INTO"), "{}", sql[1]);
+    }
+
+    /// A push must land on the row the sweep would have landed on, or its
+    /// retraction would carry a different identity than its insertion.
+    #[test]
+    fn push_upsert_shares_the_sweeps_conflict_handling() {
+        let sync = sync(crate::alloc::vec![0]);
+        let push = sync.push_upsert_sql();
+        let sweep = &sync.sweep_sql()[0];
+        let tail = "ON CONFLICT(uuid) DO UPDATE SET";
+        let (_, push_tail) = push.split_once(tail).expect("{push}");
+        let (_, sweep_tail) = sweep.split_once(tail).expect("{sweep}");
+        assert_eq!(push_tail, sweep_tail);
+        assert!(push.contains("VALUES (?1, ?2, ?3)"), "{push}");
+    }
+
+    #[test]
+    fn push_delete_keys_on_every_identity_column() {
+        let sql = sync(crate::alloc::vec![1, 0]).push_delete_sql();
+        assert!(
+            sql.ends_with("WHERE session_id = ?1 AND uuid = ?2"),
+            "{sql}"
+        );
     }
 
     #[test]
