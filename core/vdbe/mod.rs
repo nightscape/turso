@@ -161,6 +161,19 @@ pub(crate) fn step_view_delta_batch(
                     return Ok(IOResult::Done(()));
                 }
 
+                // View maintenance writes the view btrees through the pager, but an
+                // MVCC commit persists only MV-store state, so the maintenance would
+                // be served to this session and then silently dropped. Checked here
+                // rather than at translate time because a journal-mode switch does
+                // not bump the schema cookie, so a statement prepared under WAL is
+                // never reprepared.
+                if connection.mv_store_for_db(crate::MAIN_DB_ID).is_some() {
+                    return Err(LimboError::InternalError(
+                        "Materialized views are not supported in MVCC mode: cannot modify a table with dependent materialized views"
+                            .to_string(),
+                    ));
+                }
+
                 let schema = connection.schema.read();
                 let views = schema.materialized_view_maintenance_order(
                     NamespaceId::ROOT,
