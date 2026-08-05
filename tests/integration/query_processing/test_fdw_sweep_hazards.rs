@@ -7,6 +7,7 @@
 //! input delta carrying an insert, an update and a delete at once.
 
 use crate::common::{self, ExecRows, TempDatabase};
+use crate::query_processing::fdw_test_driver::MemFdw;
 use std::sync::{Arc, Mutex};
 use turso_core::foreign::{ForeignCursor, ForeignDataWrapper, KeyColumn, PushedConstraint};
 use turso_core::{Connection, Numeric, Value};
@@ -222,18 +223,12 @@ fn test_duplicate_identity_is_refused_at_create(tmp_db: TempDatabase) -> anyhow:
 /// The same lie told later: the source is fine at CREATE and repeats an
 /// identity only at REFRESH.
 ///
-/// OPEN — the sweep does not refuse it. Its `ON CONFLICT … DO UPDATE` treats
-/// the second row as an update of the first, so duplicates collapse in
-/// silence, while the same source at CREATE is refused outright. Detecting it
-/// needs the scan's row count against its distinct-identity count, and
-/// `test_scan_named_once_and_read_twice` measures that a scan read twice is
-/// scanned twice, and `test_scan_row_count_metric_is_pre_predicate` measures
-/// that the one counter that could have substituted for the second read counts
-/// rows before the predicate filters them. So the check costs a third scan of
-/// the foreign source per REFRESH. That is a cost/diagnosability trade to rule
-/// on, not a bug to quietly fix.
+/// CREATE and REFRESH answer this alike, which costs the sweep a third scan of
+/// the source: the check needs the scan's row count against its
+/// distinct-identity count, and `test_scan_named_once_and_read_twice` shows a
+/// scan named once and read twice is scanned twice, so it cannot ride along on
+/// the two the sweep already pays.
 #[turso_macros::test(views)]
-#[ignore = "OPEN: sweep collapses duplicate identities silently; refusing costs a third foreign scan"]
 fn test_duplicate_identity_is_refused_at_refresh(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     let store = register(&conn, "msg_dup2", vec![row("d1", "g1", 1)]);
@@ -261,6 +256,127 @@ fn test_duplicate_identity_is_refused_at_refresh(tmp_db: TempDatabase) -> anyhow
     // last good sweep left.
     let rows: Vec<(String, i64)> = conn.exec_rows("SELECT uuid, val FROM mv_dup2");
     assert_eq!(rows, vec![("d1".to_string(), 1)]);
+    Ok(())
+}
+
+/// A composite identity repeated at REFRESH must be refused too.
+///
+/// SQLite has no `count(DISTINCT a, b)`, so the check cannot be written the
+/// obvious way for more than one column, and a form that works for one is no
+/// evidence it works for two.
+#[turso_macros::test(views)]
+fn test_composite_duplicate_identity_is_refused_at_refresh(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let (fdw, rows) = MemFdw::new(
+        "CREATE TABLE msg_pair(session_id TEXT, uuid TEXT, body TEXT)",
+        vec![0, 1],
+    );
+    rows.set(vec![
+        pair_row("s1", "u1", "one"),
+        pair_row("s2", "u1", "two"),
+    ]);
+    conn.register_foreign_table("msg_pair", fdw)?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_pair AS SELECT session_id, uuid, body FROM msg_pair",
+    )?;
+
+    // Neither column repeats on its own; only the pair does.
+    rows.set(vec![
+        pair_row("s1", "u1", "one"),
+        pair_row("s2", "u1", "two"),
+        pair_row("s1", "u1", "again"),
+    ]);
+    let err = common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_pair")
+        .expect_err("a repeated composite identity must be refused");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("msg_pair") && message.contains("session_id") && message.contains("uuid"),
+        "the error must name the foreign table and both identity columns: {message}"
+    );
+    assert!(
+        message.contains("more than one row"),
+        "a repeated composite identity is a duplicate: {message}"
+    );
+    Ok(())
+}
+
+fn pair_row(session: &str, uuid: &str, body: &str) -> Vec<Value> {
+    vec![
+        Value::build_text(session.to_string()),
+        Value::build_text(uuid.to_string()),
+        Value::build_text(body.to_string()),
+    ]
+}
+
+/// A refused REFRESH must have written nothing: the check runs before the
+/// sweep's first statement, so the mirror keeps not just its contents but the
+/// rowids those contents sit on — the identities every later retraction is
+/// carried by. And the refusal is not terminal: the same view syncs normally
+/// once the source stops lying.
+#[turso_macros::test(views)]
+fn test_refused_refresh_leaves_the_mirror_and_the_view_untouched(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let store = register(
+        &conn,
+        "msg_intact",
+        vec![row("i1", "g1", 1), row("i2", "g1", 2)],
+    );
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_intact AS SELECT uuid, val FROM msg_intact",
+    )?;
+
+    let mirror = "__turso_internal_fdw_mirror_v1_mv_intact__msg_intact";
+    let mirror_state = |conn: &Arc<Connection>| -> Vec<(i64, String, i64)> {
+        conn.exec_rows(&format!(
+            "SELECT rowid, uuid, val FROM \"{mirror}\" ORDER BY uuid"
+        ))
+    };
+    let view_state = |conn: &Arc<Connection>| -> Vec<(String, i64)> {
+        conn.exec_rows("SELECT uuid, val FROM mv_intact ORDER BY uuid")
+    };
+
+    let mirror_before = mirror_state(&conn);
+    let view_before = view_state(&conn);
+    assert_eq!(view_before.len(), 2, "{view_before:?}");
+
+    // A duplicate plus a genuine change, so a sweep that got as far as its
+    // upsert would leave visible damage.
+    *store.lock().unwrap() = vec![
+        row("i1", "g1", 100),
+        row("i2", "g1", 2),
+        row("i1", "g1", 200),
+    ];
+    common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_intact")
+        .expect_err("a sweep over a source repeating an identity must be refused");
+
+    assert_eq!(
+        mirror_state(&conn),
+        mirror_before,
+        "a refused sweep must not have written the mirror, rowids included"
+    );
+    assert_eq!(
+        view_state(&conn),
+        view_before,
+        "a refused sweep must not have moved the view"
+    );
+
+    // The corrected source sweeps normally, so the refusal cost nothing but the
+    // scan.
+    *store.lock().unwrap() = vec![row("i1", "g1", 100), row("i2", "g1", 2)];
+    common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_intact")?;
+    assert_eq!(
+        view_state(&conn),
+        vec![("i1".to_string(), 100), ("i2".to_string(), 2)]
+    );
     Ok(())
 }
 
