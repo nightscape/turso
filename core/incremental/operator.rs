@@ -232,6 +232,13 @@ pub trait IncrementalOperator: Debug + Send + Any {
     /// The cursors parameter is for operators that need to persist state
     fn commit(&mut self, deltas: DeltaPair, cursors: &mut DbspStateCursors) -> IOResultOr<Delta>;
 
+    /// Throw away the progress of a `commit` that ended in an error, so the
+    /// next one starts from its own input. An error aborts the statement and
+    /// rolls its writes back; resuming would replay a delta against state the
+    /// database no longer holds. Operators that keep no commit state across
+    /// calls need do nothing.
+    fn discard_in_flight_commit(&mut self) {}
+
     /// Set computation tracker
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>);
 

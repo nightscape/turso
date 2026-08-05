@@ -2411,6 +2411,10 @@ impl IncrementalOperator for AggregateOperator {
         }
     }
 
+    fn discard_in_flight_commit(&mut self) {
+        self.commit_state = AggregateCommitState::Idle;
+    }
+
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
         self.tracker = Some(tracker);
     }
