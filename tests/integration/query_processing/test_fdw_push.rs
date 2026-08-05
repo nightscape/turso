@@ -256,6 +256,122 @@ fn test_push_is_all_or_nothing_to_a_concurrent_reader(tmp_db: TempDatabase) -> a
     Ok(())
 }
 
+/// A batch that fails partway through inside a transaction the caller opened
+/// must leave none of itself behind — the same all-or-nothing the engine gives
+/// a batch it owns the transaction for. The caller's own transaction survives:
+/// the failure retracts the batch, not the work the caller had already done and
+/// not its ability to keep going.
+#[turso_macros::test(views)]
+fn test_failed_push_inside_a_caller_transaction_applies_nothing(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let fdw = setup(&tmp_db, &conn, "mv_push_atomic_txn", vec![row("m1", "one")])?;
+    let stream = turso_core::foreign::StreamingForeignData::subscribe(fdw.as_ref(), &[])?;
+    common::run_query(&tmp_db, &conn, "CREATE TABLE local_notes (n TEXT)")?;
+
+    // Good, then a row whose declared identity is NULL, then good again: the
+    // batch fails in the middle with rows applied on either side of the failure.
+    fdw.push_raw(insert("m2", "two"));
+    fdw.push_raw(FdwChange {
+        values: vec![Value::Null, text("bad")],
+        weight: 1,
+    });
+    fdw.push_raw(insert("m3", "three"));
+
+    common::run_query(&tmp_db, &conn, "BEGIN")?;
+    common::run_query(&tmp_db, &conn, "INSERT INTO local_notes VALUES ('keepme')")?;
+    let failed = conn.drain_fdw_stream("msg_push", &stream);
+    assert!(failed.is_err(), "a NULL identity must fail the batch");
+
+    assert_eq!(
+        view_rows(&conn, "mv_push_atomic_txn"),
+        vec![("m1".to_string(), "one".to_string())],
+        "a failed batch must leave none of itself in the open transaction"
+    );
+
+    // The caller's transaction is still its own: it can keep writing and commit.
+    common::run_query(&tmp_db, &conn, "INSERT INTO local_notes VALUES ('after')")?;
+    common::run_query(&tmp_db, &conn, "COMMIT")?;
+
+    let notes: Vec<(String,)> = conn.exec_rows("SELECT n FROM local_notes ORDER BY n");
+    assert_eq!(
+        notes,
+        vec![("after".to_string(),), ("keepme".to_string(),)],
+        "the caller's own writes must survive a failed push"
+    );
+    assert_eq!(
+        view_rows(&conn, "mv_push_atomic_txn"),
+        vec![("m1".to_string(), "one".to_string())],
+        "committing after a failed push must not persist half the batch"
+    );
+    Ok(())
+}
+
+/// A retraction carrying fewer values than the identity needs is a malformed
+/// push, and must be named as one. Indexing past the end of the payload is not
+/// a diagnosis.
+#[turso_macros::test(views)]
+fn test_push_retraction_narrower_than_the_identity_is_refused(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let fdw = setup(&tmp_db, &conn, "mv_push_narrow_del", vec![row("m1", "one")])?;
+    let stream = turso_core::foreign::StreamingForeignData::subscribe(fdw.as_ref(), &[])?;
+
+    fdw.push_raw(FdwChange {
+        values: Vec::new(),
+        weight: -1,
+    });
+    let err = conn
+        .drain_fdw_stream("msg_push", &stream)
+        .expect_err("a retraction with no identity values must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("msg_push"),
+        "the error must name the foreign table: {msg}"
+    );
+
+    assert_eq!(
+        view_rows(&conn, "mv_push_narrow_del"),
+        vec![("m1".to_string(), "one".to_string())],
+        "a refused push must leave nothing behind"
+    );
+    Ok(())
+}
+
+/// An insert carrying fewer values than the mirror has columns is malformed
+/// too. Binding what arrived and letting the rest default to NULL would let a
+/// bad push fabricate cells the source never had.
+#[turso_macros::test(views)]
+fn test_push_insert_narrower_than_the_mirror_is_refused(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let fdw = setup(&tmp_db, &conn, "mv_push_narrow_ins", vec![row("m1", "one")])?;
+    let stream = turso_core::foreign::StreamingForeignData::subscribe(fdw.as_ref(), &[])?;
+
+    fdw.push_raw(FdwChange {
+        values: vec![text("m2")],
+        weight: 1,
+    });
+    let err = conn
+        .drain_fdw_stream("msg_push", &stream)
+        .expect_err("an insert narrower than the mirror must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("msg_push"),
+        "the error must name the foreign table: {msg}"
+    );
+
+    assert_eq!(
+        view_rows(&conn, "mv_push_narrow_ins"),
+        vec![("m1".to_string(), "one".to_string())],
+        "a malformed push must not reach the view with NULLs for what it omitted"
+    );
+    Ok(())
+}
+
 /// A push contending with a local writer takes the ordinary write lock: it is
 /// refused while the lock is held, and applies cleanly once it is released.
 /// Nothing about it is special-cased, which is the point — it is a writer like

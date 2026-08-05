@@ -78,6 +78,13 @@ impl MemFdw {
         self.rows.set(rows);
         self.changes.send(change).unwrap();
     }
+
+    /// Emit a change to the subscription without mirroring it into the rows a
+    /// rescan would return. Lets a case hand the engine a payload [`Self::push`]
+    /// could not represent — one whose width does not match the declared table.
+    pub fn push_raw(&self, change: FdwChange) {
+        self.changes.send(change).unwrap();
+    }
 }
 
 impl ForeignDataWrapper for MemFdw {
