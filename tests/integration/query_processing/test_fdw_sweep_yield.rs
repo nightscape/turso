@@ -71,6 +71,7 @@ impl ForeignCursor for SweepCursor {
     fn column(&self, idx: usize) -> turso_core::Result<Value> {
         let row = &self.rows[self.index];
         Ok(match idx {
+            0 if row.0 == NULL_UUID => Value::Null,
             0 => Value::build_text(row.0.clone()),
             1 => Value::build_text(row.1.clone()),
             2 => Value::build_text(row.2.clone()),
@@ -82,6 +83,10 @@ impl ForeignCursor for SweepCursor {
         self.index as i64
     }
 }
+
+/// A `uuid` this driver hands back as SQL NULL, so a scan can break the identity
+/// contract the only way a driver can.
+const NULL_UUID: &str = "<null>";
 
 fn rows_of(src: &[(&str, &str, &str)]) -> Vec<Row> {
     src.iter()
@@ -595,4 +600,240 @@ fn test_push_during_a_suspended_sweep_is_refused_then_applies() {
         "the sweep's result and the push must both be present, exactly once each"
     );
     assert_eq!(mirror.len(), 4, "{mirror:?}");
+}
+
+/// A source that repeats an identity, alongside a genuine change to another
+/// row: a sweep that got as far as its upsert would leave that change visible.
+const DUPLICATED: &[(&str, &str, &str)] = &[
+    ("m1", "s1", "one"),
+    ("m2", "s1", "CHANGED"),
+    ("m1", "s1", "dup"),
+];
+/// The same scan with the repeat removed — the change survives it, so a
+/// recovery sweep has something to prove.
+const REPAIRED: &[(&str, &str, &str)] = &[
+    ("m1", "s1", "one"),
+    ("m2", "s1", "CHANGED"),
+    ("m3", "s1", "three"),
+];
+/// A source whose driver returns NULL where it declared an identity.
+const NULLED: &[(&str, &str, &str)] = &[
+    ("m1", "s1", "one"),
+    (NULL_UUID, "s1", "orphan"),
+    ("m3", "s1", "three"),
+];
+
+/// The mirror down to the rowids its contents sit on — the identities every
+/// later retraction is carried by, and the part a contents-only comparison
+/// would miss.
+fn mirror_with_rowids(conn: &Arc<Connection>, io: &dyn IO) -> Vec<Vec<String>> {
+    as_strings(
+        &exec(
+            conn,
+            io,
+            &format!("SELECT rowid, uuid, session_id, body FROM \"{MIRROR}\" ORDER BY rowid"),
+        )
+        .unwrap(),
+    )
+}
+
+fn view_of(conn: &Arc<Connection>, io: &dyn IO) -> Vec<Vec<String>> {
+    as_strings(&exec(conn, io, "SELECT uuid, body FROM mv_yield ORDER BY uuid").unwrap())
+}
+
+fn expect_rows(rows: &[[&str; 2]]) -> Vec<Vec<String>> {
+    rows.iter()
+        .map(|r| r.iter().map(|s| s.to_string()).collect())
+        .collect()
+}
+
+fn repaired_view() -> Vec<Vec<String>> {
+    expect_rows(&[["m1", "one"], ["m2", "CHANGED"], ["m3", "three"]])
+}
+
+fn assert_duplicate_refusal(msg: &str, at: &str) {
+    assert!(msg.contains("msg_yield"), "{at}: {msg}");
+    assert!(msg.contains("uuid"), "{at}: {msg}");
+    assert!(msg.contains("more than one row"), "{at}: {msg}");
+    assert!(!msg.contains("__turso_internal"), "{at}: {msg}");
+}
+
+/// Count the suspensions `sql` has before it fails, and hand back the error.
+fn suspensions_before_failure(
+    conn: &Arc<Connection>,
+    io: &dyn IO,
+    sql: &str,
+) -> (usize, turso_core::LimboError) {
+    let mut count = 0usize;
+    let mut stmt = conn.prepare(sql).unwrap();
+    loop {
+        match stmt.step() {
+            Ok(StepResult::IO) | Ok(StepResult::Yield) => {
+                count += 1;
+                io.step().unwrap();
+            }
+            Ok(StepResult::Row) => {}
+            Ok(StepResult::Done) => panic!("the statement was not refused"),
+            Ok(other) => panic!("the statement did not complete: {other:?}"),
+            Err(err) => return (count, err),
+        }
+    }
+}
+
+/// A refused sweep reaches its verdict before its first suspension, so there is
+/// no yield schedule that can tear it: the guard is the sweep's first statement
+/// and answers out of the source scan alone.
+///
+/// The count is asserted rather than assumed, because it is the whole reason the
+/// refusal needs no per-boundary reasoning. If the guard ever grows IO of its
+/// own — a spilled sorter, a mirror read — this is what says the reasoning has
+/// to be redone.
+#[test]
+fn test_a_refused_sweep_refuses_before_its_first_yield() {
+    let io = Arc::new(MemoryYieldIO::new()) as Arc<dyn IO>;
+    let source = Arc::new(Mutex::new(rows_of(INITIAL)));
+    let conn = setup(io.clone(), "sweep_refuse_boundaries.db", &source);
+
+    let mirror_before = mirror_with_rowids(&conn, io.as_ref());
+    let view_before = view_of(&conn, io.as_ref());
+    assert_eq!(view_before.len(), 3, "{view_before:?}");
+
+    *source.lock().unwrap() = rows_of(DUPLICATED);
+    let (boundaries, err) =
+        suspensions_before_failure(&conn, io.as_ref(), "REFRESH MATERIALIZED VIEW mv_yield");
+    assert_duplicate_refusal(&err.to_string(), "under yields");
+    assert_eq!(
+        boundaries, 0,
+        "the guard now suspends before refusing; every boundary needs covering"
+    );
+
+    assert_eq!(
+        mirror_with_rowids(&conn, io.as_ref()),
+        mirror_before,
+        "the refusal wrote the mirror"
+    );
+    assert_eq!(
+        view_of(&conn, io.as_ref()),
+        view_before,
+        "the refusal moved the view"
+    );
+    let (_, _, cdc) = observe(&conn, io.as_ref());
+    assert_eq!(cdc, 0, "a refused sweep wrote mirror rows");
+
+    *source.lock().unwrap() = rows_of(REPAIRED);
+    exec(&conn, io.as_ref(), "REFRESH MATERIALIZED VIEW mv_yield").unwrap();
+    assert_eq!(view_of(&conn, io.as_ref()), repaired_view());
+}
+
+/// The refusal must cost the *next* sweep nothing, at every suspension that
+/// sweep has: a refused REFRESH leaves staged state behind on the connection if
+/// it leaves anything at all, and the recovery sweep is where that would show —
+/// abandoned at any of its boundaries, the one after it must still converge.
+#[test]
+fn test_recovery_after_a_refused_sweep_converges_at_every_yield() {
+    let boundaries = {
+        let io = Arc::new(MemoryYieldIO::new()) as Arc<dyn IO>;
+        let source = Arc::new(Mutex::new(rows_of(INITIAL)));
+        let conn = setup(io.clone(), "sweep_recover_probe.db", &source);
+        *source.lock().unwrap() = rows_of(DUPLICATED);
+        exec(&conn, io.as_ref(), "REFRESH MATERIALIZED VIEW mv_yield").unwrap_err();
+        *source.lock().unwrap() = rows_of(REPAIRED);
+        sweep_boundaries_on(&conn, io.as_ref())
+    };
+    assert!(boundaries > 0, "the recovery sweep performed no IO at all");
+
+    for target in 1..=boundaries {
+        let io = Arc::new(MemoryYieldIO::new()) as Arc<dyn IO>;
+        let source = Arc::new(Mutex::new(rows_of(INITIAL)));
+        let conn = setup(io.clone(), &format!("sweep_recover_{target}.db"), &source);
+
+        let mirror_before = mirror_with_rowids(&conn, io.as_ref());
+        let view_before = view_of(&conn, io.as_ref());
+
+        *source.lock().unwrap() = rows_of(DUPLICATED);
+        let err = exec(&conn, io.as_ref(), "REFRESH MATERIALIZED VIEW mv_yield")
+            .expect_err("a source repeating an identity must be refused");
+        assert_duplicate_refusal(&err.to_string(), &format!("before boundary {target}"));
+        assert_eq!(
+            mirror_with_rowids(&conn, io.as_ref()),
+            mirror_before,
+            "the refusal before boundary {target} wrote the mirror"
+        );
+        assert_eq!(
+            view_of(&conn, io.as_ref()),
+            view_before,
+            "the refusal before boundary {target} moved the view"
+        );
+
+        *source.lock().unwrap() = rows_of(REPAIRED);
+        exec_abandoning_at(
+            &conn,
+            io.as_ref(),
+            "REFRESH MATERIALIZED VIEW mv_yield",
+            target,
+        )
+        .unwrap();
+        exec(&conn, io.as_ref(), "REFRESH MATERIALIZED VIEW mv_yield").unwrap();
+        assert_eq!(
+            view_of(&conn, io.as_ref()),
+            repaired_view(),
+            "recovery abandoned at boundary {target} never converged"
+        );
+    }
+}
+
+/// How many suspensions the pending sweep on `conn` has.
+fn sweep_boundaries_on(conn: &Arc<Connection>, io: &dyn IO) -> usize {
+    let mut count = 0usize;
+    let mut stmt = conn.prepare("REFRESH MATERIALIZED VIEW mv_yield").unwrap();
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::IO | StepResult::Yield => {
+                count += 1;
+                io.step().unwrap();
+            }
+            StepResult::Row => {}
+            StepResult::Done => break,
+            other => panic!("sweep did not complete: {other:?}"),
+        }
+    }
+    count
+}
+
+/// The other broken promise, under the same yielding IO: a NULL identity is
+/// refused as a NULL, not as a duplicate, and costs the mirror nothing.
+#[test]
+fn test_null_identity_sweep_under_io_yields_is_refused_as_a_null() {
+    let io = Arc::new(MemoryYieldIO::new()) as Arc<dyn IO>;
+    let source = Arc::new(Mutex::new(rows_of(INITIAL)));
+    let conn = setup(io.clone(), "sweep_refuse_null.db", &source);
+
+    let mirror_before = mirror_with_rowids(&conn, io.as_ref());
+    let view_before = view_of(&conn, io.as_ref());
+
+    *source.lock().unwrap() = rows_of(NULLED);
+    let err = exec(&conn, io.as_ref(), "REFRESH MATERIALIZED VIEW mv_yield")
+        .expect_err("a NULL identity must be refused by the sweep");
+    let msg = err.to_string();
+    assert!(msg.contains("msg_yield"), "{msg}");
+    assert!(msg.to_lowercase().contains("null"), "{msg}");
+    assert!(
+        !msg.contains("more than one row"),
+        "a NULL identity is not a duplicate identity: {msg}"
+    );
+
+    assert_eq!(
+        mirror_with_rowids(&conn, io.as_ref()),
+        mirror_before,
+        "the NULL refusal wrote the mirror"
+    );
+    assert_eq!(
+        view_of(&conn, io.as_ref()),
+        view_before,
+        "the NULL refusal moved the view"
+    );
+
+    *source.lock().unwrap() = rows_of(REPAIRED);
+    exec(&conn, io.as_ref(), "REFRESH MATERIALIZED VIEW mv_yield").unwrap();
+    assert_eq!(view_of(&conn, io.as_ref()), repaired_view());
 }
