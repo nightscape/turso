@@ -15091,8 +15091,12 @@ fn sync_fdw_mirrors_inner(
             // name instead would name something the user never wrote.
             let step = stmt.step().map_err(|err| sync.identity_violation(err))?;
             match step {
-                // DML emits no rows; keep stepping.
-                StepResult::Row => {}
+                // Only the sweep's guard emits a row, and only to refuse the
+                // scan; every other sync statement is DML.
+                StepResult::Row => {
+                    let row = stmt.row().expect("a Row step carries a row");
+                    return Err(sync.guard_refusal(row.get::<&str>(0)?));
+                }
                 StepResult::Done => {
                     phase += 1;
                     match sql.get(phase) {
