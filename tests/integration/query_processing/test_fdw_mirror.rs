@@ -2,8 +2,9 @@
 //!
 //! A mirror is an internal btree shadowing the foreign rows a view reads. It
 //! exists only when the driver declares an identity, which is what makes a row
-//! recognisable across scans. These cases cover its creation and teardown; the
-//! view still reads the foreign table directly at this stage.
+//! recognisable across scans. The view reads the mirror rather than the foreign
+//! table, and `REFRESH` syncs the mirror instead of rebuilding the view, so
+//! only the rows that actually changed cost anything.
 
 use crate::common::{self, ExecRows, TempDatabase};
 use std::io::Write;
@@ -632,5 +633,377 @@ fn test_mirrored_view_keeps_user_alias(tmp_db: TempDatabase) -> anyhow::Result<(
     )?;
     let rows: Vec<(String, String)> = conn.exec_rows("SELECT uuid, body FROM mv_alias");
     assert_eq!(rows, vec![("m1".to_string(), "one".to_string())]);
+    Ok(())
+}
+
+/// Row-level CDC records recorded for `table`.
+///
+/// The filter on `table_name` is what makes this a sharp oracle: at this base
+/// every autocommit statement also writes a transaction-boundary COMMIT record
+/// (empty `table_name`) even when it captured nothing. That is fixed upstream
+/// by 4d1c058d ("translate: gate the CDC autocommit COMMIT record on captured
+/// changes"), which is not in this stream's base — drop the filter once it
+/// merges.
+fn cdc_row_records(conn: &std::sync::Arc<turso_core::Connection>, table: &str) -> i64 {
+    let rows: Vec<(i64,)> = conn.exec_rows(&format!(
+        "SELECT count(*) FROM turso_cdc WHERE table_name = '{table}'"
+    ));
+    rows[0].0
+}
+
+/// A REFRESH whose source did not change must be completely inert: no row of
+/// the mirror is written, so no delta reaches the view and nothing is captured.
+/// This is the property the whole sweep exists for — a rebuild would retract
+/// and re-insert every row.
+#[turso_macros::test(views)]
+fn test_sweep_over_unchanged_source_is_inert(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let csv_path = tmp_db.path.parent().unwrap().join("sweep_inert.csv");
+    setup_fdw_rows(
+        &tmp_db,
+        &conn,
+        &csv_path,
+        &[("m1", "s1", "one"), ("m2", "s1", "two")],
+    );
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_inert AS SELECT uuid, body FROM msg_fdw",
+    )?;
+
+    conn.execute("PRAGMA capture_data_changes_conn('full')")?;
+    let mirror = mirror_name("mv_inert");
+
+    for _ in 0..3 {
+        common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_inert")?;
+    }
+
+    assert_eq!(
+        cdc_row_records(&conn, &mirror),
+        0,
+        "a no-change REFRESH must write nothing to the mirror"
+    );
+    let rows: Vec<(String, String)> =
+        conn.exec_rows("SELECT uuid, body FROM mv_inert ORDER BY uuid");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    Ok(())
+}
+
+/// Reordering the source's lines changes no row, so it must change nothing.
+/// This fails loudly under a rebuild, where a row's identity is its scan
+/// position.
+#[turso_macros::test(views)]
+fn test_sweep_ignores_source_reordering(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let csv_path = tmp_db.path.parent().unwrap().join("sweep_reorder.csv");
+    setup_fdw_rows(
+        &tmp_db,
+        &conn,
+        &csv_path,
+        &[
+            ("m1", "s1", "one"),
+            ("m2", "s1", "two"),
+            ("m3", "s1", "three"),
+        ],
+    );
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_reorder AS SELECT uuid, body FROM msg_fdw",
+    )?;
+
+    conn.execute("PRAGMA capture_data_changes_conn('full')")?;
+    rewrite_csv(
+        &csv_path,
+        &[
+            ("m3", "s1", "three"),
+            ("m1", "s1", "one"),
+            ("m2", "s1", "two"),
+        ],
+    );
+    common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_reorder")?;
+
+    assert_eq!(
+        cdc_row_records(&conn, &mirror_name("mv_reorder")),
+        0,
+        "reordering the source must not disturb a single row"
+    );
+    let rows: Vec<(String, String)> =
+        conn.exec_rows("SELECT uuid, body FROM mv_reorder ORDER BY uuid");
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    Ok(())
+}
+
+/// One appended source row must cost exactly one change.
+#[turso_macros::test(views)]
+fn test_sweep_appended_row_costs_one_change(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let csv_path = tmp_db.path.parent().unwrap().join("sweep_append.csv");
+    setup_fdw_rows(
+        &tmp_db,
+        &conn,
+        &csv_path,
+        &[("m1", "s1", "one"), ("m2", "s1", "two")],
+    );
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_append AS SELECT uuid, body FROM msg_fdw",
+    )?;
+
+    conn.execute("PRAGMA capture_data_changes_conn('full')")?;
+    rewrite_csv(
+        &csv_path,
+        &[
+            ("m1", "s1", "one"),
+            ("m2", "s1", "two"),
+            ("m3", "s1", "three"),
+        ],
+    );
+    common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_append")?;
+
+    assert_eq!(
+        cdc_row_records(&conn, &mirror_name("mv_append")),
+        1,
+        "one appended source row must touch exactly one mirror row"
+    );
+    let rows: Vec<(String, String)> =
+        conn.exec_rows("SELECT uuid, body FROM mv_append ORDER BY uuid");
+    assert_eq!(
+        rows,
+        vec![
+            ("m1".to_string(), "one".to_string()),
+            ("m2".to_string(), "two".to_string()),
+            ("m3".to_string(), "three".to_string()),
+        ]
+    );
+    Ok(())
+}
+
+/// A row leaving the source must be retracted from the view and from every
+/// matview chained onto it, at the cost of exactly one change.
+#[turso_macros::test(views)]
+fn test_sweep_deleted_row_retracts_through_the_chain(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let csv_path = tmp_db.path.parent().unwrap().join("sweep_delete.csv");
+    setup_fdw_rows(
+        &tmp_db,
+        &conn,
+        &csv_path,
+        &[
+            ("m1", "s1", "one"),
+            ("m2", "s1", "two"),
+            ("m3", "s1", "three"),
+        ],
+    );
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_del AS SELECT uuid, body FROM msg_fdw",
+    )?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_del_downstream AS \
+         SELECT uuid FROM mv_del WHERE uuid <> 'm1'",
+    )?;
+
+    conn.execute("PRAGMA capture_data_changes_conn('full')")?;
+    rewrite_csv(&csv_path, &[("m1", "s1", "one"), ("m3", "s1", "three")]);
+    common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_del")?;
+
+    assert_eq!(
+        cdc_row_records(&conn, &mirror_name("mv_del")),
+        1,
+        "one vanished source row must touch exactly one mirror row"
+    );
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT uuid FROM mv_del ORDER BY uuid");
+    assert_eq!(
+        rows,
+        vec![("m1".to_string(),), ("m3".to_string(),)],
+        "the vanished row must leave the view"
+    );
+    let downstream: Vec<(String,)> =
+        conn.exec_rows("SELECT uuid FROM mv_del_downstream ORDER BY uuid");
+    assert_eq!(
+        downstream,
+        vec![("m3".to_string(),)],
+        "the retraction must reach the chained matview"
+    );
+    Ok(())
+}
+
+/// A changed row must be updated in place, not retracted and re-inserted. The
+/// rowid alone is a weak oracle — a rebuild reassigns rowids in scan order and
+/// so often reproduces them — so the change count carries the assertion.
+#[turso_macros::test(views)]
+fn test_sweep_changed_row_updates_in_place(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let csv_path = tmp_db.path.parent().unwrap().join("sweep_change.csv");
+    setup_fdw_rows(
+        &tmp_db,
+        &conn,
+        &csv_path,
+        &[("m1", "s1", "one"), ("m2", "s1", "two")],
+    );
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_change AS SELECT uuid, body FROM msg_fdw",
+    )?;
+    let mirror = mirror_name("mv_change");
+    let rowids_before: Vec<(String, i64)> = conn.exec_rows(&format!(
+        "SELECT uuid, rowid FROM \"{mirror}\" ORDER BY uuid"
+    ));
+
+    conn.execute("PRAGMA capture_data_changes_conn('full')")?;
+
+    rewrite_csv(&csv_path, &[("m1", "s1", "CHANGED"), ("m2", "s1", "two")]);
+    common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_change")?;
+
+    let rows: Vec<(String, String)> =
+        conn.exec_rows("SELECT uuid, body FROM mv_change ORDER BY uuid");
+    assert_eq!(
+        rows,
+        vec![
+            ("m1".to_string(), "CHANGED".to_string()),
+            ("m2".to_string(), "two".to_string()),
+        ]
+    );
+    let rowids_after: Vec<(String, i64)> = conn.exec_rows(&format!(
+        "SELECT uuid, rowid FROM \"{mirror}\" ORDER BY uuid"
+    ));
+    assert_eq!(
+        rowids_after, rowids_before,
+        "an updated row must keep its rowid, or its retraction carries a different identity"
+    );
+    assert_eq!(
+        cdc_row_records(&conn, &mirror),
+        1,
+        "only the row that changed may be written"
+    );
+    Ok(())
+}
+
+/// An aggregate over a mirrored source must survive REFRESH. The sweep leaves
+/// the DBSP state alone, so it also sidesteps the pre-existing clear-without-
+/// its-index defect that breaks REFRESH for every rebuilt aggregate view.
+#[turso_macros::test(views)]
+fn test_sweep_maintains_an_aggregate_view(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let csv_path = tmp_db.path.parent().unwrap().join("sweep_agg.csv");
+    setup_fdw_rows(
+        &tmp_db,
+        &conn,
+        &csv_path,
+        &[
+            ("m1", "s1", "one"),
+            ("m2", "s1", "two"),
+            ("m3", "s2", "three"),
+        ],
+    );
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_sweep_agg AS \
+         SELECT session_id, count(*) AS n FROM msg_fdw GROUP BY session_id",
+    )?;
+
+    rewrite_csv(
+        &csv_path,
+        &[
+            ("m1", "s1", "one"),
+            ("m3", "s2", "three"),
+            ("m4", "s2", "four"),
+        ],
+    );
+    common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_sweep_agg")?;
+
+    let counts: Vec<(String, i64)> =
+        conn.exec_rows("SELECT session_id, n FROM mv_sweep_agg ORDER BY session_id");
+    assert_eq!(
+        counts,
+        vec![("s1".to_string(), 1), ("s2".to_string(), 2)],
+        "one row left s1 and one joined s2"
+    );
+
+    // Repeat REFRESHes over an unchanged source must not drift the counts.
+    for _ in 0..3 {
+        common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_sweep_agg")?;
+    }
+    let counts: Vec<(String, i64)> =
+        conn.exec_rows("SELECT session_id, n FROM mv_sweep_agg ORDER BY session_id");
+    assert_eq!(counts, vec![("s1".to_string(), 1), ("s2".to_string(), 2)]);
+    Ok(())
+}
+
+/// A view joining a mirrored source to a local table: REFRESH sweeps the mirror
+/// and leaves the local side alone, which is enough because local writes are
+/// already incremental.
+#[turso_macros::test(views)]
+fn test_sweep_maintains_a_mixed_source_view(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let csv_path = tmp_db.path.parent().unwrap().join("sweep_mixed.csv");
+    setup_fdw_rows(
+        &tmp_db,
+        &conn,
+        &csv_path,
+        &[("m1", "s1", "one"), ("m2", "s2", "two")],
+    );
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE TABLE sessions (session_id TEXT, label TEXT)",
+    )?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "INSERT INTO sessions VALUES ('s1', 'first'), ('s2', 'second')",
+    )?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_mixed AS \
+         SELECT msg_fdw.uuid, msg_fdw.body, sessions.label \
+         FROM msg_fdw JOIN sessions ON msg_fdw.session_id = sessions.session_id",
+    )?;
+    let rows: Vec<(String, String, String)> =
+        conn.exec_rows("SELECT uuid, body, label FROM mv_mixed ORDER BY uuid");
+    assert_eq!(
+        rows,
+        vec![
+            ("m1".to_string(), "one".to_string(), "first".to_string()),
+            ("m2".to_string(), "two".to_string(), "second".to_string()),
+        ]
+    );
+
+    // A local write needs no REFRESH.
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "INSERT INTO sessions VALUES ('s3', 'third')",
+    )?;
+    // A foreign write needs one, and must join against the local side.
+    rewrite_csv(
+        &csv_path,
+        &[
+            ("m1", "s1", "one"),
+            ("m2", "s2", "two"),
+            ("m3", "s3", "three"),
+        ],
+    );
+    common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_mixed")?;
+
+    let rows: Vec<(String, String, String)> =
+        conn.exec_rows("SELECT uuid, body, label FROM mv_mixed ORDER BY uuid");
+    assert_eq!(
+        rows,
+        vec![
+            ("m1".to_string(), "one".to_string(), "first".to_string()),
+            ("m2".to_string(), "two".to_string(), "second".to_string()),
+            ("m3".to_string(), "three".to_string(), "third".to_string()),
+        ],
+        "the swept mirror must join against the local table's current contents"
+    );
     Ok(())
 }
