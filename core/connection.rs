@@ -145,6 +145,11 @@ pub(crate) struct NamedSavepointFrame {
     /// SAVEPOINT begin. Cheap — values are `Arc`. Used by ROLLBACK TO
     /// to restore staged DDL on attached databases.
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
+    /// Per-view, per-table lengths of the staged incremental-view deltas at
+    /// SAVEPOINT begin. A materialized view's rows for the open transaction are
+    /// these deltas merged over its btree, so rolling the btree back without
+    /// them would leave the view reporting writes whose pages are gone.
+    pub(crate) view_tx_state_snapshot: HashMap<String, HashMap<String, usize>>,
 }
 
 /// Info returned by `rollback_named_savepoint_frame` so callers can
@@ -153,6 +158,7 @@ pub(crate) struct RollbackFrameInfo {
     pub(crate) main_schema_snapshot: Arc<Schema>,
     pub(crate) temp_schema_snapshot: Option<Arc<Schema>>,
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
+    pub(crate) view_tx_state_snapshot: HashMap<String, HashMap<String, usize>>,
 }
 
 struct SchemaReparseGuard {
@@ -365,6 +371,10 @@ impl Drop for ExplicitCheckpointGuard {
         activity.explicit_checkpoint_active = false;
     }
 }
+
+/// The savepoint [`Connection::inject_fdw_changes`] wraps a batch in when it is
+/// joining a transaction the caller owns.
+const FDW_PUSH_SAVEPOINT: &str = "__turso_internal_fdw_push";
 
 /// Database connection handle.
 ///
@@ -2039,9 +2049,14 @@ impl Connection {
     /// ordinary commit path. It is the entry point behind
     /// [`crate::foreign::StreamingForeignData`] — see [`Self::drain_fdw_stream`].
     ///
-    /// The whole batch commits at once, so a reader never sees part of a push.
-    /// Inside a transaction the caller opened, the batch joins it and commits
-    /// with it instead.
+    /// The whole batch lands or none of it does. When there is no transaction
+    /// to join the batch gets its own; inside one the caller opened it takes a
+    /// savepoint, so a failure retracts the batch without disturbing the
+    /// caller's own writes or ending its transaction. Either way a reader never
+    /// sees part of a push.
+    ///
+    /// Every change is checked against the mirror's declared width first, so a
+    /// malformed batch is refused before any of it is applied.
     ///
     /// Must be called on the same thread that owns the connection, and never
     /// from inside a running statement.
@@ -2072,11 +2087,25 @@ impl Connection {
             return Ok(());
         }
 
+        // A payload of the wrong width names no row, so reject the batch before
+        // any of it reaches a mirror rather than discovering it partway through.
+        for sync in &syncs {
+            for change in changes {
+                if change.values.len() != sync.columns.len() {
+                    return Err(sync.width_violation(change.values.len()));
+                }
+            }
+        }
+
         // Own the transaction only when there is none to join, so a caller
-        // batching pushes with its own writes keeps one commit boundary.
+        // batching pushes with its own writes keeps one commit boundary. Inside
+        // the caller's transaction a savepoint gives the batch its own
+        // all-or-nothing boundary without claiming the caller's.
         let owns_txn = self.get_auto_commit();
         if owns_txn {
             self.execute("BEGIN IMMEDIATE")?;
+        } else {
+            self.execute(format!("SAVEPOINT {FDW_PUSH_SAVEPOINT}"))?;
         }
         let result = (|| -> crate::Result<()> {
             for sync in &syncs {
@@ -2086,13 +2115,20 @@ impl Connection {
             }
             Ok(())
         })();
+        // A half-applied mirror would outlive the failed push and be read as
+        // the source's real contents.
         match (owns_txn, result) {
-            (false, result) => result,
             (true, Ok(())) => self.execute("COMMIT"),
             (true, Err(err)) => {
-                // A half-applied mirror would outlive the failed push and be
-                // read as the source's real contents.
                 self.execute("ROLLBACK")?;
+                Err(err)
+            }
+            (false, Ok(())) => self.execute(format!("RELEASE {FDW_PUSH_SAVEPOINT}")),
+            (false, Err(err)) => {
+                // `ROLLBACK TO` keeps the savepoint open, so release it too and
+                // leave the caller's transaction exactly as the push found it.
+                self.execute(format!("ROLLBACK TO {FDW_PUSH_SAVEPOINT}"))?;
+                self.execute(format!("RELEASE {FDW_PUSH_SAVEPOINT}"))?;
                 Err(err)
             }
         }
@@ -5164,6 +5200,7 @@ impl Connection {
             main_schema_snapshot: frame.main_schema_snapshot.clone(),
             temp_schema_snapshot: frame.temp_schema_snapshot.clone(),
             staged_schema_snapshot: frame.staged_schema_snapshot.clone(),
+            view_tx_state_snapshot: frame.view_tx_state_snapshot.clone(),
         };
         // ROLLBACK TO keeps the target savepoint itself on the stack;
         // only nested savepoints above it are discarded.

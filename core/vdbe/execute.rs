@@ -5171,6 +5171,7 @@ pub fn op_savepoint(
                         main_schema_snapshot,
                         temp_schema_snapshot,
                         staged_schema_snapshot,
+                        view_tx_state_snapshot: conn.view_transaction_states.snapshot_lengths(),
                     };
                     // Mirror onto attached/temp pagers. If any pager fails
                     // mid-flight, earlier ones already opened a savepoint
@@ -5294,6 +5295,12 @@ pub fn op_savepoint(
             // consistent across tables / indexes / sequences without any
             // I/O.
             if let Some(info) = frame_info {
+                // Staged incremental-view deltas belong to the pages that were
+                // just rolled back: a matview read in an open transaction is
+                // its btree merged with them, so deltas surviving the rollback
+                // would report rows the rollback removed.
+                conn.view_transaction_states
+                    .rollback_to(&info.view_tx_state_snapshot);
                 *conn.schema.write() = info.main_schema_snapshot;
                 if let Some(temp_db) = conn.temp.database.read().as_ref() {
                     match info.temp_schema_snapshot {
