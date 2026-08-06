@@ -117,6 +117,24 @@ pub struct AlterTable {
     // `ALTER TABLE` body
     pub body: AlterTableBody,
 }
+/// How much of a refreshed materialized view's source the refreshing scan
+/// speaks for.
+///
+/// Absence of a row from a scan means it was deleted only within the scan's
+/// scope; outside it, absence only means the scan did not look. The two cases
+/// are distinct values rather than a predicate that may be empty, because
+/// inferring "no scope" from a scan that returned nothing is exactly how a
+/// partial scan comes to retract the rows it never covered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum RefreshScope {
+    /// The scan speaks for the whole source: a row it does not return is gone.
+    Full,
+    /// The scan speaks only for rows satisfying this predicate. Rows outside it
+    /// are left as they are.
+    Scoped(Box<Expr>),
+}
+
 /// SQL statement
 // https://sqlite.org/syntax/sql-stmt.html
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -231,6 +249,8 @@ pub enum Stmt {
     RefreshMaterializedView {
         /// view name
         view_name: QualifiedName,
+        /// how much of the source the refreshing scan speaks for
+        scope: RefreshScope,
     },
 
     /// `CREATE VIRTUAL TABLE`
