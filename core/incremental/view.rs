@@ -457,6 +457,10 @@ impl AllViewsTxState {
 /// Works for both BTree tables and virtual/foreign tables.
 #[derive(Debug, Clone)]
 pub struct ReferencedTable {
+    /// Always the normalized name. A btree table is stored under one already,
+    /// but a virtual table keeps the spelling it was declared with, and this
+    /// name is matched against the schema's folded keys — including the mirror
+    /// specs a foreign source is paired with.
     pub name: String,
     pub columns: Vec<Column>,
     pub has_rowid: bool,
@@ -479,7 +483,7 @@ impl ReferencedTable {
     pub fn from_btree(table: &BTreeTable) -> Self {
         let rowid_alias_index = table.get_rowid_alias_column().map(|(idx, _)| idx);
         Self {
-            name: table.name.clone(),
+            name: normalize_ident(&table.name),
             columns: table.columns().to_vec(),
             has_rowid: table.has_rowid,
             rowid_alias_index,
@@ -489,7 +493,7 @@ impl ReferencedTable {
 
     pub fn from_virtual(table: &VirtualTable) -> Self {
         Self {
-            name: table.name.clone(),
+            name: normalize_ident(&table.name),
             columns: table.columns.clone(),
             has_rowid: true,
             rowid_alias_index: None,
@@ -4088,6 +4092,61 @@ mod fdw_mirror_redirect_tests {
             "SELECT * FROM msg_fdw WHERE session_id = 's1'"
         );
         assert_eq!(syncs[0].identity, crate::alloc::vec![0]);
+    }
+
+    /// A source spelled in another case is the same table, so it must reach the
+    /// circuit through its mirror just the same. Missing the redirect is silent:
+    /// the view compiles against the foreign table and keeps snapshot semantics
+    /// while its mirror is filled and swept for nobody.
+    #[test]
+    fn a_source_spelled_in_another_case_is_still_redirected() {
+        let schema = schema_with_mirror(true);
+        let view = build_view(
+            &schema,
+            "SELECT uuid, body FROM MSG_FDW WHERE session_id = 's1'",
+        )
+        .unwrap();
+
+        assert_eq!(view.get_referenced_table_names(), vec![MIRROR.to_string()]);
+        assert_eq!(
+            view.sql_for_populate().unwrap(),
+            vec![format!(
+                "SELECT *, rowid FROM {MIRROR} WHERE session_id = 's1'"
+            )]
+        );
+    }
+
+    /// The mirror's name embeds the view's. `CREATE` mints it from the folded
+    /// view name, so a load that kept the DDL's own spelling would name a
+    /// mirror that was never created.
+    #[test]
+    fn the_mirror_name_does_not_depend_on_how_the_view_was_spelled() {
+        let schema = schema_with_mirror(true);
+        let view = IncrementalView::from_stmt(
+            ast::QualifiedName {
+                db_name: None,
+                name: ast::Name::exact("MV_Ident".to_string()),
+                alias: None,
+            },
+            parse_select("SELECT uuid FROM msg_fdw"),
+            &schema,
+            1,
+            2,
+            3,
+        )
+        .unwrap();
+
+        assert_eq!(view.mirror_syncs()[0].mirror_table, MIRROR);
+    }
+
+    /// The redirect keeps the source's name as an alias so qualifiers written
+    /// against it still resolve — including one written in a third spelling.
+    #[test]
+    fn a_case_mismatched_source_still_resolves_its_qualifiers() {
+        let schema = schema_with_mirror(true);
+        let view = build_view(&schema, "SELECT Msg_Fdw.uuid FROM MSG_FDW").unwrap();
+
+        assert_eq!(view.get_referenced_table_names(), vec![MIRROR.to_string()]);
     }
 
     /// A missing mirror is a broken view, never a silent fall back to

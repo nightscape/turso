@@ -765,7 +765,7 @@ impl<'a> LogicalPlanBuilder<'a> {
         }
 
         let cte = &with.ctes[0];
-        let cte_name = Self::name_to_string(&cte.tbl_name);
+        let cte_name = Self::normalized_name(&cte.tbl_name);
 
         // Analyze the CTE's SELECT to find base case and recursive step
         // Typically: base_case UNION recursive_step
@@ -806,7 +806,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                     .iter()
                     .zip(base_schema.columns.iter())
                     .map(|(cte_col, base_col)| ColumnInfo {
-                        name: Self::name_to_string(&cte_col.col_name),
+                        name: Self::normalized_name(&cte_col.col_name),
                         ty: base_col.ty,
                         database: None,
                         table: Some(cte_name.clone()),
