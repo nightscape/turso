@@ -2808,7 +2808,7 @@ impl Program {
                         return Err(LimboError::InternalError(
                             "Materialized views are not supported in MVCC mode: cannot modify a table with dependent materialized views"
                                 .to_string(),
-                        ));
+                        ).into());
                     }
 
                     // Not a rollback - proceed with processing
