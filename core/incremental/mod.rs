@@ -7,6 +7,8 @@ pub mod dbsp;
 mod eq_only_seek_boundary;
 pub mod expr_compiler;
 pub mod fdw_mirror;
+#[cfg(test)]
+mod fdw_mirror_scope_tests;
 pub mod filter_operator;
 pub mod input_operator;
 #[cfg(test)]
