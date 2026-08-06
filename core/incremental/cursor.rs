@@ -9,6 +9,7 @@ use crate::{
     },
     return_if_io,
     storage::btree::CursorTrait,
+    turso_assert,
     types::{IOResult, SeekKey, SeekOp, SeekResult, Value},
     LimboError, Pager, Result,
 };
@@ -162,6 +163,21 @@ impl MaterializedViewCursor {
     /// upstream yields nothing and substituting would drop the rebuild — the
     /// read would return the pre-refresh value until COMMIT.
     fn ensure_tx_changes_computed(&mut self) -> Result<IOResult<()>> {
+        if self.conn.matview_rebuild_in_progress() {
+            // A rebuild is reading us as its source. It must see our committed
+            // state only: whatever we hold uncommitted will reach the view it
+            // rebuilds through the COMMIT-time cascade, and folding it into the
+            // rebuilt rows as well would count it twice. The flag is only ever
+            // raised around the rebuild's own nested scan.
+            turso_assert!(
+                self.conn.is_nested_stmt(),
+                "matview rebuild scan must run as a nested statement"
+            );
+            self.uncommitted = RowKeyZSet::new();
+            self.full_result_mode = false;
+            return Ok(IOResult::Done(()));
+        }
+
         let current_len = self.total_relevant_tx_len();
         if current_len == self.last_tx_state_len {
             return Ok(IOResult::Done(()));

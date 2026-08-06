@@ -1925,7 +1925,11 @@ impl IncrementalView {
         // and decrement on every exit (including IO yields and errors) so re-entrant
         // calls keep the counter balanced.
         conn.start_nested();
+        // Everything this scan reads through a matview cursor must be the
+        // upstream's committed state — see `matview_rebuild_in_progress`.
+        conn.start_matview_rebuild();
         let result = self.populate_from_table_inner(conn, pager, _btree_cursor, cascade);
+        conn.end_matview_rebuild();
         conn.end_nested();
         result
     }

@@ -482,6 +482,10 @@ pub struct Connection {
     /// The state is integer as we may want to spawn deep nested programs (e.g. Root -[run]-> S1 -[run]-> S2 -[run]-> ...)
     /// and we need to track current nestedness depth in order to properly understand when we will reach the root back again
     pub(super) nestedness: AtomicI32,
+    /// Greater than zero while a materialized view is being rebuilt on this
+    /// connection. See [`Connection::matview_rebuild_in_progress`]. Nested like
+    /// `nestedness` because a rebuild's scan can itself trigger one.
+    pub(super) matview_rebuild_depth: AtomicI32,
     /// Stack of currently compiling triggers to prevent recursive trigger subprogram compilation
     pub(super) compiling_triggers: RwLock<Vec<Arc<Trigger>>>,
     /// Stack of currently executing triggers to prevent recursive trigger execution
@@ -886,6 +890,22 @@ impl Connection {
     /// ends nested program execution
     pub fn end_nested(&self) {
         self.nestedness.fetch_add(-1, Ordering::SeqCst);
+    }
+
+    /// True while this connection is rebuilding a materialized view from its
+    /// sources. A rebuild reads upstream matviews at their *committed* state:
+    /// the rows it writes must not already contain an upstream delta that the
+    /// COMMIT-time cascade will deliver to the rebuilt view afterwards.
+    pub(crate) fn matview_rebuild_in_progress(&self) -> bool {
+        self.matview_rebuild_depth.load(Ordering::SeqCst) > 0
+    }
+
+    pub(crate) fn start_matview_rebuild(&self) {
+        self.matview_rebuild_depth.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn end_matview_rebuild(&self) {
+        self.matview_rebuild_depth.fetch_add(-1, Ordering::SeqCst);
     }
 
     /// Check if a specific trigger is currently compiling (for recursive trigger prevention)

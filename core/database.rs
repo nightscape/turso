@@ -2398,6 +2398,7 @@ impl Database {
             view_transaction_states: AllViewsTxState::new(),
             metrics: RwLock::new(ConnectionMetrics::new()),
             nestedness: AtomicI32::new(0),
+            matview_rebuild_depth: AtomicI32::new(0),
             compiling_triggers: RwLock::new(Vec::new()),
             executing_triggers: RwLock::new(Vec::new()),
             encryption_key: RwLock::new(encryption_key),
