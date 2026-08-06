@@ -5232,9 +5232,10 @@ pub fn op_auto_commit(
 
     // Drive any multi-step commit/rollback that's already in progress.
     // This handles main DB commits (Committing), attached DB commits
-    // (CommittingAttached), MVCC commits (CommittingMvcc), and attached
-    // MVCC commits (CommittingAttachedMvcc) that yielded on IO and need re-entry.
-    if !matches!(state.commit_state, CommitState::Ready) {
+    // (CommittingAttached), MVCC commits (CommittingMvcc), attached
+    // MVCC commits (CommittingAttachedMvcc), and the view-delta merge that
+    // precedes all of them, any of which may have yielded on IO.
+    if state.commit_in_flight() {
         let res = program.commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback);
         let res = state.done_or_suspend(res);
         // Only clear after a final, successful non-rollback COMMIT.
