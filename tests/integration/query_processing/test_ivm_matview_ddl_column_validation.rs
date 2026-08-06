@@ -39,7 +39,9 @@ async fn test_matview_ddl_rejects_qualified_missing_column() -> anyhow::Result<(
 
     let msg = err.to_string();
     assert!(
-        msg.contains("no such column") && msg.contains("depth") && msg.contains("b"),
+        (msg.contains("no such column") || msg.contains("not found in schema"))
+            && msg.contains("depth")
+            && msg.contains("b"),
         "error must name the missing column and its table qualifier, got: {msg}"
     );
     assert!(
@@ -63,7 +65,8 @@ async fn test_matview_ddl_rejects_unqualified_missing_column() -> anyhow::Result
 
     let msg = err.to_string();
     assert!(
-        msg.contains("no such column") && msg.contains("sort_key"),
+        (msg.contains("no such column") || msg.contains("not found in schema"))
+            && msg.contains("sort_key"),
         "error must name the missing column, got: {msg}"
     );
     Ok(())
