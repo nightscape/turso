@@ -37,6 +37,7 @@ mod test_ivm_populate_stash_drop;
 mod test_ivm_recursive_antijoin_reparent_dup;
 mod test_ivm_recursive_cte_update_cdc;
 mod test_ivm_recursive_nonconvergence;
+mod test_ivm_refresh_dependent_matview;
 mod test_ivm_refresh_in_transaction;
 mod test_ivm_refresh_state_index_orphan;
 mod test_ivm_selfjoin_where;
