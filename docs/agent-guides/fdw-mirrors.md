@@ -107,6 +107,34 @@ the first scan into a staging table — trades the repeats for a second copy of
 the data plus per-sync DDL; see `core/incremental/fdw_mirror.rs` and
 `tests/integration/query_processing/test_fdw_scan_cost.rs`.
 
+## Scoped REFRESH
+
+`REFRESH MATERIALIZED VIEW <mv> WHERE <predicate>` sweeps a source the scan
+speaks for only in part. A driver that can afford "rows changed since the
+watermark" but not a full scan cannot witness a deletion at all — a deleted row
+has no attributes — so an unscoped sweep over such a scan retracts every row the
+scan did not happen to cover.
+
+The scope is one predicate used twice: ANDed into the source's own query block
+(so the qualifier reaches the driver — `test_the_scope_is_pushed_down_to_the_driver`)
+and prefixed to the anti-join's `WHERE` (so absence retracts only inside it).
+`ScanQuery` keeps the scan in parts for exactly this: the view's predicate may be
+a disjunction, and appending `AND …` to the rendered text would bind to its last
+branch alone. Everything else — the guard, the upsert, `upsert_tail` — is what a
+full sweep uses, byte for byte.
+
+"The scan returned nothing" and "no scope was given" are distinct values, not an
+empty predicate: `ast::RefreshScope::{Full, Scoped}`, chosen by the parser. An
+empty scoped scan therefore retracts exactly its scope, which is the failure mode
+that sank three driver-side attempts at the same bound.
+
+The bound is evaluated against the mirror, so `MirrorSync::validate_scope`
+refuses at translate time a scope naming a column the source does not have, a
+qualified name (the scan and the mirror are two different tables), a parameter
+(the sweep binds nothing), or a subquery. A scope on a view with no mirror is
+refused too: the rebuild path is authoritative over its whole scan and has
+nothing to bound.
+
 ## The push path
 
 `Connection::inject_fdw_changes(foreign_table, &[FdwChange])` — REFRESH without the

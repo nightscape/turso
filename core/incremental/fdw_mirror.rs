@@ -18,9 +18,11 @@
 //! [`ForeignDataWrapper::identity_columns`]: crate::foreign::ForeignDataWrapper::identity_columns
 
 use crate::schema::{Column, Schema, Table, FDW_MIRROR_TABLE_PREFIX};
+use crate::translate::expr::{walk_expr, WalkControl};
 use crate::{LimboError, Result};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use turso_parser::ast;
+use turso_parser::ast::RefreshScope;
 
 /// Everything needed to create and sync one view's mirror of one foreign table.
 #[derive(Debug, Clone)]
@@ -128,6 +130,53 @@ impl MirrorSpec {
     }
 }
 
+/// The scan that fills one mirror, kept in the two parts a scope has to come
+/// between.
+///
+/// A refresh scope narrows the scan, and it has to narrow it *inside the
+/// source's own query block*: a predicate one block out is one the driver never
+/// sees, so the source would serve the whole scan and the engine would filter
+/// it afterwards — which is the cost the scope exists to avoid
+/// (`test_the_scope_is_pushed_down_to_the_driver`). Splitting the text back
+/// apart would not do: the view's predicate may be a disjunction, and appending
+/// `AND …` to one binds to its last branch alone.
+#[derive(Debug, Clone)]
+pub struct ScanQuery {
+    /// `SELECT * FROM <source>`.
+    head: String,
+    /// The view's own predicate over that source, if it has one.
+    predicate: Option<String>,
+}
+
+impl ScanQuery {
+    pub fn new(head: String, predicate: Option<String>) -> Self {
+        Self { head, predicate }
+    }
+
+    /// The scan as the view defines it.
+    pub fn sql(&self) -> String {
+        self.narrowed(None)
+    }
+
+    /// The scan narrowed to the rows this refresh speaks for.
+    fn scoped(&self, scope: &RefreshScope) -> String {
+        match scope {
+            RefreshScope::Full => self.sql(),
+            RefreshScope::Scoped(predicate) => self.narrowed(Some(&predicate.to_string())),
+        }
+    }
+
+    fn narrowed(&self, scope: Option<&str>) -> String {
+        let head = &self.head;
+        match (&self.predicate, scope) {
+            (None, None) => head.clone(),
+            (Some(predicate), None) => format!("{head} WHERE {predicate}"),
+            (None, Some(scope)) => format!("{head} WHERE {scope}"),
+            (Some(predicate), Some(scope)) => format!("{head} WHERE ({predicate}) AND ({scope})"),
+        }
+    }
+}
+
 /// What a sweep does with a source that hands it two rows sharing an identity.
 ///
 /// `CREATE` has no choice — the mirror's primary key refuses them — so the seam
@@ -163,7 +212,7 @@ pub struct MirrorSync {
     /// Indices into `columns` whose values identify a row across scans.
     pub identity: Vec<usize>,
     /// Scan of the foreign table, scoped by the view's predicate.
-    pub scan_query: String,
+    pub scan: ScanQuery,
     /// How the sweep answers a source repeating an identity. Private so the
     /// seam cannot be opened from outside this module by accident.
     policy: DuplicatePolicy,
@@ -176,7 +225,7 @@ const GUARD_NULL: &str = "null";
 const GUARD_DUPLICATE: &str = "duplicate";
 
 impl MirrorSync {
-    pub fn new(spec: &MirrorSpec, scan_query: String) -> Self {
+    pub fn new(spec: &MirrorSpec, scan: ScanQuery) -> Self {
         Self {
             // The only construction site, and the only place the policy is
             // chosen: a sweep refuses what `CREATE` refuses.
@@ -193,7 +242,7 @@ impl MirrorSync {
                 })
                 .collect(),
             identity: spec.identity.iter().map(|i| *i as usize).collect(),
-            scan_query,
+            scan,
         }
     }
 
@@ -310,8 +359,78 @@ impl MirrorSync {
             format!("DELETE FROM {table}"),
             // A mirror's columns are the foreign table's columns in order, so
             // the scan's `SELECT *` aligns positionally.
-            format!("INSERT INTO {table} {}", self.scan_query),
+            format!("INSERT INTO {table} {}", self.scan.sql()),
         ]
+    }
+
+    /// The `WHERE` prefix confining the anti-join to the rows the scan spoke
+    /// for. Empty for a full refresh, whose scan spoke for all of them.
+    fn retraction_bound(&self, scope: &RefreshScope) -> String {
+        match scope {
+            RefreshScope::Full => String::new(),
+            RefreshScope::Scoped(predicate) => format!("({predicate}) AND "),
+        }
+    }
+
+    /// Refuse a scope the retraction bound could not be evaluated with.
+    ///
+    /// The bound runs against the mirror, whose columns are the source's; a
+    /// scope naming anything else — another table's column, a parameter the
+    /// sweep's own statements have nothing bound to — would either fail deep
+    /// inside a sweep or, worse, bound the retraction by something other than
+    /// what the scan was scoped by.
+    pub fn validate_scope(&self, scope: &RefreshScope) -> Result<()> {
+        let RefreshScope::Scoped(predicate) = scope else {
+            return Ok(());
+        };
+        walk_expr(predicate, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+            match expr {
+                ast::Expr::Id(name) | ast::Expr::Name(name) => {
+                    let column = crate::util::normalize_ident(name.as_str());
+                    if !self
+                        .columns
+                        .iter()
+                        .any(|c| crate::util::normalize_ident(c) == column)
+                    {
+                        return Err(self.scope_error(&format!(
+                            "names column '{}', which foreign table '{}' does not have \
+                             (its columns are {})",
+                            name.as_str(),
+                            self.source_table,
+                            self.columns.join(", ")
+                        )));
+                    }
+                }
+                ast::Expr::Qualified(..) | ast::Expr::DoublyQualified(..) => {
+                    return Err(self.scope_error(
+                        "must name the source's columns unqualified: the same predicate \
+                         bounds the scan and the mirror, which are two different tables",
+                    ));
+                }
+                ast::Expr::Variable(_) => {
+                    return Err(
+                        self.scope_error("must not use a parameter: a sweep binds nothing to one")
+                    );
+                }
+                ast::Expr::Subquery(_)
+                | ast::Expr::Exists(_)
+                | ast::Expr::InSelect { .. }
+                | ast::Expr::InTable { .. } => {
+                    return Err(self.scope_error(
+                        "must be a predicate over the source's own columns; a subquery is not one",
+                    ));
+                }
+                _ => {}
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        Ok(())
+    }
+
+    fn scope_error(&self, problem: &str) -> LimboError {
+        LimboError::ParseError(format!(
+            "the scope of a REFRESH bounds which mirror rows it may retract, so it {problem}"
+        ))
     }
 
     /// Statements that bring the mirror in step with the source, touching only
@@ -331,20 +450,26 @@ impl MirrorSync {
     /// The guard comes first so a source that broke its promise costs the sweep
     /// nothing but the scan: no mirror row is written, so no rowid moves and no
     /// delta is staged.
-    pub fn sweep_sql(&self) -> Vec<String> {
+    /// A scope changes what the scan covers and, with it, which mirror rows an
+    /// absence from that scan may retract. It changes nothing else: same
+    /// guard, same upsert, so a scoped sweep and a push still land on the same
+    /// row the same way.
+    pub fn sweep_sql(&self, scope: &RefreshScope) -> Vec<String> {
         let table = self.table_ident();
         let identity = self.identity_list();
-        let scan = &self.scan_query;
+        let scan = self.scan.scoped(scope);
+        let scan = &scan;
+        let bound = self.retraction_bound(scope);
 
         let mut statements = Vec::with_capacity(3);
-        statements.extend(self.guard_sql());
+        statements.extend(self.guard_sql(scope));
         // `WHERE true` disambiguates `ON CONFLICT` from a SELECT's own tail.
         statements.push(format!(
             "INSERT INTO {table} SELECT * FROM ({scan}) WHERE true {}",
             self.upsert_tail()
         ));
         statements.push(format!(
-            "DELETE FROM {table} WHERE ({identity}) NOT IN (SELECT {identity} FROM ({scan}))"
+            "DELETE FROM {table} WHERE {bound}({identity}) NOT IN (SELECT {identity} FROM ({scan}))"
         ));
         statements
     }
@@ -361,7 +486,7 @@ impl MirrorSync {
     ///
     /// The scan is named once, because naming it twice would scan it twice
     /// (`test_scan_named_once_and_read_twice`).
-    fn guard_sql(&self) -> Option<String> {
+    fn guard_sql(&self, scope: &RefreshScope) -> Option<String> {
         if self.policy == DuplicatePolicy::LastWins {
             return None;
         }
@@ -372,7 +497,11 @@ impl MirrorSync {
             .map(|i| format!("{} IS NULL", Self::ident(&self.columns[*i])))
             .collect::<Vec<_>>()
             .join(" OR ");
-        let scan = &self.scan_query;
+        // The guard validates the scan it is given: a scoped sweep writes only
+        // what the scoped scan returned, so that is what has to hold the
+        // identity contract.
+        let scan = self.scan.scoped(scope);
+        let scan = &scan;
         Some(format!(
             "SELECT CASE WHEN any_null > 0 THEN '{GUARD_NULL}' \
              ELSE '{GUARD_DUPLICATE}' END \
@@ -679,19 +808,22 @@ mod tests {
     fn sync(identity: Vec<u32>) -> MirrorSync {
         MirrorSync::new(
             &spec(identity),
-            "SELECT * FROM cc_message_fdw WHERE session_id = 's1'".to_string(),
+            ScanQuery::new(
+                "SELECT * FROM cc_message_fdw".to_string(),
+                Some("session_id = 's1'".to_string()),
+            ),
         )
     }
 
     /// The sweep's upsert, whatever precedes it.
     fn upsert(sync: &MirrorSync) -> String {
-        let sql = sync.sweep_sql();
+        let sql = sync.sweep_sql(&RefreshScope::Full);
         sql[sql.len() - 2].clone()
     }
 
     /// The sweep's anti-join delete.
     fn anti_join(sync: &MirrorSync) -> String {
-        sync.sweep_sql().last().unwrap().clone()
+        sync.sweep_sql(&RefreshScope::Full).last().unwrap().clone()
     }
 
     #[test]
@@ -747,7 +879,7 @@ mod tests {
     /// leave the mirror half-swept.
     #[test]
     fn sweep_checks_the_identity_contract_before_it_writes() {
-        let sql = sync(crate::alloc::vec![0]).sweep_sql();
+        let sql = sync(crate::alloc::vec![0]).sweep_sql(&RefreshScope::Full);
         assert_eq!(sql.len(), 3, "{sql:?}");
         assert!(
             sql[0].starts_with("SELECT CASE WHEN any_null"),
@@ -760,7 +892,7 @@ mod tests {
     /// NULLs apart from repeats and reports them first.
     #[test]
     fn guard_separates_null_identities_from_repeated_ones() {
-        let sql = sync(crate::alloc::vec![0]).sweep_sql()[0].clone();
+        let sql = sync(crate::alloc::vec![0]).sweep_sql(&RefreshScope::Full)[0].clone();
         assert!(sql.contains("(uuid IS NULL) AS identity_is_null"), "{sql}");
         assert!(
             !sql.contains("count(DISTINCT"),
@@ -774,7 +906,7 @@ mod tests {
     /// foreign source.
     #[test]
     fn guard_reads_the_scan_once() {
-        let sql = sync(crate::alloc::vec![0]).sweep_sql()[0].clone();
+        let sql = sync(crate::alloc::vec![0]).sweep_sql(&RefreshScope::Full)[0].clone();
         assert_eq!(sql.matches("FROM cc_message_fdw").count(), 1, "{sql}");
     }
 
@@ -782,7 +914,7 @@ mod tests {
     /// checked by grouping on every column and flagging a NULL in any of them.
     #[test]
     fn guard_handles_a_composite_identity() {
-        let sql = sync(crate::alloc::vec![1, 0]).sweep_sql()[0].clone();
+        let sql = sync(crate::alloc::vec![1, 0]).sweep_sql(&RefreshScope::Full)[0].clone();
         assert!(
             sql.contains("(session_id IS NULL OR uuid IS NULL) AS identity_is_null"),
             "{sql}"
@@ -798,8 +930,11 @@ mod tests {
         let mut collapsing = refusing.clone();
         collapsing.policy = DuplicatePolicy::LastWins;
 
-        assert_eq!(collapsing.guard_sql(), None);
-        assert_eq!(collapsing.sweep_sql(), refusing.sweep_sql()[1..].to_vec());
+        assert_eq!(collapsing.guard_sql(&RefreshScope::Full), None);
+        assert_eq!(
+            collapsing.sweep_sql(&RefreshScope::Full),
+            refusing.sweep_sql(&RefreshScope::Full)[1..].to_vec()
+        );
     }
 
     /// The guard's marker decides which broken promise the user is told about.
