@@ -15256,17 +15256,17 @@ pub fn op_populate_materialized_views(
                 }
             };
 
-            // Reset only for REFRESH (where state is Done from prior population).
-            // On initial CREATE it's already Start, and during I/O re-entry it's mid-population
-            // — resetting would discard progress and force redundant table re-reads.
-            if view.populate_state_is_done() {
+            // Start a population, unless one is already in flight — an I/O
+            // re-entry lands mid-state and resetting would discard its progress.
+            if !view.population_in_flight() {
                 view.reset_for_repopulate();
-                // The rebuild reads its sources on this connection, so inside a
-                // transaction it already sees every row this view has staged.
-                // Leaving those deltas queued would apply them a second time at
-                // commit and count each row twice. Only this view's are marked;
-                // a sibling view over the same tables still needs its own.
-                // (`sync_fdw_mirrors` marks the same for a mirror-fed rebuild.)
+                // A population reads its sources on this connection, so inside a
+                // transaction it folds every row staged for this view into the
+                // rows it writes. Leaving those deltas queued would apply them a
+                // second time at commit and count each row twice. Only this
+                // view's are marked; a sibling view over the same tables still
+                // needs its own. (`sync_fdw_mirrors` marks the same for a
+                // mirror-fed rebuild.)
                 conn.view_transaction_states.mark_absorbed(&view_name);
             }
             // Now populate it with the cursor for writing

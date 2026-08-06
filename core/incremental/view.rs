@@ -1031,8 +1031,20 @@ impl IncrementalView {
         ))
     }
 
-    pub fn populate_state_is_done(&self) -> bool {
-        matches!(self.populate_state, PopulateState::Done)
+    /// Whether a population is part-way through, i.e. the caller is re-entering
+    /// `populate_from_table` after an I/O yield rather than starting a fresh
+    /// population.
+    ///
+    /// `Start` is not in flight: its arm always transitions to another state
+    /// without yielding, so it can only mean a population has yet to begin —
+    /// for a view being created, and equally for one read back from the
+    /// database file, whose population state says nothing about the rows it
+    /// already holds.
+    pub fn population_in_flight(&self) -> bool {
+        !matches!(
+            self.populate_state,
+            PopulateState::Start | PopulateState::Done
+        )
     }
 
     /// Ready the view for a fresh population from its sources, as REFRESH does
