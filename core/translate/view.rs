@@ -851,6 +851,21 @@ pub fn translate_refresh_materialized_view(
         return Ok(());
     }
 
+    // The rebuild below is not symmetric: clearing the btree row by row emits a
+    // retraction to every matview defined over this one, while the repopulation
+    // writes straight to the btree and emits nothing, so the dependents would be
+    // emptied and stay empty. Refuse rather than lose their contents silently.
+    // (The mirror-fed path above is exempt: it maintains the view through the
+    // ordinary delta path, which does cascade to dependents.)
+    let dependents = resolver.with_schema(database_id, |s| {
+        s.get_dependent_materialized_views(&normalized_view_name)
+    });
+    if let Some(first) = dependents.first() {
+        return Err(crate::LimboError::ParseError(format!(
+            "cannot REFRESH materialized view {normalized_view_name}: materialized view {first} is defined over it. Refresh from the leaves, or DROP and re-CREATE the dependents."
+        )));
+    }
+
     // Clear matview data
     emit_clear_btree(program, view_cursor_id, &normalized_view_name);
 
