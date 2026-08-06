@@ -282,6 +282,188 @@ fn test_a_scope_the_mirror_cannot_evaluate_is_refused(tmp_db: TempDatabase) -> a
     Ok(())
 }
 
+/// The two sides of a scope must select the same rows, including when the
+/// answer turns on affinity.
+///
+/// The scope is evaluated twice over different tables: pushed into the scan
+/// over the foreign source, and again over the mirror rows the anti-join walks.
+/// `part` is declared `TEXT` and holds digits, so `part = 1` is decided by the
+/// column's affinity being applied to the numeric literal — if only one side
+/// applies it, the sweep retracts rows no scan spoke for.
+///
+/// A local table declared the same way is the oracle for what that comparison
+/// means at all.
+#[turso_macros::test(views)]
+fn test_a_scope_needing_affinity_selects_alike_on_both_sides(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let digits = vec![row("a1", "1", 1), row("a2", "1", 2), row("b1", "2", 3)];
+    let rows = setup(&tmp_db, &conn, "msg_aff", "mv_aff", digits)?;
+
+    // What the comparison means on an ordinary table of the same declaration.
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE TABLE aff_local(uuid TEXT, part TEXT, val INTEGER)",
+    )?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "INSERT INTO aff_local VALUES ('a1','1',1),('a2','1',2),('b1','2',3)",
+    )?;
+    let local: Vec<(String,)> = conn.exec_rows("SELECT uuid FROM aff_local WHERE part = 1");
+    assert_eq!(
+        local,
+        vec![("a1".to_string(),), ("a2".to_string(),)],
+        "TEXT affinity applies to the literal, so the digits match"
+    );
+
+    // Side one: the rows the scan covers.
+    let scanned: Vec<(String,)> =
+        conn.exec_rows("SELECT uuid FROM msg_aff WHERE part = 1 ORDER BY uuid");
+    assert_eq!(
+        scanned, local,
+        "the scan side must read the scope as SQLite does"
+    );
+
+    // Side two: the rows the retraction bound covers. An empty scan makes the
+    // bound the only thing deciding what goes.
+    rows.set(vec![]);
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "REFRESH MATERIALIZED VIEW mv_aff WHERE part = 1",
+    )?;
+    let survivors = view_rows(&conn, "mv_aff");
+    assert_eq!(
+        survivors,
+        vec![("b1".to_string(), 3)],
+        "the retraction bound must cover exactly the rows the scan does: \
+         it retracted something other than {scanned:?}"
+    );
+    Ok(())
+}
+
+/// The sharper affinity case: a driver whose values do not take the column's
+/// declared affinity.
+///
+/// `part` is declared `TEXT` and this driver hands back integers, so the two
+/// sides of a scope genuinely hold different types — the source reports
+/// `integer`, the mirror stores `text`, because inserting into the mirror
+/// applies the declaration and reading a foreign row does not. A scope over
+/// `part` must still select the same rows on both sides, which it does because
+/// the comparison takes its affinity from the declaration rather than from the
+/// value it finds.
+#[turso_macros::test(views)]
+fn test_a_scope_selects_alike_when_the_driver_ignores_the_declared_affinity(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let int_part = |uuid: &str, part: i64, val: i64| {
+        vec![
+            Value::build_text(uuid.to_string()),
+            Value::Numeric(Numeric::Integer(part)),
+            Value::Numeric(Numeric::Integer(val)),
+        ]
+    };
+    let rows = setup(
+        &tmp_db,
+        &conn,
+        "msg_typed",
+        "mv_typed",
+        vec![
+            int_part("a1", 1, 1),
+            int_part("a2", 1, 2),
+            int_part("b1", 2, 3),
+        ],
+    )?;
+    let mirror = "__turso_internal_fdw_mirror_v1_mv_typed__msg_typed";
+
+    // The premise: the two sides really do hold different types, so their
+    // agreeing below is not vacuous.
+    let source_types: Vec<(String,)> =
+        conn.exec_rows("SELECT DISTINCT typeof(part) FROM msg_typed");
+    let mirror_types: Vec<(String,)> =
+        conn.exec_rows(&format!("SELECT DISTINCT typeof(part) FROM \"{mirror}\""));
+    assert_eq!(source_types, vec![("integer".to_string(),)]);
+    assert_eq!(mirror_types, vec![("text".to_string(),)]);
+
+    for predicate in ["part = 1", "part = '1'"] {
+        let scan: Vec<(String,)> = conn.exec_rows(&format!(
+            "SELECT uuid FROM msg_typed WHERE {predicate} ORDER BY uuid"
+        ));
+        let bound: Vec<(String,)> = conn.exec_rows(&format!(
+            "SELECT uuid FROM \"{mirror}\" WHERE {predicate} ORDER BY uuid"
+        ));
+        assert_eq!(
+            scan,
+            vec![("a1".to_string(),), ("a2".to_string(),)],
+            "{predicate}: the scan side"
+        );
+        assert_eq!(
+            bound, scan,
+            "{predicate}: the retraction bound covers rows the scan did not"
+        );
+    }
+
+    // End to end: the row the scoped scan stopped returning goes, the one its
+    // scope never covered stays.
+    rows.set(vec![int_part("a1", 1, 1)]);
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "REFRESH MATERIALIZED VIEW mv_typed WHERE part = 1",
+    )?;
+    assert_eq!(
+        view_rows(&conn, "mv_typed"),
+        vec![("a1".to_string(), 1), ("b1".to_string(), 3)]
+    );
+    Ok(())
+}
+
+/// A scope that answers differently each time it runs is refused at the
+/// statement rather than half-applied.
+///
+/// The scan evaluates the predicate against the source and the retraction bound
+/// evaluates it again against the mirror. Nothing makes two evaluations of
+/// `random()` agree, so the bound would retract rows the scan never spoke for.
+#[turso_macros::test(views)]
+fn test_a_non_deterministic_scope_is_refused(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    setup(&tmp_db, &conn, "msg_nd", "mv_nd", seed())?;
+
+    for predicate in ["random() > 0", "val > changes()", "part < datetime('now')"] {
+        let message = refusal(
+            &tmp_db,
+            &conn,
+            &format!("REFRESH MATERIALIZED VIEW mv_nd WHERE {predicate}"),
+        );
+        assert!(
+            message.contains("evaluate the scope separately"),
+            "{predicate} must be refused: {message}"
+        );
+    }
+
+    assert_eq!(
+        view_rows(&conn, "mv_nd"),
+        vec![
+            ("a1".to_string(), 1),
+            ("a2".to_string(), 2),
+            ("b1".to_string(), 3)
+        ],
+        "a refused scope must not have moved the view"
+    );
+
+    // A deterministic scope over the same columns is unaffected.
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "REFRESH MATERIALIZED VIEW mv_nd WHERE part = 'p1'",
+    )?;
+    Ok(())
+}
+
 /// `msg_key(uuid, part, val)` with `part` a key column the source can filter
 /// on, recording every qualifier it is handed.
 #[derive(Debug)]
