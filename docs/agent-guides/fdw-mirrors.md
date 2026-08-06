@@ -150,6 +150,17 @@ qualified name (the scan and the mirror are two different tables), a parameter
 refused too: the rebuild path is authoritative over its whole scan and has
 nothing to bound.
 
+Because the predicate runs twice — once per side — it must be a function of the
+row alone, so `validate_scope` also refuses a non-deterministic call
+(`random()`, `datetime('now')`, `changes()`, `CURRENT_TIMESTAMP`), an aggregate
+or window call, and a name it cannot resolve. Determinism is the schema-expression
+notion (`is_deterministic_schema_function_call`), so a scope is usable exactly
+where an expression index over the same predicate would be. Affinity needs no
+special handling: the comparison takes its affinity from the column declaration
+on both sides, so a `TEXT`-declared column probed with a numeric literal selects
+alike even when the driver hands back integers the mirror stores as text
+(`test_a_scope_selects_alike_when_the_driver_ignores_the_declared_affinity`).
+
 ## REFRESH with dependents
 
 A matview other matviews are defined over can be refreshed; nothing refuses it.

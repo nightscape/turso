@@ -379,6 +379,10 @@ impl MirrorSync {
     /// sweep's own statements have nothing bound to — would either fail deep
     /// inside a sweep or, worse, bound the retraction by something other than
     /// what the scan was scoped by.
+    ///
+    /// A predicate whose value moves is refused for that second reason: the
+    /// scan and the bound evaluate the scope in separate statements, so only a
+    /// function of the row alone makes the two cover the same rows.
     pub fn validate_scope(&self, scope: &RefreshScope) -> Result<()> {
         let RefreshScope::Scoped(predicate) = scope else {
             return Ok(());
@@ -420,11 +424,68 @@ impl MirrorSync {
                         "must be a predicate over the source's own columns; a subquery is not one",
                     ));
                 }
+                ast::Expr::FunctionCall {
+                    name,
+                    args,
+                    filter_over,
+                    ..
+                } => self.check_scope_function(name.as_str(), args, filter_over)?,
+                ast::Expr::FunctionCallStar { name, filter_over } => {
+                    self.check_scope_function(name.as_str(), &[], filter_over)?
+                }
+                ast::Expr::Literal(
+                    ast::Literal::CurrentDate
+                    | ast::Literal::CurrentTime
+                    | ast::Literal::CurrentTimestamp,
+                ) => return Err(self.moving_scope_error("reads the current time")),
                 _ => {}
             }
             Ok(WalkControl::Continue)
         })?;
         Ok(())
+    }
+
+    /// Refuse a call the scope's two evaluations could disagree about.
+    ///
+    /// Determinism is the schema-expression notion — the one that already
+    /// decides what may sit in an index or a generated column — so a scope is
+    /// usable exactly where an expression index over the same predicate would
+    /// be. A name that resolves to nothing here cannot be shown deterministic,
+    /// and the sweep is a bad place to find that out.
+    fn check_scope_function(
+        &self,
+        name: &str,
+        args: &[Box<ast::Expr>],
+        filter_over: &ast::FunctionTail,
+    ) -> Result<()> {
+        if filter_over.over_clause.is_some() {
+            return Err(self.scope_error(
+                "must be a predicate over one row of the source; a window function is not one",
+            ));
+        }
+        let normalized = crate::util::normalize_ident(name);
+        let Some(func) = crate::function::Func::resolve_function(&normalized, args.len())? else {
+            return Err(self.scope_error(&format!(
+                "calls '{name}', which this database cannot resolve to a function"
+            )));
+        };
+        if matches!(func, crate::function::Func::Agg(_)) {
+            return Err(self.scope_error(
+                "must be a predicate over one row of the source; an aggregate is not one",
+            ));
+        }
+        if !crate::schema::is_deterministic_schema_function_call(&func, args) {
+            return Err(self.moving_scope_error(&format!("calls '{name}'")));
+        }
+        Ok(())
+    }
+
+    fn moving_scope_error(&self, problem: &str) -> LimboError {
+        self.scope_error(&format!(
+            "{problem}, whose result can change between calls: the scan and the \
+             retraction bound evaluate the scope separately, so the two would not \
+             agree on which rows it covers"
+        ))
     }
 
     fn scope_error(&self, problem: &str) -> LimboError {
