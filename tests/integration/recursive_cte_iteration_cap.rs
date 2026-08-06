@@ -1,14 +1,9 @@
-//! Regression tests for the recursive-CTE iteration cap.
+//! Regression test against silent truncation of deep recursive CTEs.
 //!
-//! `translate_recursive_cte` emits a guard at the top of the main recursion loop
-//! (`core/translate/select.rs`) that compares an iteration counter against
-//! `DEFAULT_RECURSIVE_MAX_ITERATIONS` (`core/translate/logical.rs`) and errors on breach.
-//!
-//! Two properties are asserted here:
-//!   1. An ordinary hierarchy deeper than the old cap is walked completely.
-//!   2. A recursion that genuinely cannot converge fails loudly instead of silently truncating.
+//! Bounding a runaway recursion is the job of interruption and the query deadline
+//! (`tests/integration/recursive_cte_runaway.rs`), not of an iteration cap.
 
-use crate::common::{limbo_exec_rows, try_limbo_exec_rows, TempDatabase};
+use crate::common::{limbo_exec_rows, TempDatabase};
 use std::sync::Arc;
 use turso_core::Connection;
 
@@ -29,8 +24,8 @@ fn seed_chain(conn: &Arc<Connection>, len: usize) {
     limbo_exec_rows(conn, "COMMIT");
 }
 
-/// Walks the whole chain from the root. `len` exceeds `DEFAULT_RECURSIVE_MAX_ITERATIONS`, so a
-/// silently-truncating guard would return fewer than `len` rows.
+/// Walks the whole chain from the root. `len` is far past any plausible per-query iteration
+/// bound, so a silently-truncating implementation would return fewer than `len` rows.
 #[test]
 fn recursive_cte_walks_chain_deeper_than_the_old_cap() {
     let len = 2000;
@@ -52,37 +47,5 @@ fn recursive_cte_walks_chain_deeper_than_the_old_cap() {
         rows,
         vec![vec![rusqlite::types::Value::Integer(len as i64)]],
         "recursive CTE must walk all {len} levels, not stop at the iteration cap"
-    );
-}
-
-/// A `UNION ALL` self-reference with no termination condition can never converge. It must surface
-/// as an error. Returning a truncated result set would be a silent wrong answer, and looping
-/// forever would be an unkillable hang -- neither is acceptable.
-// REGRESSION (Option B, upstream recursive-CTE adoption): upstream's native
-// recursive-CTE implementation has no iteration cap, so this query now loops
-// forever instead of erroring -- the "unkillable hang" this test was written to
-// forbid. The stack's cap was deleted along with its translator. Ignored so the
-// suite terminates; the guard must be ported onto upstream's implementation
-// (core/translate/recursive_cte.rs) before this can be re-enabled.
-#[ignore = "upstream recursive CTE has no iteration cap; runaway query hangs (see comment)"]
-#[test]
-fn runaway_recursive_cte_errors_instead_of_truncating() {
-    let db = TempDatabase::new_empty();
-    let conn = db.connect_limbo();
-
-    let result = try_limbo_exec_rows(
-        &db,
-        &conn,
-        "WITH RECURSIVE forever(x) AS (
-             SELECT 1
-             UNION ALL
-             SELECT x FROM forever
-         )
-         SELECT count(*) FROM (SELECT x FROM forever)",
-    );
-
-    assert!(
-        result.is_err(),
-        "a non-converging recursive CTE must raise an error, but it returned: {result:?}"
     );
 }
