@@ -7,10 +7,10 @@ use crate::ast::{
     InitDeferredPred, InsertBody, JoinConstraint, JoinOperator, JoinType, JoinedSelectTable,
     LikeOperator, Limit, Literal, Materialized, Name, NamedColumnConstraint, NamedTableConstraint,
     NullsOrder, OneSelect, Operator, Over, PragmaBody, PragmaValue, QualifiedName, RefAct, RefArg,
-    ResolveType, ResultColumn, Select, SelectBody, SelectTable, ServerOption, Set, SortOrder,
-    SortedColumn, Stmt, TableConstraint, TableOptions, TransactionType, TriggerCmd, TriggerEvent,
-    TriggerTime, Type, TypeField, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update, Upsert,
-    UpsertDo, UpsertIndex, Variable, Window, WindowDef, With,
+    RefreshScope, ResolveType, ResultColumn, Select, SelectBody, SelectTable, ServerOption, Set,
+    SortOrder, SortedColumn, Stmt, TableConstraint, TableOptions, TransactionType, TriggerCmd,
+    TriggerEvent, TriggerTime, Type, TypeField, TypeOperator, TypeParam, TypeSize, UnaryOperator,
+    Update, Upsert, UpsertDo, UpsertIndex, Variable, Window, WindowDef, With,
 };
 use crate::error::Error;
 use crate::lexer::{Lexer, Token};
@@ -5508,7 +5508,13 @@ impl<'a> Parser<'a> {
         eat_expect!(self, TK_MATERIALIZED);
         eat_expect!(self, TK_VIEW);
         let view_name = self.parse_fullname(false)?;
-        Ok(Stmt::RefreshMaterializedView { view_name })
+        // The `WHERE` scopes the *scan*, not the view: it says which rows the
+        // refresh speaks for, and so which absences from it are deletions.
+        let scope = match self.parse_where()? {
+            Some(predicate) => RefreshScope::Scoped(predicate),
+            None => RefreshScope::Full,
+        };
+        Ok(Stmt::RefreshMaterializedView { view_name, scope })
     }
 
     fn parse_reindex(&mut self) -> Result<Stmt> {
