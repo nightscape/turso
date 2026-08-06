@@ -457,11 +457,18 @@ impl ToTokens for Stmt {
                 s.append(TK_AS, None)?;
                 select.to_tokens(s, context)
             }
-            Self::RefreshMaterializedView { view_name } => {
+            Self::RefreshMaterializedView { view_name, scope } => {
                 s.append(TK_REFRESH, None)?;
                 s.append(TK_MATERIALIZED, None)?;
                 s.append(TK_VIEW, None)?;
-                view_name.to_tokens(s, context)
+                view_name.to_tokens(s, context)?;
+                match scope {
+                    RefreshScope::Full => Ok(()),
+                    RefreshScope::Scoped(predicate) => {
+                        s.append(TK_WHERE, None)?;
+                        predicate.to_tokens(s, context)
+                    }
+                }
             }
             Self::CreateVirtualTable(CreateVirtualTable {
                 if_not_exists,
