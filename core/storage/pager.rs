@@ -5753,7 +5753,8 @@ impl Pager {
                     if freelist_count > 0 && first_freelist_trunk_page_id == 0 {
                         return Err(LimboError::Corrupt(format!(
                             "freelist_pages={freelist_count} but freelist_trunk_page=0"
-                        )));
+                        ))
+                        .into());
                     }
 
                     let old_db_size = header.database_size.get();

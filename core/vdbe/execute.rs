@@ -12964,8 +12964,23 @@ pub fn op_delete(
                     if let Some(record) = maybe_record {
                         let mut values = record.get_values_owned()?;
 
-                        // Fix rowid alias columns: replace Null with actual rowid value
-                        if let Some(table) = schema.get_table(table_name) {
+                        // A materialized view's btree row is its output row plus
+                        // a trailing multiset weight (see `Circuit::commit`'s
+                        // UpdateView state). Dependents consume this view's rows
+                        // in output shape — that is what the commit-time cascade
+                        // hands them — so the weight must not travel with the
+                        // retraction, or the retraction keys on a row no
+                        // insertion will ever match.
+                        if let Some(view) = schema.get_materialized_view(table_name) {
+                            let num_columns = view.lock().column_schema.flat_columns().len();
+                            turso_assert!(
+                                values.len() == num_columns + 1,
+                                "matview btree row is its columns plus a weight",
+                                { "table_name": table_name, "len": values.len(), "num_columns": num_columns }
+                            );
+                            values.truncate(num_columns);
+                        } else if let Some(table) = schema.get_table(table_name) {
+                            // Fix rowid alias columns: replace Null with actual rowid value
                             for (i, col) in table.columns().iter().enumerate() {
                                 if col.is_rowid_alias() && i < values.len() {
                                     values[i] = Value::from_i64(key);
@@ -15936,12 +15951,10 @@ pub fn op_sync_fdw_mirrors(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(SyncFdwMirrors { view_name, scope }, insn);
     let conn = program.connection.clone();
-    return_if_io!(sync_fdw_mirrors(
-        &conn,
+    return_if_io!(
         state,
-        view_name,
-        MirrorSyncMode::Sweep(scope)
-    ));
+        sync_fdw_mirrors(&conn, state, view_name, MirrorSyncMode::Sweep(scope))
+    );
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -15952,7 +15965,7 @@ pub fn op_populate_materialized_views(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(PopulateMaterializedViews { cursors }, insn);
+    load_insn!(PopulateMaterializedViews { cursors, cascade }, insn);
 
     let conn = program.connection.clone();
 
@@ -15989,12 +16002,10 @@ pub fn op_populate_materialized_views(
         // A view's mirrors are filled before the view reads its sources, so a
         // mirror is a faithful record of the foreign rows the view was built
         // from and later syncs have something to diff against.
-        return_if_io!(sync_fdw_mirrors(
-            &conn,
+        return_if_io!(
             state,
-            &view_name,
-            MirrorSyncMode::Rebuild
-        ));
+            sync_fdw_mirrors(&conn, state, &view_name, MirrorSyncMode::Rebuild)
+        );
 
         let schema = conn.schema.read();
         if let Some(view) = schema.get_materialized_view(&view_name) {
@@ -16041,7 +16052,40 @@ pub fn op_populate_materialized_views(
                 conn.view_transaction_states.mark_absorbed(&view_name);
             }
             // Now populate it with the cursor for writing
-            return_if_io!(state, view.populate_from_table(&conn, pager, btree_cursor));
+            return_if_io!(
+                state,
+                view.populate_from_table(&conn, pager, btree_cursor, *cascade)
+            );
+
+            // Hand the rebuild to the views defined over this one. Their input
+            // for this statement is now the clear loop's retraction of every row
+            // this view held, followed by these insertions — the two halves of
+            // one delta, staged into the same per-table delta under the same
+            // view name and keyed the same way, so an unchanged row cancels.
+            if *cascade == crate::incremental::view::PopulateCascade::ToDependents {
+                let rebuilt = view.take_populate_output();
+                drop(view);
+                let dependents = conn
+                    .schema
+                    .read()
+                    .get_dependent_materialized_views(&view_name);
+                for dep_view_name in dependents {
+                    let dep_tx_state = conn.view_transaction_states.get_or_create(&dep_view_name);
+                    for (row, weight) in rebuilt.changes.iter() {
+                        // One insertion per row, matching the clear loop's one
+                        // retraction per btree row: the stored multiset weight
+                        // is a property of the row, not a repeat count, on
+                        // either side. A negative net would mean the rebuild
+                        // retracted something the clear did not.
+                        turso_assert!(
+                            *weight > 0,
+                            "a rebuild from cleared state can only insert",
+                            { "view_name": view_name, "weight": *weight }
+                        );
+                        dep_tx_state.insert(&view_name, row.rowid, row.values.clone());
+                    }
+                }
+            }
         }
     }
 
