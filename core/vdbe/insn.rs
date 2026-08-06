@@ -1685,6 +1685,10 @@ pub enum Insn {
     PopulateMaterializedViews {
         /// Mapping of view name to cursor_id for writing to the view's btree
         cursors: Vec<(String, usize)>,
+        /// Whether the population's output is owed to the views defined over
+        /// the populated one. `REFRESH` retracted their contents on the way in
+        /// and owes them the re-insertions; `CREATE` retracted nothing.
+        cascade: crate::incremental::view::PopulateCascade,
     },
 
     /// Sync a materialized view's FDW mirrors incrementally, so the resulting

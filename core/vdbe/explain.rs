@@ -2034,14 +2034,14 @@ pub fn insn_to_row(
                 0,
                 where_clause.clone().unwrap_or_else(|| "NULL".to_string()),
             ),
-            Insn::PopulateMaterializedViews { cursors } => (
+            Insn::PopulateMaterializedViews { cursors, cascade } => (
                 "PopulateMaterializedViews",
                 0,
                 0,
                 0,
                 Value::Null,
                 cursors.len() as i64,
-                "".to_string(),
+                format!("{cascade:?}"),
             ),
             Insn::SyncFdwMirrors { view_name, scope } => (
                 "SyncFdwMirrors",

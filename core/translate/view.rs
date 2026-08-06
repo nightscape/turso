@@ -1,6 +1,9 @@
 use crate::alloc::TryClone;
 use crate::incremental::fdw_mirror::{mirror_specs_for_view, MirrorSpec};
-use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, view::IncrementalView};
+use crate::incremental::{
+    compiler::DBSP_CIRCUIT_VERSION,
+    view::{IncrementalView, PopulateCascade},
+};
 use crate::schema::{
     BTreeCharacteristics, BTreeTable, SchemaObjectType, DBSP_TABLE_PREFIX, RESERVED_TABLE_PREFIXES,
 };
@@ -765,10 +768,12 @@ pub fn translate_create_materialized_view(
         p5: 0,
     });
 
-    // Populate the materialized view
+    // Populate the materialized view. Nothing can be defined over a view that
+    // does not exist yet, so this population owes no dependent anything.
     let cursor_info = vec![(normalized_view_name.clone(), view_cursor_id)];
     program.emit_insn(Insn::PopulateMaterializedViews {
         cursors: cursor_info,
+        cascade: PopulateCascade::None,
     });
 
     program.epilogue(resolver.schema());
@@ -880,21 +885,6 @@ pub fn translate_refresh_materialized_view(
         )));
     }
 
-    // The rebuild below is not symmetric: clearing the btree row by row emits a
-    // retraction to every matview defined over this one, while the repopulation
-    // writes straight to the btree and emits nothing, so the dependents would be
-    // emptied and stay empty. Refuse rather than lose their contents silently.
-    // (The mirror-fed path above is exempt: it maintains the view through the
-    // ordinary delta path, which does cascade to dependents.)
-    let dependents = resolver.with_schema(database_id, |s| {
-        s.get_dependent_materialized_views(&normalized_view_name)
-    });
-    if let Some(first) = dependents.first() {
-        return Err(crate::LimboError::ParseError(format!(
-            "cannot REFRESH materialized view {normalized_view_name}: materialized view {first} is defined over it. Refresh from the leaves, or DROP and re-CREATE the dependents."
-        )));
-    }
-
     // Clear matview data
     emit_clear_btree(program, view_cursor_id, &normalized_view_name);
 
@@ -931,10 +921,13 @@ pub fn translate_refresh_materialized_view(
         }
     }
 
-    // Repopulate
+    // Repopulate. The clear above staged a retraction of every row this view
+    // held into each matview defined over it; the population stages the matching
+    // insertions, so a dependent sees exactly the difference the refresh made.
     let cursor_info = vec![(normalized_view_name, view_cursor_id)];
     program.emit_insn(Insn::PopulateMaterializedViews {
         cursors: cursor_info,
+        cascade: PopulateCascade::ToDependents,
     });
 
     program.epilogue(resolver.schema());

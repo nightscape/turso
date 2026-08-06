@@ -501,6 +501,12 @@ impl DeltaSet {
         self.deltas.insert(table_name, delta);
     }
 
+    /// Append a delta to whatever is already staged for a table, keeping the
+    /// changes already there ahead of the new ones.
+    pub fn append(&mut self, table_name: String, delta: Delta) {
+        self.deltas.entry(table_name).or_default().merge(&delta);
+    }
+
     /// Get delta for a table, returns empty delta if not found
     pub fn get(&self, table_name: &str) -> Delta {
         self.deltas

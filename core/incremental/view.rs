@@ -108,6 +108,24 @@ impl MatviewOrderBy {
     }
 }
 
+/// What a population owes the materialized views defined over the one being
+/// populated.
+///
+/// The two populations differ in what preceded them, not in what they compute.
+/// `REFRESH` first clears the view's btree row by row, and every one of those
+/// deletes reaches each dependent as a retraction; the population therefore owes
+/// each dependent the matching insertions. `CREATE` is preceded by nothing —
+/// the view is new, so no dependent has read it and none can exist yet — and an
+/// emission there would be a change nobody's state accounts for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PopulateCascade {
+    /// `CREATE MATERIALIZED VIEW`: emit nothing.
+    None,
+    /// `REFRESH MATERIALIZED VIEW`: accumulate the population's output delta so
+    /// it can be staged into every dependent, cancelling the clear's retractions.
+    ToDependents,
+}
+
 /// State machine for populating a view from its source table
 pub enum PopulateState {
     /// Initial state - need to prepare the query
@@ -547,6 +565,10 @@ pub struct IncrementalView {
     pub column_schema: ViewColumnSchema,
     // State machine for population
     populate_state: PopulateState,
+    // Net output of the population in progress, accumulated only under
+    // `PopulateCascade::ToDependents`. Survives I/O yields because the
+    // population resumes into the same view.
+    populate_output: Delta,
     // Computation tracker for statistics
     // We will use this one day to export rows_read, but for now, will just test that we're doing the expected amount of compute
     #[cfg_attr(not(test), allow(dead_code))]
@@ -932,6 +954,7 @@ impl IncrementalView {
             table_conditions,
             column_schema,
             populate_state: PopulateState::Start,
+            populate_output: Delta::new(),
             tracker,
             root_page: main_data_root,
             has_recursive_cte,
@@ -1020,7 +1043,17 @@ impl IncrementalView {
     /// every rebuilt row back out as already seen.
     pub fn reset_for_repopulate(&mut self) {
         self.populate_state = PopulateState::Start;
+        self.populate_output = Delta::new();
         self.circuit.discard_in_flight_commit();
+    }
+
+    /// The net output of the population that just finished, for the caller to
+    /// hand to this view's dependents. Empty unless the population ran under
+    /// [`PopulateCascade::ToDependents`].
+    pub fn take_populate_output(&mut self) -> Delta {
+        let mut delta = std::mem::take(&mut self.populate_output);
+        delta.consolidate();
+        delta
     }
 
     /// Execute the circuit with uncommitted changes to get processed delta
@@ -1867,6 +1900,7 @@ impl IncrementalView {
         conn: &crate::sync::Arc<crate::Connection>,
         pager: &crate::sync::Arc<crate::Pager>,
         _btree_cursor: &mut dyn CursorTrait,
+        cascade: PopulateCascade,
     ) -> crate::Result<IOResult<()>> {
         // Assert that this is a materialized view with a root page
         assert!(
@@ -1879,7 +1913,7 @@ impl IncrementalView {
         // and decrement on every exit (including IO yields and errors) so re-entrant
         // calls keep the counter balanced.
         conn.start_nested();
-        let result = self.populate_from_table_inner(conn, pager, _btree_cursor);
+        let result = self.populate_from_table_inner(conn, pager, _btree_cursor, cascade);
         conn.end_nested();
         result
     }
@@ -1889,6 +1923,7 @@ impl IncrementalView {
         conn: &crate::sync::Arc<crate::Connection>,
         pager: &crate::sync::Arc<crate::Pager>,
         _btree_cursor: &mut dyn CursorTrait,
+        cascade: PopulateCascade,
     ) -> crate::Result<IOResult<()>> {
         'outer: loop {
             match std::mem::replace(&mut self.populate_state, PopulateState::Done) {
@@ -1969,6 +2004,7 @@ impl IncrementalView {
                             values.clone(),
                             current_idx,
                             pager.clone(),
+                            cascade,
                         )? {
                             IOResult::Done(_) => {
                                 // Row processed successfully, continue to next row
@@ -2024,6 +2060,7 @@ impl IncrementalView {
                                     values.clone(),
                                     current_idx,
                                     pager.clone(),
+                                    cascade,
                                 )? {
                                     IOResult::Done(_) => {
                                         // Row processed successfully, continue to next row
@@ -2192,7 +2229,10 @@ impl IncrementalView {
                         input_map.clone()
                     };
                     match self.circuit.commit(data, pager.clone())? {
-                        IOResult::Done(_) => {
+                        IOResult::Done(output_delta) => {
+                            if cascade == PopulateCascade::ToDependents {
+                                self.populate_output.merge(&output_delta);
+                            }
                             self.populate_state = PopulateState::Done;
                             return Ok(IOResult::Done(()));
                         }
@@ -2235,6 +2275,7 @@ impl IncrementalView {
         values: Vec<Value>,
         table_idx: usize,
         pager: Arc<crate::Pager>,
+        cascade: PopulateCascade,
     ) -> crate::Result<IOResult<()>> {
         // Create a single-row delta
         let mut single_row_delta = Delta::new();
@@ -2245,10 +2286,13 @@ impl IncrementalView {
         let table_name = self.referenced_tables[table_idx].name.clone();
         delta_set.insert(table_name, single_row_delta);
 
-        // Process through merge_delta - we discard the output delta here since
-        // this is used during population, not during transaction commit
         match self.merge_delta(delta_set, pager)? {
-            IOResult::Done(_output_delta) => Ok(IOResult::Done(())),
+            IOResult::Done(output_delta) => {
+                if cascade == PopulateCascade::ToDependents {
+                    self.populate_output.merge(&output_delta);
+                }
+                Ok(IOResult::Done(()))
+            }
             IOResult::IO(io) => Ok(IOResult::IO(io)),
         }
     }
