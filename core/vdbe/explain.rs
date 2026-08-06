@@ -2043,14 +2043,19 @@ pub fn insn_to_row(
                 cursors.len() as i64,
                 "".to_string(),
             ),
-            Insn::SyncFdwMirrors { view_name } => (
+            Insn::SyncFdwMirrors { view_name, scope } => (
                 "SyncFdwMirrors",
                 0,
                 0,
                 0,
                 Value::build_text(view_name.clone()),
                 0,
-                view_name.clone(),
+                match scope {
+                    turso_parser::ast::RefreshScope::Full => view_name.clone(),
+                    turso_parser::ast::RefreshScope::Scoped(predicate) => {
+                        format!("{view_name} WHERE {predicate}")
+                    }
+                },
             ),
             Insn::Prev {
                 cursor_id,

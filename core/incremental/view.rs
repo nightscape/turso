@@ -1,6 +1,6 @@
 use super::compiler::{DbspCircuit, DbspCompiler, DeltaSet};
 use super::dbsp::{Delta, RowValues};
-use super::fdw_mirror::MirrorSync;
+use super::fdw_mirror::{MirrorSync, ScanQuery};
 use super::operator::ComputationTracker;
 use crate::numeric::Numeric;
 use crate::schema::{
@@ -809,7 +809,7 @@ impl IncrementalView {
         // The scan of the *foreign* table, taken before the redirect: it is how
         // the mirror gets filled, and after the redirect the view's own scans
         // read the mirror instead.
-        let source_scans = Self::generate_populate_queries(
+        let source_scans = Self::generate_populate_scans(
             select,
             referenced_tables,
             table_aliases,
@@ -1394,6 +1394,27 @@ impl IncrementalView {
         qualified_table_names: &HashMap<String, String>,
         table_conditions: &HashMap<String, Vec<Option<ast::Expr>>>,
     ) -> crate::Result<Vec<String>> {
+        Ok(Self::generate_populate_scans(
+            select_stmt,
+            referenced_tables,
+            table_aliases,
+            qualified_table_names,
+            table_conditions,
+        )?
+        .iter()
+        .map(ScanQuery::sql)
+        .collect())
+    }
+
+    /// The same scans, kept in parts, for the mirrors that must be able to
+    /// narrow theirs to a refresh scope.
+    fn generate_populate_scans(
+        select_stmt: &ast::Select,
+        referenced_tables: &[ReferencedTable],
+        table_aliases: &HashMap<String, String>,
+        qualified_table_names: &HashMap<String, String>,
+        table_conditions: &HashMap<String, Vec<Option<ast::Expr>>>,
+    ) -> crate::Result<Vec<ScanQuery>> {
         if referenced_tables.is_empty() {
             return Err(LimboError::ParseError(
                 "No tables to populate from".to_string(),
@@ -1433,12 +1454,11 @@ impl IncrementalView {
                 .unwrap_or_else(|| table.name.clone());
 
             // Construct the query for this table
-            let query = if where_clause.is_empty() {
-                format!("SELECT {select_clause} FROM {table_name}")
-            } else {
-                format!("SELECT {select_clause} FROM {table_name} WHERE {where_clause}")
-            };
-            tracing::debug!("populating materialized view with `{query}`");
+            let query = ScanQuery::new(
+                format!("SELECT {select_clause} FROM {table_name}"),
+                (!where_clause.is_empty()).then_some(where_clause),
+            );
+            tracing::debug!("populating materialized view with `{}`", query.sql());
             queries.push(query);
         }
 
@@ -4088,7 +4108,7 @@ mod fdw_mirror_redirect_tests {
         assert_eq!(syncs.len(), 1);
         assert_eq!(syncs[0].mirror_table, MIRROR);
         assert_eq!(
-            syncs[0].scan_query,
+            syncs[0].scan.sql(),
             "SELECT * FROM msg_fdw WHERE session_id = 's1'"
         );
         assert_eq!(syncs[0].identity, crate::alloc::vec![0]);

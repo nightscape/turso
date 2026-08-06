@@ -777,6 +777,7 @@ pub fn translate_create_materialized_view(
 
 pub fn translate_refresh_materialized_view(
     view_name: &ast::QualifiedName,
+    scope: ast::RefreshScope,
     resolver: &Resolver,
     connection: Arc<Connection>,
     program: &mut ProgramBuilder,
@@ -844,11 +845,39 @@ pub fn translate_refresh_materialized_view(
             .is_some_and(|view| !view.lock().mirror_syncs().is_empty())
     });
     if is_mirror_fed {
+        // The bound is evaluated against every mirror this view sweeps, so it
+        // has to be expressible over each of them. Checking here costs the
+        // sweep nothing and reports the mistake where the user can still act
+        // on it, rather than partway through the first mirror.
+        resolver.with_schema(database_id, |s| {
+            let view = s
+                .get_materialized_view(&normalized_view_name)
+                .expect("a mirror-fed view was just found in this schema");
+            let view = view.lock();
+            for sync in view.mirror_syncs() {
+                sync.validate_scope(&scope)?;
+            }
+            Ok::<(), crate::LimboError>(())
+        })?;
         program.emit_insn(Insn::SyncFdwMirrors {
             view_name: normalized_view_name,
+            scope,
         });
         program.epilogue(resolver.schema());
         return Ok(());
+    }
+
+    // Everything below rebuilds the view from a scan of its sources, which is
+    // authoritative over all of them by construction. A scope bounds which
+    // absences from a *partial* scan count as deletions, so there is nothing
+    // here for it to bound — accepting one and ignoring it would silently
+    // rebuild what the caller asked to leave alone.
+    if matches!(scope, ast::RefreshScope::Scoped(_)) {
+        return Err(crate::LimboError::ParseError(format!(
+            "cannot REFRESH materialized view {normalized_view_name} with a scope: \
+             a scope bounds which rows a partial scan of a mirrored foreign source \
+             speaks for, and {normalized_view_name} reads no mirror"
+        )));
     }
 
     // The rebuild below is not symmetric: clearing the btree row by row emits a

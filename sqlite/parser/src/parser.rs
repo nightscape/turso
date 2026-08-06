@@ -46,6 +46,7 @@ use crate::ast::{
     QualifiedName,
     RefAct,
     RefArg,
+    RefreshScope,
     ResolveType,
     ResultColumn,
     Select,
@@ -5549,7 +5550,13 @@ impl<'a> Parser<'a> {
         eat_expect!(self, TK_MATERIALIZED);
         eat_expect!(self, TK_VIEW);
         let view_name = self.parse_fullname(false)?;
-        Ok(Stmt::RefreshMaterializedView { view_name })
+        // The `WHERE` scopes the *scan*, not the view: it says which rows the
+        // refresh speaks for, and so which absences from it are deletions.
+        let scope = match self.parse_where()? {
+            Some(predicate) => RefreshScope::Scoped(predicate),
+            None => RefreshScope::Full,
+        };
+        Ok(Stmt::RefreshMaterializedView { view_name, scope })
     }
 
     fn parse_reindex(&mut self) -> Result<Stmt> {

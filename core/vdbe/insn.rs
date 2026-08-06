@@ -1693,6 +1693,9 @@ pub enum Insn {
     SyncFdwMirrors {
         /// The view whose mirrors to sync
         view_name: String,
+        /// How much of the source the syncing scan speaks for, and so which
+        /// mirror rows its silence may retract
+        scope: turso_parser::ast::RefreshScope,
     },
 
     /// Place the result of lhs >> rhs in dest register.

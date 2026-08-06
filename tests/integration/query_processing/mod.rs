@@ -63,6 +63,7 @@ mod test_fdw_null_identity;
 mod test_fdw_push;
 mod test_fdw_required_key;
 mod test_fdw_scan_cost;
+mod test_fdw_scoped_refresh;
 mod test_fdw_sweep_hazards;
 mod test_fdw_sweep_yield;
 mod test_foreign_table;

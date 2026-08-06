@@ -317,9 +317,10 @@ pub fn translate_inner(
             connection.clone(),
             program,
         )?,
-        ast::Stmt::RefreshMaterializedView { view_name } => {
+        ast::Stmt::RefreshMaterializedView { view_name, scope } => {
             view::translate_refresh_materialized_view(
                 &view_name,
+                scope,
                 resolver,
                 connection.clone(),
                 program,

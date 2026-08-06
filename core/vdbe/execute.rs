@@ -136,7 +136,7 @@ use super::{
     CommitState,
 };
 use crate::sync::{Mutex, RwLock};
-use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType};
+use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, RefreshScope, ResolveType};
 use turso_parser::parser::Parser;
 
 use super::sorter::Sorter;
@@ -14991,13 +14991,15 @@ fn drive_init_cdc_version(
 
 /// How a view's mirrors are being brought in line with their foreign sources.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum MirrorSyncMode {
+enum MirrorSyncMode<'a> {
     /// Discard and refill. The view is rebuilt from scratch alongside, so the
     /// DML's deltas are redundant and are dropped.
     Rebuild,
     /// Touch only what differs. The DML's deltas ARE the maintenance — nothing
-    /// else updates the view — so they must survive to commit.
-    Sweep,
+    /// else updates the view — so they must survive to commit. The scope rides
+    /// along here rather than beside the mode because a rebuild has none: it
+    /// reads the source whole by construction.
+    Sweep(&'a RefreshScope),
 }
 
 /// Bring every not-yet-synced FDW mirror of `view_name` in line with its
@@ -15012,7 +15014,7 @@ fn sync_fdw_mirrors(
     conn: &Arc<Connection>,
     state: &mut ProgramState,
     view_name: &str,
-    mode: MirrorSyncMode,
+    mode: MirrorSyncMode<'_>,
 ) -> Result<IOResult<()>> {
     conn.start_nested();
     let result = sync_fdw_mirrors_inner(conn, state, view_name, mode);
@@ -15041,7 +15043,7 @@ fn sync_fdw_mirrors_inner(
     conn: &Arc<Connection>,
     state: &mut ProgramState,
     view_name: &str,
-    mode: MirrorSyncMode,
+    mode: MirrorSyncMode<'_>,
 ) -> Result<IOResult<()>> {
     // (mirror, the statements that sync it, how to read its constraint
     // failures), in the view's own fixed order so re-entry after a yield walks
@@ -15061,7 +15063,7 @@ fn sync_fdw_mirrors_inner(
                 .map(|sync| {
                     let sql = match mode {
                         MirrorSyncMode::Rebuild => sync.rebuild_sql(),
-                        MirrorSyncMode::Sweep => sync.sweep_sql(),
+                        MirrorSyncMode::Sweep(scope) => sync.sweep_sql(scope),
                     };
                     (sync.mirror_table.clone(), sql, sync.clone())
                 })
@@ -15125,7 +15127,7 @@ fn sync_fdw_mirrors_inner(
     }
 
     // The divergence between the two modes, and the only place it exists.
-    if mode == MirrorSyncMode::Rebuild {
+    if matches!(mode, MirrorSyncMode::Rebuild) {
         // A rebuild is initial state, not a change: `populate_from_table` is
         // about to read these same rows and build the view from scratch.
         // Applying the rebuild's deltas at commit as well would count every row
@@ -15151,13 +15153,13 @@ pub fn op_sync_fdw_mirrors(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(SyncFdwMirrors { view_name }, insn);
+    load_insn!(SyncFdwMirrors { view_name, scope }, insn);
     let conn = program.connection.clone();
     return_if_io!(sync_fdw_mirrors(
         &conn,
         state,
         view_name,
-        MirrorSyncMode::Sweep
+        MirrorSyncMode::Sweep(scope)
     ));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
