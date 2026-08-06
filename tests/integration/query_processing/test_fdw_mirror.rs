@@ -1165,3 +1165,161 @@ fn test_failed_mirror_create_in_transaction_leaves_the_database_usable(
         .expect("DDL on a fresh connection must work too");
     Ok(())
 }
+
+/// A foreign table whose declared name is not already lower case.
+///
+/// The schema keys tables by their folded name but a virtual table keeps the
+/// spelling it was declared with, so a mirror source is the one place the two
+/// forms meet. `declared` is interpolated into the DDL verbatim, so a case can
+/// pass a quoted identifier.
+fn setup_fdw_named(
+    tmp_db: &TempDatabase,
+    conn: &std::sync::Arc<turso_core::Connection>,
+    declared: &str,
+    csv_path: &std::path::Path,
+    rows: &[(&str, &str, &str)],
+) {
+    rewrite_csv(csv_path, rows);
+    common::run_query(tmp_db, conn, "CREATE SERVER csv_srv OPTIONS (driver 'csv')").unwrap();
+    common::run_query(
+        tmp_db,
+        conn,
+        &format!(
+            "CREATE FOREIGN TABLE {declared} (uuid TEXT, session_id TEXT, body TEXT) \
+             SERVER csv_srv OPTIONS (path '{}', skip_header 'true', identity 'uuid')",
+            csv_path.display()
+        ),
+    )
+    .unwrap();
+}
+
+/// A source declared in mixed case must be usable as a mirror source at all.
+/// The mirror's identity is folded, so anything comparing it against the
+/// verbatim declared name fails to match and the view cannot be created.
+#[turso_macros::test(views)]
+fn test_mixed_case_declared_source_is_mirrored(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let csv_path = tmp_db.path.parent().unwrap().join("declared_mixed.csv");
+    setup_fdw_named(
+        &tmp_db,
+        &conn,
+        "MsgSrc",
+        &csv_path,
+        &[("m1", "s1", "one"), ("m2", "s1", "two")],
+    );
+
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_declared AS SELECT uuid, body FROM MsgSrc",
+    )?;
+    let rows: Vec<(String, String)> =
+        conn.exec_rows("SELECT uuid, body FROM mv_declared ORDER BY uuid");
+    assert_eq!(
+        rows,
+        vec![
+            ("m1".to_string(), "one".to_string()),
+            ("m2".to_string(), "two".to_string()),
+        ]
+    );
+
+    // The sweep round-trip: the mirror tracks the source, so the view does too.
+    rewrite_csv(&csv_path, &[("m1", "s1", "changed"), ("m3", "s1", "three")]);
+    common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_declared")?;
+    let rows: Vec<(String, String)> =
+        conn.exec_rows("SELECT uuid, body FROM mv_declared ORDER BY uuid");
+    assert_eq!(
+        rows,
+        vec![
+            ("m1".to_string(), "changed".to_string()),
+            ("m3".to_string(), "three".to_string()),
+        ]
+    );
+    Ok(())
+}
+
+/// A quoted declaration preserves case just as a bare one folds nowhere, and
+/// reaches the same seam.
+#[turso_macros::test(views)]
+fn test_quoted_declared_source_is_mirrored(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let csv_path = tmp_db.path.parent().unwrap().join("declared_quoted.csv");
+    setup_fdw_named(
+        &tmp_db,
+        &conn,
+        "\"MyTable\"",
+        &csv_path,
+        &[("m1", "s1", "one")],
+    );
+
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_quoted AS SELECT uuid, body FROM \"MyTable\"",
+    )?;
+    let rows: Vec<(String, String)> = conn.exec_rows("SELECT uuid, body FROM mv_quoted");
+    assert_eq!(rows, vec![("m1".to_string(), "one".to_string())]);
+
+    // The source is still reachable under a folded reference, and the sweep
+    // keeps the view in step.
+    rewrite_csv(&csv_path, &[("m1", "s1", "one"), ("m2", "s1", "two")]);
+    common::run_query(&tmp_db, &conn, "REFRESH MATERIALIZED VIEW mv_quoted")?;
+    let rows: Vec<(String, String)> =
+        conn.exec_rows("SELECT uuid, body FROM mv_quoted ORDER BY uuid");
+    assert_eq!(
+        rows,
+        vec![
+            ("m1".to_string(), "one".to_string()),
+            ("m2".to_string(), "two".to_string()),
+        ]
+    );
+    Ok(())
+}
+
+/// The view's predicate scopes the mirror, and the predicate is looked up by
+/// the source's name. A verbatim declared name misses a folded lookup key, and
+/// the miss is silent: the mirror fills from an unscoped scan of a source the
+/// driver may not even be able to enumerate.
+#[turso_macros::test(views)]
+fn test_mixed_case_declared_source_keeps_its_predicate(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let csv_path = tmp_db.path.parent().unwrap().join("declared_scoped.csv");
+    setup_fdw_named(
+        &tmp_db,
+        &conn,
+        "MsgScoped",
+        &csv_path,
+        &[
+            ("m1", "s1", "one"),
+            ("m2", "s2", "two"),
+            ("m3", "s1", "three"),
+        ],
+    );
+
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_scoped AS \
+         SELECT uuid, body FROM MsgScoped WHERE session_id = 's1'",
+    )?;
+
+    let rows: Vec<(String, String)> =
+        conn.exec_rows("SELECT uuid, body FROM mv_scoped ORDER BY uuid");
+    assert_eq!(
+        rows,
+        vec![
+            ("m1".to_string(), "one".to_string()),
+            ("m3".to_string(), "three".to_string()),
+        ]
+    );
+
+    let mirrored: Vec<(String,)> = conn.exec_rows(
+        "SELECT uuid FROM \"__turso_internal_fdw_mirror_v1_mv_scoped__msgscoped\" ORDER BY uuid",
+    );
+    assert_eq!(
+        mirrored,
+        vec![("m1".to_string(),), ("m3".to_string(),)],
+        "the mirror must hold only the rows the view's predicate selects"
+    );
+    Ok(())
+}
