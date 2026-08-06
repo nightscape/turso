@@ -60,6 +60,66 @@ fn view_rows(conn: &Arc<turso_core::Connection>, view: &str) -> Vec<(String, Str
     conn.exec_rows(&format!("SELECT uuid, body FROM {view} ORDER BY uuid"))
 }
 
+/// A source registered under a name that is not already lower case reaches the
+/// same seam through the Rust API as `CREATE FOREIGN TABLE MsgSrc` does through
+/// SQL: the schema keys it folded, the virtual table keeps it verbatim.
+#[turso_macros::test(views)]
+fn test_push_reaches_a_view_over_a_mixed_case_declared_source(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let (fdw, rows) = MemFdw::new("CREATE TABLE MsgPush(uuid TEXT, body TEXT)", vec![0]);
+    rows.set(vec![row("m1", "one")]);
+    conn.register_foreign_table("MsgPush", fdw.clone())?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_push_declared AS SELECT uuid, body FROM MsgPush",
+    )?;
+    let stream = turso_core::foreign::StreamingForeignData::subscribe(fdw.as_ref(), &[])?;
+
+    fdw.push(insert("m2", "two"));
+    conn.drain_fdw_stream("MsgPush", &stream)?;
+
+    assert_eq!(
+        view_rows(&conn, "mv_push_declared"),
+        vec![
+            ("m1".to_string(), "one".to_string()),
+            ("m2".to_string(), "two".to_string()),
+        ]
+    );
+    Ok(())
+}
+
+/// A push lands as DML on the mirror, so it only reaches a view that actually
+/// reads the mirror. Spelling the source in another case must not quietly leave
+/// the view reading the foreign table, where no push can ever reach it.
+#[turso_macros::test(views)]
+fn test_push_reaches_a_case_mismatched_view(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let (fdw, rows) = MemFdw::new("CREATE TABLE msg_push(uuid TEXT, body TEXT)", vec![0]);
+    rows.set(vec![row("m1", "one")]);
+    conn.register_foreign_table("msg_push", fdw.clone())?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv_push_case AS SELECT uuid, body FROM MSG_PUSH",
+    )?;
+    let stream = turso_core::foreign::StreamingForeignData::subscribe(fdw.as_ref(), &[])?;
+
+    fdw.push(insert("m2", "two"));
+    conn.drain_fdw_stream("msg_push", &stream)?;
+
+    assert_eq!(
+        view_rows(&conn, "mv_push_case"),
+        vec![
+            ("m1".to_string(), "one".to_string()),
+            ("m2".to_string(), "two".to_string()),
+        ]
+    );
+    Ok(())
+}
+
 /// The acceptance property: a row appearing at the source reaches the view with
 /// no `REFRESH` at all.
 #[turso_macros::test(views)]

@@ -183,3 +183,101 @@ test matview-maintained-by-case-mismatched-delete {
 expect {
     2|b
 }
+
+# HOLON-ONLY below: `REFRESH MATERIALIZED VIEW` and recursive CTEs both exist
+# only in this stack, so these groups have no upstream-portable form.
+
+# A view rebuilt from scratch must land on the same rows the incremental path
+# does, whatever case its source was spelled in.
+test matview-refresh-heals-case-mismatched-view {
+    CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO msg VALUES (1,'a'),(2,'b');
+    CREATE MATERIALIZED VIEW mv_ref AS SELECT id, body FROM MSG;
+    INSERT INTO MSG VALUES (3,'c');
+    REFRESH MATERIALIZED VIEW mv_ref;
+    SELECT id, body FROM mv_ref ORDER BY 1;
+}
+expect {
+    1|a
+    2|b
+    3|c
+}
+
+# A refresh must stay repeatable, and must still leave the view maintained.
+test matview-refresh-case-mismatched-view-is-repeatable {
+    CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO msg VALUES (1,'a');
+    CREATE MATERIALIZED VIEW mv_ref AS SELECT id, body FROM MSG;
+    REFRESH MATERIALIZED VIEW mv_ref;
+    REFRESH MATERIALIZED VIEW mv_ref;
+    INSERT INTO msg VALUES (2,'b');
+    SELECT id, body FROM mv_ref ORDER BY 1;
+}
+expect {
+    1|a
+    2|b
+}
+
+test matview-cte-name-is-case-insensitive {
+    CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO msg VALUES (1,'a'),(2,'b');
+    CREATE MATERIALIZED VIEW v_cte AS
+      WITH Src AS (SELECT id, body FROM msg) SELECT id, body FROM SRC;
+    SELECT id, body FROM v_cte ORDER BY 1;
+}
+expect {
+    1|a
+    2|b
+}
+
+# A CTE shadows a real table of the same name, and "the same name" folds case:
+# the view must read the CTE, never the table. (The CTE reads a base table of
+# its own because a matview needs a source to be maintained from.)
+test matview-cte-shadows-a-table-across-case {
+    CREATE TABLE msg (id INTEGER PRIMARY KEY, body TEXT);
+    CREATE TABLE other (id INTEGER PRIMARY KEY, body TEXT);
+    INSERT INTO msg VALUES (1,'a'),(2,'b');
+    INSERT INTO other VALUES (9,'z');
+    CREATE MATERIALIZED VIEW v_shadow AS
+      WITH MSG AS (SELECT id, body FROM other) SELECT id, body FROM msg;
+    SELECT id, body FROM v_shadow;
+}
+expect {
+    9|z
+}
+
+test matview-recursive-cte-name-is-case-insensitive {
+    CREATE TABLE node (id TEXT PRIMARY KEY, pid TEXT);
+    INSERT INTO node VALUES ('a','root'),('b','a'),('c','b');
+    CREATE MATERIALIZED VIEW v_rec AS
+      WITH RECURSIVE Tree AS (
+        SELECT id, pid, 0 AS depth FROM node WHERE pid = 'root'
+        UNION ALL
+        SELECT c.id, c.pid, p.depth + 1 FROM NODE c JOIN TREE p ON c.pid = p.id
+      ) SELECT id, depth FROM tree;
+    SELECT id, depth FROM v_rec ORDER BY 1;
+}
+expect {
+    a|0
+    b|1
+    c|2
+}
+
+# The recursive view stays maintained through a case-mismatched insert.
+test matview-recursive-cte-maintained-across-case {
+    CREATE TABLE node (id TEXT PRIMARY KEY, pid TEXT);
+    INSERT INTO node VALUES ('a','root'),('b','a');
+    CREATE MATERIALIZED VIEW v_rec AS
+      WITH RECURSIVE Tree AS (
+        SELECT id, pid, 0 AS depth FROM node WHERE pid = 'root'
+        UNION ALL
+        SELECT c.id, c.pid, p.depth + 1 FROM node c JOIN TREE p ON c.pid = p.id
+      ) SELECT id, depth FROM tree;
+    INSERT INTO NODE VALUES ('c','b');
+    SELECT id, depth FROM v_rec ORDER BY 1;
+}
+expect {
+    a|0
+    b|1
+    c|2
+}
