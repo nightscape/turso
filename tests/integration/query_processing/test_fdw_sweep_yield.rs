@@ -738,7 +738,7 @@ fn test_recovery_after_a_refused_sweep_converges_at_every_yield() {
         *source.lock().unwrap() = rows_of(DUPLICATED);
         exec(&conn, io.as_ref(), "REFRESH MATERIALIZED VIEW mv_yield").unwrap_err();
         *source.lock().unwrap() = rows_of(REPAIRED);
-        sweep_boundaries_on(&conn, io.as_ref())
+        boundaries_of(&conn, io.as_ref(), "REFRESH MATERIALIZED VIEW mv_yield")
     };
     assert!(boundaries > 0, "the recovery sweep performed no IO at all");
 
@@ -782,10 +782,10 @@ fn test_recovery_after_a_refused_sweep_converges_at_every_yield() {
     }
 }
 
-/// How many suspensions the pending sweep on `conn` has.
-fn sweep_boundaries_on(conn: &Arc<Connection>, io: &dyn IO) -> usize {
+/// How many suspensions running `sql` on `conn` has.
+fn boundaries_of(conn: &Arc<Connection>, io: &dyn IO, sql: &str) -> usize {
     let mut count = 0usize;
-    let mut stmt = conn.prepare("REFRESH MATERIALIZED VIEW mv_yield").unwrap();
+    let mut stmt = conn.prepare(sql).unwrap();
     loop {
         match stmt.step().unwrap() {
             StepResult::IO | StepResult::Yield => {
@@ -798,6 +798,185 @@ fn sweep_boundaries_on(conn: &Arc<Connection>, io: &dyn IO) -> usize {
         }
     }
     count
+}
+
+/// A source split across two sessions, so a scope on `session_id` covers part
+/// of it and is silent about the rest.
+const SCOPED_INITIAL: &[(&str, &str, &str)] = &[
+    ("k1", "s2", "keep"),
+    ("m1", "s1", "one"),
+    ("m2", "s1", "two"),
+    ("m3", "s1", "three"),
+];
+/// In scope: `m1` updated, `m2` deleted, `m4` inserted. Out of scope: `k1` is
+/// gone from the source too, but the scoped scan never asked about it, so its
+/// absence says nothing and the sweep must keep it.
+const SCOPED_CHANGED: &[(&str, &str, &str)] = &[
+    ("m1", "s1", "CHANGED"),
+    ("m3", "s1", "three"),
+    ("m4", "s1", "four"),
+];
+const SCOPED_SWEEP: &str = "REFRESH MATERIALIZED VIEW mv_yield WHERE session_id = 's1'";
+const SCOPED_CONVERGED: &[[&str; 2]] = &[
+    ["k1", "keep"],
+    ["m1", "CHANGED"],
+    ["m3", "three"],
+    ["m4", "four"],
+];
+
+/// Pins existing behaviour: the scope changes which statements the sweep runs,
+/// not how any of them resumes, and this is the coverage that says so.
+///
+/// A scoped sweep carries the scope in three places — the guard, the upsert's
+/// scan, and the anti-join's bound — and each is re-entered after every IO it
+/// performs. State advanced before one of those returns would show up here as a
+/// row the scope should have spared, or one it should have taken.
+#[test]
+fn test_scoped_sweep_under_io_yields_matches_synchronous_run() {
+    let mut results = Vec::new();
+    for (label, io) in [
+        ("sync", Arc::new(MemoryIO::new()) as Arc<dyn IO>),
+        ("yield", Arc::new(MemoryYieldIO::new()) as Arc<dyn IO>),
+    ] {
+        let source = Arc::new(Mutex::new(rows_of(SCOPED_INITIAL)));
+        let conn = setup(io.clone(), &format!("sweep_scoped_{label}.db"), &source);
+
+        *source.lock().unwrap() = rows_of(SCOPED_CHANGED);
+        exec(&conn, io.as_ref(), SCOPED_SWEEP).unwrap();
+
+        results.push(observe(&conn, io.as_ref()));
+    }
+
+    let (sync, yielded) = (&results[0], &results[1]);
+    assert_eq!(
+        sync.0, yielded.0,
+        "the scoped view diverged when the sweep yielded at every IO"
+    );
+    assert_eq!(
+        sync.1, yielded.1,
+        "the scoped mirror diverged when the sweep yielded at every IO"
+    );
+    assert_eq!(
+        sync.2, yielded.2,
+        "the yielding scoped sweep wrote a different number of mirror rows"
+    );
+
+    // The oracle is only sharp if the scope actually bounded something.
+    assert_eq!(sync.0, expect_rows(SCOPED_CONVERGED), "{:?}", sync.0);
+    assert_eq!(
+        sync.2, 3,
+        "one update, one in-scope delete and one insert is three written rows; \
+         the out-of-scope row costs nothing"
+    );
+}
+
+/// A scoped sweep abandoned at any of its suspensions must not lose the change
+/// and must not widen its scope on the way back: the next complete scoped sweep
+/// still reaches the source's contents, and the out-of-scope row is still there.
+///
+/// Pins existing behaviour. Every boundary the scoped sweep has is covered,
+/// discovered rather than assumed — a scope adds statements, so the unscoped
+/// count would not do.
+#[test]
+fn test_scoped_sweep_abandoned_at_each_yield_converges() {
+    let boundaries = {
+        let io = Arc::new(MemoryYieldIO::new()) as Arc<dyn IO>;
+        let source = Arc::new(Mutex::new(rows_of(SCOPED_INITIAL)));
+        let conn = setup(io.clone(), "sweep_scoped_probe.db", &source);
+        *source.lock().unwrap() = rows_of(SCOPED_CHANGED);
+        boundaries_of(&conn, io.as_ref(), SCOPED_SWEEP)
+    };
+    assert!(boundaries > 0, "the scoped sweep performed no IO at all");
+
+    for target in 1..=boundaries {
+        let io = Arc::new(MemoryYieldIO::new()) as Arc<dyn IO>;
+        let source = Arc::new(Mutex::new(rows_of(SCOPED_INITIAL)));
+        let conn = setup(
+            io.clone(),
+            &format!("sweep_scoped_abandon_{target}.db"),
+            &source,
+        );
+        *source.lock().unwrap() = rows_of(SCOPED_CHANGED);
+
+        if !exec_abandoning_at(&conn, io.as_ref(), SCOPED_SWEEP, target).unwrap() {
+            continue;
+        }
+
+        exec(&conn, io.as_ref(), SCOPED_SWEEP).unwrap();
+        let (view, mirror, _) = observe(&conn, io.as_ref());
+        assert_eq!(
+            view,
+            expect_rows(SCOPED_CONVERGED),
+            "the scoped view did not converge after abandoning at suspension {target}"
+        );
+        assert_eq!(mirror.len(), 4, "at suspension {target}: {mirror:?}");
+    }
+}
+
+/// A scoped sweep abandoned mid-flight leaves the view in step with its mirror,
+/// on the same terms as an unscoped one. Pins existing behaviour: the scope must
+/// not make a torn sweep tear differently.
+#[test]
+fn test_abandoned_scoped_sweep_leaves_view_in_step_with_mirror() {
+    let boundaries = {
+        let io = Arc::new(MemoryYieldIO::new()) as Arc<dyn IO>;
+        let source = Arc::new(Mutex::new(rows_of(SCOPED_INITIAL)));
+        let conn = setup(io.clone(), "sweep_scoped_torn_probe.db", &source);
+        *source.lock().unwrap() = rows_of(SCOPED_CHANGED);
+        boundaries_of(&conn, io.as_ref(), SCOPED_SWEEP)
+    };
+
+    for target in 1..=boundaries {
+        let io = Arc::new(MemoryYieldIO::new()) as Arc<dyn IO>;
+        let source = Arc::new(Mutex::new(rows_of(SCOPED_INITIAL)));
+        let conn = setup(
+            io.clone(),
+            &format!("sweep_scoped_torn_{target}.db"),
+            &source,
+        );
+        *source.lock().unwrap() = rows_of(SCOPED_CHANGED);
+
+        if !exec_abandoning_at(&conn, io.as_ref(), SCOPED_SWEEP, target).unwrap() {
+            continue;
+        }
+
+        let (view, mirror, _) = observe(&conn, io.as_ref());
+        assert_eq!(
+            view.len(),
+            mirror.len(),
+            "view and mirror disagree after abandoning a scoped sweep at suspension {target}: \
+             view={view:?} mirror={mirror:?}"
+        );
+    }
+}
+
+/// Repeated scoped sweeps under yields converge rather than drift: the second
+/// and third must write nothing, and must not start retracting the rows their
+/// scope never covered.
+#[test]
+fn test_repeated_scoped_sweeps_under_io_yields_are_inert() {
+    let io = Arc::new(MemoryYieldIO::new()) as Arc<dyn IO>;
+    let source = Arc::new(Mutex::new(rows_of(SCOPED_INITIAL)));
+    let conn = setup(io.clone(), "sweep_scoped_inert.db", &source);
+
+    exec(&conn, io.as_ref(), SCOPED_SWEEP).unwrap();
+    let (_, _, after_first) = observe(&conn, io.as_ref());
+    assert_eq!(
+        after_first, 0,
+        "the first scoped sweep over an unchanged source already had nothing to do"
+    );
+
+    for _ in 0..3 {
+        exec(&conn, io.as_ref(), SCOPED_SWEEP).unwrap();
+    }
+
+    let (view, mirror, cdc) = observe(&conn, io.as_ref());
+    assert_eq!(
+        cdc, 0,
+        "a no-change scoped sweep must write nothing even under yields"
+    );
+    assert_eq!(view.len(), 4, "{view:?}");
+    assert_eq!(mirror.len(), 4, "{mirror:?}");
 }
 
 /// The other broken promise, under the same yielding IO: a NULL identity is
