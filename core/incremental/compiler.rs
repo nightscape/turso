@@ -950,6 +950,29 @@ impl DbspCircuit {
             .collect()
     }
 
+    /// Cursor over the materialized view's own btree, with the yield context
+    /// every IVM-owned cursor must carry (see `install_dbsp_yield_context`).
+    fn new_view_cursor(
+        &self,
+        pager: &Arc<Pager>,
+        is_index: bool,
+        order_by: &super::view::MatviewOrderBy,
+        num_columns: usize,
+    ) -> Box<BTreeCursor> {
+        let mut cursor = if is_index {
+            BTreeCursor::new_index_with_index_info(
+                pager.clone(),
+                self.main_data_root,
+                order_by.to_index_info(),
+                num_columns,
+            )
+        } else {
+            BTreeCursor::new_table(pager.clone(), self.main_data_root, num_columns)
+        };
+        install_dbsp_yield_context(&mut cursor, pager);
+        Box::new(cursor)
+    }
+
     /// Execute the circuit with incremental input data (deltas).
     ///
     /// # Arguments
@@ -1192,9 +1215,6 @@ impl DbspCircuit {
 
         self.restore_recursive_operators_if_needed(&pager)?;
 
-        // Get btree root pages
-        let main_data_root = self.main_data_root;
-
         // Add 1 for the weight column that we store in the btree
         let num_columns = self.output_schema.columns.len() + 1;
 
@@ -1271,20 +1291,12 @@ impl DbspCircuit {
                     // ORDER BY views use an index btree (composite-keyed by
                     // sort cols + rowid); plain matviews use a table btree
                     // keyed by rowid.
-                    let view_cursor: Box<BTreeCursor> = if is_index_organized {
-                        Box::new(BTreeCursor::new_index_with_index_info(
-                            pager.clone(),
-                            main_data_root,
-                            self.order_by.to_index_info(),
-                            num_columns,
-                        ))
-                    } else {
-                        Box::new(BTreeCursor::new_table(
-                            pager.clone(),
-                            main_data_root,
-                            num_columns,
-                        ))
-                    };
+                    let view_cursor: Box<BTreeCursor> = self.new_view_cursor(
+                        &pager,
+                        is_index_organized,
+                        &self.order_by,
+                        num_columns,
+                    );
 
                     self.commit_state = CommitState::UpdateView {
                         delta,
@@ -1353,16 +1365,8 @@ impl DbspCircuit {
                             matches!(write_row_state, WriteRowView::GetRecord)
                         };
                         if needs_fresh {
-                            *view_cursor = if is_index {
-                                Box::new(BTreeCursor::new_index_with_index_info(
-                                    pager.clone(),
-                                    main_data_root,
-                                    view_order_by.to_index_info(),
-                                    nc,
-                                ))
-                            } else {
-                                Box::new(BTreeCursor::new_table(pager.clone(), main_data_root, nc))
-                            };
+                            *view_cursor =
+                                self.new_view_cursor(&pager, is_index, view_order_by, nc);
                         }
 
                         if is_index {
@@ -1404,16 +1408,7 @@ impl DbspCircuit {
                         let delta = std::mem::take(delta);
                         // Take ownership of view_cursor - we'll create a new one for next row if needed.
                         // The replacement must match the btree page format.
-                        let placeholder: Box<BTreeCursor> = if is_index {
-                            Box::new(BTreeCursor::new_index_with_index_info(
-                                pager.clone(),
-                                main_data_root,
-                                view_order_by.to_index_info(),
-                                nc,
-                            ))
-                        } else {
-                            Box::new(BTreeCursor::new_table(pager.clone(), main_data_root, nc))
-                        };
+                        let placeholder = self.new_view_cursor(&pager, is_index, view_order_by, nc);
                         let view_cursor = std::mem::replace(view_cursor, placeholder);
 
                         self.commit_state = CommitState::UpdateView {
