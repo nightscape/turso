@@ -168,6 +168,13 @@ impl MaterializedViewCursor {
     /// inputs to our circuit — otherwise reads inside an open transaction miss
     /// changes that flowed in through an upstream matview but have not yet been
     /// committed (the COMMIT-time `apply_view_deltas` cascade hasn't run yet).
+    ///
+    /// An upstream's contribution is *appended* to whatever is already staged
+    /// under its name, never substituted for it: `REFRESH` stages the rebuild it
+    /// owes us directly into our own tx state (`op_populate_materialized_views`)
+    /// while marking the upstream's own state absorbed, so recomputing the
+    /// upstream yields nothing and substituting would drop the rebuild — the
+    /// read would return the pre-refresh value until COMMIT.
     fn ensure_tx_changes_computed(&mut self) -> IOResultOr<()> {
         if self.conn.matview_rebuild_in_progress() {
             // A rebuild is reading us as its source. It must see our committed
@@ -224,7 +231,7 @@ impl MaterializedViewCursor {
         };
         for ref_name in &our_refs {
             if let Some(out_delta) = upstream_outputs.deltas.get(ref_name) {
-                uncommitted.insert(ref_name.clone(), out_delta.clone());
+                uncommitted.append(ref_name.clone(), out_delta.clone());
             }
         }
 
@@ -357,7 +364,7 @@ impl MaterializedViewCursor {
             }
             for ref_name in &upstream_refs {
                 if let Some(out_delta) = outputs.deltas.get(ref_name) {
-                    sub_input.insert(ref_name.clone(), out_delta.clone());
+                    sub_input.append(ref_name.clone(), out_delta.clone());
                 }
             }
             let mut upstream_guard = upstream_arc.lock();
