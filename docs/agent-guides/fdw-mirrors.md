@@ -59,6 +59,18 @@ Zero-based column indices whose combined values recognise a row across scans.
   sweep's guard, since its `ON CONFLICT … DO UPDATE` would otherwise collapse
   duplicates silently, last-scanned-wins over an order no driver promises.
 
+- **One folded spelling, asserted.** A mirror is found by name, and missing it is
+  silent — the view would then read the foreign table directly and stage no
+  deltas — so every name on the path is normalized at its source rather than at
+  its uses. `ReferencedTable::name` is normalized by both constructors (a btree
+  table is already stored folded, but a virtual table keeps the spelling it was
+  declared with); `MirrorSpec::source_table` is normalized in
+  `mirror_specs_for_view`; and `mirror_table_name` folds *both* the view name and
+  the source name, because `CREATE` and the load path mint that name
+  independently. `rewrite_sources_to_mirrors` asserts its redirect map is keyed
+  by folded names, since a raw key there is a key that never matches
+  (`a_source_spelled_in_another_case_is_still_redirected`).
+
 `CsvFdw` accepts an `identity` table option so the feature is provable in-repo:
 `CREATE FOREIGN TABLE … OPTIONS (path '…', identity 'uuid')`.
 
@@ -66,8 +78,11 @@ Zero-based column indices whose combined values recognise a row across scans.
 
 `translate_refresh_materialized_view` branches: no foreign source, or a foreign
 source with no declared identity, gets today's byte-identical clear-and-rebuild.
-An identity-declaring foreign source instead syncs its mirrors and does nothing
-else — the sync's own DML drives the view through the normal commit path.
+An identity-declaring foreign source instead emits `Insn::SyncFdwMirrors` and
+does nothing else — the sync's own DML drives the view through the normal commit
+path. `sync_fdw_mirrors` in `core/vdbe/execute.rs` picks the SQL by
+`MirrorSyncMode`: `Rebuild` (a mirror-fed view being populated from scratch)
+runs `rebuild_sql`, `Sweep(&RefreshScope)` runs `sweep_sql(scope)`.
 
 `MirrorSync::sweep_sql` is three ordinary statements (so IO-yield resumability
 is the engine's existing behaviour, not a bespoke state machine):
@@ -135,6 +150,31 @@ qualified name (the scan and the mirror are two different tables), a parameter
 refused too: the rebuild path is authoritative over its whole scan and has
 nothing to bound.
 
+## REFRESH with dependents
+
+A matview other matviews are defined over can be refreshed; nothing refuses it.
+The clear-and-rebuild path maintains the dependents through the ordinary IVM
+path rather than a bespoke one, by emitting `Insn::PopulateMaterializedViews`
+with `cascade: PopulateCascade::ToDependents`. `CREATE` emits
+`PopulateCascade::None` — nothing can be defined over a view that does not exist
+yet, so its population owes no dependent anything.
+
+The two halves have to be one delta for this to be correct. The clear loop
+deletes every row the view held, staging one retraction each into the
+dependents' per-table delta; `populate_from_table` then collects the rebuilt
+rows into `populate_output` and stages one insertion each, keyed the same way
+and under the same view name. An unchanged row therefore cancels, and a
+dependent sees exactly the difference the refresh made. A negative net would
+mean the rebuild retracted something the clear did not, and is asserted against.
+
+`op_delete` truncates the trailing multiset weight before capturing the
+retraction. A matview's btree row is its output columns plus a weight written by
+`Circuit::commit`; the weight is a property of the stored row, not part of the
+row the circuit is keyed on, so carrying it into the delta would key the
+retraction differently from the insertion and defeat the cancellation. It is
+also not a repeat count: the clear loop stages one retraction per btree row and
+the rebuild one insertion per row, on either side.
+
 ## The push path
 
 `Connection::inject_fdw_changes(foreign_table, &[FdwChange])` — REFRESH without the
@@ -166,10 +206,21 @@ by `test_refresh_matview_on_fdw`.
 
 ## Key files
 
-- `core/incremental/fdw_mirror.rs` — `MirrorSpec` / `MirrorSync`: naming, DDL,
-  `sweep_sql`, `rebuild_sql`, push SQL, the identity-violation errors
+- `core/incremental/fdw_mirror.rs` — `MirrorSpec` / `MirrorSync` / `ScanQuery`:
+  naming, DDL, `sweep_sql`, `rebuild_sql`, `validate_scope`, push SQL, the
+  identity-violation errors, `rewrite_sources_to_mirrors`
+- `core/incremental/fdw_mirror_scope_tests.rs` — the scoped-sweep SQL unit tests
+- `core/incremental/view.rs` — `ReferencedTable`,
+  `redirect_foreign_sources_to_mirrors`, `mirror_syncs`, `PopulateCascade`
+- `core/translate/view.rs` — `translate_refresh_materialized_view`
+- `core/vdbe/execute.rs` — `MirrorSyncMode`, `sync_fdw_mirrors`,
+  `op_populate_materialized_views`, the `op_delete` weight truncation
+- `sqlite/parser/src/{ast.rs,parser.rs}` — `RefreshScope`
 - `core/foreign.rs` — `identity_columns`, `FdwChange`, `StreamingForeignData`
 - `core/connection.rs` — `inject_fdw_changes`, `drain_fdw_stream`
 - `core/schema.rs` — `FDW_MIRROR_TABLE_PREFIX`, `mirror_table_names_for_view`
 - `tests/integration/query_processing/test_fdw_*.rs` — mirror lifecycle, sweep
-  hazards, yield injection, push, required-key, scan cost
+  hazards, yield injection, push, required-key, scan cost, scoped refresh,
+  integer/null identity, CSV quoted columns
+- `tests/integration/query_processing/test_ivm_refresh_fdw_dependent.rs` — the
+  dependent cascade
