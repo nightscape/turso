@@ -213,6 +213,49 @@ fn a_scope_containing_a_subquery_is_refused() {
     assert!(message.contains("subquer"), "{message}");
 }
 
+/// The scope is evaluated twice — once by the scan against the source, once by
+/// the retraction bound against the mirror — and nothing makes the two
+/// evaluations agree except the predicate being a function of the row alone.
+/// A scope that answers differently each time it runs makes the bound unsound:
+/// the sweep would retract rows no scan spoke for, or spare rows one did.
+#[test]
+fn a_non_deterministic_scope_is_refused() {
+    for predicate in [
+        "random() > 0",
+        "body > randomblob(4)",
+        "session_id = datetime('now')",
+        "body > date()",
+        "changes() > 0",
+        "upper(body) = upper(sqlite_version())",
+        "body < CURRENT_TIMESTAMP",
+    ] {
+        let message = rejection(predicate);
+        assert!(
+            message.contains("evaluate the scope separately"),
+            "{predicate} must be refused as non-deterministic: {message}"
+        );
+    }
+}
+
+/// An aggregate has no value for a single row, which is all the bound and the
+/// scan ever look at one of.
+#[test]
+fn an_aggregate_scope_is_refused() {
+    let message = rejection("count(*) > 0");
+    assert!(message.contains("aggregate"), "{message}");
+}
+
+/// A name the engine cannot resolve cannot be shown deterministic either, and
+/// the scope is the wrong place to find that out late.
+#[test]
+fn a_scope_calling_an_unknown_function_is_refused() {
+    let message = rejection("no_such_fn(body) = 1");
+    assert!(
+        message.contains("no_such_fn") && message.contains("resolve"),
+        "{message}"
+    );
+}
+
 #[test]
 fn a_scope_over_mirror_columns_is_accepted() {
     let sync = sync(crate::alloc::vec![0]);
@@ -220,6 +263,11 @@ fn a_scope_over_mirror_columns_is_accepted() {
         "body > 'w'",
         "body IS NULL OR session_id = 's1'",
         "uuid < 'z'",
+        // Deterministic calls stay usable: the refusal is of the result that
+        // moves, not of function calls as such.
+        "upper(body) = 'W'",
+        "length(body) > 2",
+        "date(session_id) = '2020-01-01'",
     ] {
         sync.validate_scope(&scope(predicate))
             .unwrap_or_else(|err| panic!("{predicate} must be a usable scope: {err}"));
