@@ -41,7 +41,15 @@ pub struct MirrorSpec {
 /// predicate scopes which rows are fetched, and a driver may *require* a
 /// qualifier (`KeyColumn::required`) and so be unable to enumerate the table at
 /// all.
+///
+/// Both names are folded, because `CREATE` and the load path mint this name
+/// independently from whatever spelling their own statement used, and
+/// [`Schema::mirror_table_names_for_view`] rediscovers it from the prefix alone.
+///
+/// [`Schema::mirror_table_names_for_view`]: crate::schema::Schema::mirror_table_names_for_view
 pub fn mirror_table_name(view_name: &str, source_table: &str) -> String {
+    let view_name = crate::util::normalize_ident(view_name);
+    let source_table = crate::util::normalize_ident(source_table);
     format!("{FDW_MIRROR_TABLE_PREFIX}{view_name}__{source_table}")
 }
 
@@ -496,7 +504,8 @@ pub fn mirror_specs_for_view(
         }
 
         specs.push(MirrorSpec {
-            source_table: source_table.clone(),
+            // Folded, because it keys the source-to-mirror redirect.
+            source_table: crate::util::normalize_ident(source_table),
             mirror_table: mirror_table_name(view_name, source_table),
             columns,
             identity: identity.to_vec(),
@@ -515,6 +524,15 @@ pub fn mirror_specs_for_view(
 /// rewritten statement's referenced tables, its compiled circuit and its
 /// populate scan naming the same thing.
 pub fn rewrite_sources_to_mirrors(select: &mut ast::Select, mirrors: &HashMap<String, String>) {
+    // Sources are matched by folded spelling, so a raw key here would be a key
+    // nothing can ever match: the view would compile against the foreign table
+    // and silently keep snapshot semantics while its mirror is swept for nobody.
+    assert!(
+        mirrors
+            .keys()
+            .all(|source| *source == crate::util::normalize_ident(source)),
+        "mirrors must be keyed by the normalized source name"
+    );
     rewrite_select(select, mirrors, &HashSet::default());
 }
 
@@ -526,7 +544,7 @@ fn rewrite_select(
     let mut cte_names = parent_cte_names.clone();
     if let Some(with) = select.with.as_mut() {
         for cte in with.ctes.iter() {
-            cte_names.insert(cte.tbl_name.as_str().to_string());
+            cte_names.insert(crate::util::normalize_ident(cte.tbl_name.as_str()));
         }
         for cte in with.ctes.iter_mut() {
             rewrite_select(&mut cte.select, mirrors, &cte_names);
@@ -565,10 +583,14 @@ fn rewrite_select_table(
         return;
     };
     let source = name.name.as_str().to_string();
-    if cte_names.contains(&source) {
+    // Both sets are keyed by the folded spelling, as every other identity site
+    // in the plan is. The alias keeps the user's own spelling, which qualifiers
+    // resolve against case-insensitively anyway.
+    let folded = crate::util::normalize_ident(&source);
+    if cte_names.contains(&folded) {
         return;
     }
-    let Some(mirror) = mirrors.get(&source) else {
+    let Some(mirror) = mirrors.get(&folded) else {
         return;
     };
     name.name = ast::Name::exact(mirror.clone());
