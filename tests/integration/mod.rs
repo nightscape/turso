@@ -18,6 +18,7 @@ mod pragma;
 mod query_processing;
 mod query_timeout;
 mod queued_io;
+mod recursive_cte_dependent_matview;
 mod recursive_cte_iteration_cap;
 mod recursive_cte_order_by;
 mod recursive_cte_plan_shape;
