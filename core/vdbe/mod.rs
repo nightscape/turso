@@ -2396,10 +2396,8 @@ impl Program {
                 } => {
                     // At this point we know it's not a rollback
                     if *current_index >= views.len() {
-                        // Notify BEFORE clearing - callbacks fire BEFORE commit completes.
-                        // WARNING: Changes may still be rolled back if a later error occurs.
-                        // If your use case requires guaranteed committed data, poll the view
-                        // directly after the transaction completes.
+                        // Events are built here, where the deltas still exist, but only
+                        // STAGED: `commit_txn` announces them once the commit is durable.
 
                         // Step 1: Gather schema info BEFORE acquiring callback lock (avoid lock ordering issues)
                         let mut view_schemas: std::collections::HashMap<String, Vec<String>> =
@@ -2421,27 +2419,8 @@ impl Program {
                         }
                         // Schema lock is now dropped
 
-                        // Step 2: Clone callbacks to avoid holding lock during execution (race condition fix)
-                        let callbacks_to_invoke: Vec<(
-                            crate::types::RelationFilter,
-                            crate::types::ChangeCallbackFn,
-                        )> = {
-                            let callbacks = self.connection.db.change_callbacks.read();
-                            if callbacks.is_empty() {
-                                Vec::new()
-                            } else {
-                                callbacks
-                                    .iter()
-                                    .map(|(_id, filter, callback)| {
-                                        (filter.clone(), Arc::clone(callback))
-                                    })
-                                    .collect()
-                            }
-                        };
-                        // Callback lock is now dropped
-
-                        // Step 3: Build events and invoke callbacks
-                        if !callbacks_to_invoke.is_empty() {
+                        // Step 2: Build and stage one event per view whose output changed
+                        if self.connection.has_change_callbacks() {
                             for view_name in views.iter() {
                                 // Skip views without schema - don't use fake column names
                                 let Some(column_names) = view_schemas.get(view_name) else {
@@ -2502,34 +2481,13 @@ impl Program {
                                     continue;
                                 }
 
-                                // Build the event with schema metadata
-                                let event = crate::types::RelationChangeEvent {
-                                    relation_name: view_name.clone(),
-                                    columns: column_names.clone(),
-                                    changes,
-                                };
-
-                                // Call registered callbacks with panic protection
-                                for (filter, callback) in &callbacks_to_invoke {
-                                    let should_fire = filter
-                                        .as_ref()
-                                        .map(|f| f.contains(view_name))
-                                        .unwrap_or(true);
-                                    if should_fire {
-                                        let result = std::panic::catch_unwind(
-                                            std::panic::AssertUnwindSafe(|| {
-                                                callback(&event);
-                                            }),
-                                        );
-                                        if let Err(panic_info) = result {
-                                            tracing::error!(
-                                                "Matview change callback panicked for view '{}': {:?}",
-                                                view_name,
-                                                panic_info
-                                            );
-                                        }
-                                    }
-                                }
+                                self.connection.stage_change_event(
+                                    crate::types::RelationChangeEvent::staged(
+                                        view_name.clone(),
+                                        column_names.clone(),
+                                        changes,
+                                    ),
+                                );
                             }
                         }
 
@@ -2687,6 +2645,7 @@ impl Program {
             Ok(applied) => applied,
             Err(e) => {
                 self.connection.view_transaction_states.clear();
+                self.connection.clear_staged_change_events();
                 program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
                 return Err(e);
             }
@@ -2749,6 +2708,14 @@ impl Program {
                     self.connection.rollback_temp_schema();
                 } else {
                     self.connection.commit_temp_schema();
+                }
+                // Announce the transaction's change events only now: the commit
+                // has completed, so nothing staged can still be rolled back. A
+                // rollback announces nothing at all.
+                if rollback {
+                    self.connection.clear_staged_change_events();
+                } else {
+                    self.connection.dispatch_staged_change_events();
                 }
             }
         }

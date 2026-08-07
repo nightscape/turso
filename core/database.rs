@@ -2396,6 +2396,7 @@ impl Database {
             #[cfg(any(test, injected_yields))]
             yield_instance_id_counter: AtomicU64::new(1),
             view_transaction_states: AllViewsTxState::new(),
+            staged_change_events: RwLock::new(Vec::new()),
             metrics: RwLock::new(ConnectionMetrics::new()),
             nestedness: AtomicI32::new(0),
             matview_rebuild_depth: AtomicI32::new(0),

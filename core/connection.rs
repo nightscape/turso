@@ -473,6 +473,10 @@ pub struct Connection {
     /// Per-connection view transaction states for uncommitted changes. This represents
     /// one entry per view that was touched in the transaction.
     pub(crate) view_transaction_states: AllViewsTxState,
+    /// Change events built during this transaction but not yet announced. They
+    /// are dispatched only once the transaction is committed and durable, and
+    /// dropped if it rolls back, so a consumer never sees a phantom delta.
+    pub(crate) staged_change_events: RwLock<Vec<crate::types::RelationChangeEvent>>,
     /// Connection-level metrics aggregation
     pub metrics: RwLock<ConnectionMetrics>,
     /// Greater than zero if connection executes a program within a program
@@ -5367,6 +5371,76 @@ impl Connection {
         // theirs, so undoing the transaction is the only point that can undo all
         // of them. Keeping any would merge phantom rows into the matview.
         self.view_transaction_states.clear();
+        self.clear_staged_change_events();
+    }
+
+    /// Queue a change event for announcement at the next successful commit.
+    pub(crate) fn stage_change_event(&self, event: crate::types::RelationChangeEvent) {
+        self.staged_change_events.write().push(event);
+    }
+
+    /// Drop every event staged by the current transaction.
+    pub(crate) fn clear_staged_change_events(&self) {
+        self.staged_change_events.write().clear();
+    }
+
+    /// Stamp the commit envelope onto every event this transaction staged and
+    /// hand them to the registered callbacks. Callers must only reach this once
+    /// the transaction is committed and durable.
+    pub(crate) fn dispatch_staged_change_events(&self) {
+        let mut events = std::mem::take(&mut *self.staged_change_events.write());
+        if events.is_empty() {
+            return;
+        }
+
+        // Clone the callbacks out of the registry: a callback must never run
+        // with the registry lock held, because it may register or drop one.
+        let callbacks: Vec<(crate::types::RelationFilter, crate::types::ChangeCallbackFn)> = {
+            let registry = self.db.change_callbacks.read();
+            registry
+                .iter()
+                .map(|(_id, filter, callback)| (filter.clone(), Arc::clone(callback)))
+                .collect()
+        };
+        if callbacks.is_empty() {
+            return;
+        }
+
+        let commit_id = crate::types::next_commit_id();
+        let commit_len = events.len() as u32;
+        for (index, event) in events.iter_mut().enumerate() {
+            event.commit_id = commit_id;
+            event.commit_index = index as u32;
+            event.commit_len = commit_len;
+        }
+
+        for event in &events {
+            for (filter, callback) in &callbacks {
+                let should_fire = filter
+                    .as_ref()
+                    .map(|f| f.contains(&event.relation_name))
+                    .unwrap_or(true);
+                if !should_fire {
+                    continue;
+                }
+                // A panicking consumer must not unwind through the VDBE.
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(event)));
+                if let Err(panic_info) = result {
+                    tracing::error!(
+                        "Change callback panicked for relation '{}': {:?}",
+                        event.relation_name,
+                        panic_info
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whether anything is listening for change events. The emission sites use
+    /// this to skip building events nobody will receive.
+    pub(crate) fn has_change_callbacks(&self) -> bool {
+        !self.db.change_callbacks.read().is_empty()
     }
 
     /// Roll back transaction state for helpers that start a manual `BEGIN`

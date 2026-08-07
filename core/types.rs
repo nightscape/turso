@@ -3656,20 +3656,24 @@ impl CallbackId {
     }
 }
 
-/// Event data for materialized view change callbacks.
+/// Event data for materialized view and base table change callbacks.
 /// Provides both the changes and the schema metadata needed to interpret them.
 ///
 /// # Timing Behavior
 ///
-/// **IMPORTANT**: Callbacks fire BEFORE the transaction commits. This means:
-/// - Changes may still be rolled back if a later error occurs
-/// - The data in `changes` represents pending changes, not committed state
-/// - If you need guaranteed committed data, poll the view/table directly after
-///   the transaction completes successfully
+/// Callbacks fire AFTER the transaction has committed. The rows in `changes`
+/// are committed state, and a transaction that rolls back or fails to commit
+/// delivers no events at all — there is no retraction event and no "tentative"
+/// flag.
 ///
-/// This timing allows callbacks to be used for notifications and real-time updates
-/// where eventual consistency is acceptable, but is not suitable for use cases
-/// requiring transactional guarantees.
+/// # Commit envelope
+///
+/// One commit can change several relations, so it delivers several events. All
+/// events of one commit share `commit_id`, and `commit_index` / `commit_len`
+/// make the group self-delimiting: a consumer knows the group is complete once
+/// it has seen `commit_len` events for that `commit_id`. A callback registered
+/// with a [`RelationFilter`] sees only the matching subset, so it may receive
+/// fewer than `commit_len` events.
 #[derive(Debug)]
 pub struct RelationChangeEvent {
     /// Name of the materialized view or table that changed
@@ -3677,8 +3681,46 @@ pub struct RelationChangeEvent {
     /// Column names in the view/table, in the same order as values in DatabaseChange records
     pub columns: Vec<String>,
     /// The actual row changes (inserts, updates, deletes).
-    /// WARNING: These changes are pending and may be rolled back.
     pub changes: Vec<DatabaseChange>,
+    /// Identity of the commit this event belongs to. All events emitted for one
+    /// commit share this value. Never 0 for a delivered event.
+    pub commit_id: u64,
+    /// This event's position in its commit's fan-out. Always `< commit_len`.
+    pub commit_index: u32,
+    /// Number of events this commit delivers in total.
+    pub commit_len: u32,
+}
+
+impl RelationChangeEvent {
+    /// Build an event that is not yet attached to a commit. The envelope is
+    /// stamped by `Connection::dispatch_staged_change_events` once the commit
+    /// is durable; `commit_id == 0` marks the event as undelivered.
+    pub(crate) fn staged(
+        relation_name: String,
+        columns: Vec<String>,
+        changes: Vec<DatabaseChange>,
+    ) -> Self {
+        Self {
+            relation_name,
+            columns,
+            changes,
+            commit_id: 0,
+            commit_index: 0,
+            commit_len: 0,
+        }
+    }
+
+    /// Identity of the commit this event belongs to.
+    pub fn commit_id(&self) -> u64 {
+        self.commit_id
+    }
+}
+
+/// Hand out the next commit identity. Process-monotonic and never 0, so that
+/// `0` stays reserved for "not attached to a commit".
+pub(crate) fn next_commit_id() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Type alias for a change callback function that receives relation change events.

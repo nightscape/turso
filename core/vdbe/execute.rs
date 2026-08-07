@@ -4972,6 +4972,8 @@ pub fn op_auto_commit(
                 // is now rolled back; merging them at the next commit would corrupt
                 // the matview btree.
                 conn.view_transaction_states.clear();
+                // Same reason: these events describe writes this rollback undid.
+                conn.clear_staged_change_events();
                 conn.set_tx_state(TransactionState::None);
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 conn.set_cdc_transaction_id(-1);
@@ -19412,45 +19414,19 @@ pub fn op_notify_cdc_change(
         id: rowid,
     };
 
-    // Build the event
-    let event = crate::types::RelationChangeEvent {
-        relation_name: table_name.clone(),
-        columns: column_names,
-        changes: vec![database_change],
-    };
-
-    // Clone callbacks to avoid holding the lock during callback execution (race condition fix)
-    let callbacks_to_invoke: Vec<_> = {
-        let callbacks = program.connection.db.change_callbacks.read();
-        if callbacks.is_empty() {
-            return Ok(InsnFunctionStepResult::Done);
-        }
-        callbacks
-            .iter()
-            .filter(|(_id, filter, _callback)| {
-                filter
-                    .as_ref()
-                    .map(|f| f.contains(&table_name))
-                    .unwrap_or(true)
-            })
-            .map(|(_id, _filter, callback)| Arc::clone(callback))
-            .collect()
-    };
-    // Lock is now dropped
-
-    // Fire callbacks with panic protection to prevent unwinding through VDBE
-    for callback in callbacks_to_invoke {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            callback(&event);
-        }));
-        if let Err(panic_info) = result {
-            tracing::error!(
-                "CDC change callback panicked for table '{}': {:?}",
-                table_name,
-                panic_info
-            );
-        }
+    if !program.connection.has_change_callbacks() {
+        return Ok(InsnFunctionStepResult::Done);
     }
+
+    // Stage rather than fire: the row is not committed yet, and its event has to
+    // join the rest of this commit's fan-out. `commit_txn` announces the batch.
+    program
+        .connection
+        .stage_change_event(crate::types::RelationChangeEvent::staged(
+            table_name,
+            column_names,
+            vec![database_change],
+        ));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
