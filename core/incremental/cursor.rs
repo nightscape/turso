@@ -46,6 +46,18 @@ enum SeekState {
     Done,
 }
 
+/// What the transitively-upstream matviews contribute to a cursor's own
+/// uncommitted read.
+#[derive(Default)]
+struct UpstreamOutputs {
+    /// Uncommitted output delta per upstream matview name. Empty when
+    /// `any_full_result` is set.
+    deltas: rustc_hash::FxHashMap<String, Delta>,
+    /// Some view in the upstream chain yields its complete contents instead of
+    /// a delta, so nothing in the chain can be fed to a downstream circuit.
+    any_full_result: bool,
+}
+
 /// Cursor for reading materialized views that combines:
 /// 1. Persistent btree data (committed state)
 /// 2. Transaction-specific DBSP deltas (uncommitted changes)
@@ -185,6 +197,25 @@ impl MaterializedViewCursor {
 
         let upstream_outputs = return_if_io!(self.compute_upstream_outputs());
 
+        // An upstream that yields its COMPLETE contents has no delta to give us,
+        // and our circuit would add that complete result on top of the rows it
+        // already holds on disk. Fall back to the same escape hatch the upstream
+        // uses: evaluate our own SQL on the parent connection, which reads the
+        // upstream through its cursor and therefore sees its uncommitted rows
+        // exactly once.
+        if upstream_outputs.any_full_result {
+            let view_guard = self.view.lock();
+            let full_result = return_if_io!(view_guard.execute_full_result(&self.conn));
+            drop(view_guard);
+
+            self.uncommitted = RowKeyZSet::from_delta(&full_result);
+            self.full_result_mode = true;
+            self.last_tx_state_len = current_len;
+            self.sorted_index_snapshot = None;
+            self.sorted_index_pos = 0;
+            return Ok(IOResult::Done(()));
+        }
+
         let mut uncommitted = DeltaSet::new();
         for (table_name, delta) in self.tx_state.get_table_deltas() {
             uncommitted.insert(table_name, delta);
@@ -198,7 +229,7 @@ impl MaterializedViewCursor {
                 .collect()
         };
         for ref_name in &our_refs {
-            if let Some(out_delta) = upstream_outputs.get(ref_name) {
+            if let Some(out_delta) = upstream_outputs.deltas.get(ref_name) {
                 uncommitted.append(ref_name.clone(), out_delta.clone());
             }
         }
@@ -286,14 +317,26 @@ impl MaterializedViewCursor {
     /// Compute the uncommitted output delta for each transitively-upstream
     /// matview, in topological order. Each upstream's circuit is fed both its
     /// own base-table deltas and the output deltas of its already-processed
-    /// upstreams. Returns a map from matview name to that view's uncommitted
-    /// output delta.
-    fn compute_upstream_outputs(
-        &mut self,
-    ) -> Result<IOResult<rustc_hash::FxHashMap<String, Delta>>> {
+    /// upstreams.
+    ///
+    /// If any view in that chain yields a complete result rather than a delta,
+    /// no delta in the chain is usable — the complete result taints every view
+    /// below it — so we compute nothing and report it to the caller.
+    fn compute_upstream_outputs(&mut self) -> Result<IOResult<UpstreamOutputs>> {
         let upstream_names = self.collect_upstream_view_names();
-        let mut outputs: rustc_hash::FxHashMap<String, Delta> = rustc_hash::FxHashMap::default();
+        let mut outputs = UpstreamOutputs::default();
         if upstream_names.is_empty() {
+            return Ok(IOResult::Done(outputs));
+        }
+        {
+            let schema = self.conn.schema.read();
+            outputs.any_full_result = upstream_names.iter().any(|name| {
+                schema
+                    .get_materialized_view(name)
+                    .is_some_and(|view| view.lock().produces_full_result())
+            });
+        }
+        if outputs.any_full_result {
             return Ok(IOResult::Done(outputs));
         }
         for upstream_name in &upstream_names {
@@ -319,12 +362,12 @@ impl MaterializedViewCursor {
                 }
             }
             for ref_name in &upstream_refs {
-                if let Some(out_delta) = outputs.get(ref_name) {
+                if let Some(out_delta) = outputs.deltas.get(ref_name) {
                     sub_input.append(ref_name.clone(), out_delta.clone());
                 }
             }
             let mut upstream_guard = upstream_arc.lock();
-            let (output_delta, _is_full_result) = return_if_io!(upstream_guard
+            let (output_delta, is_full_result) = return_if_io!(upstream_guard
                 .execute_with_uncommitted(
                     sub_input,
                     self.pager.clone(),
@@ -332,7 +375,11 @@ impl MaterializedViewCursor {
                     &self.conn,
                 ));
             drop(upstream_guard);
-            outputs.insert(upstream_name.clone(), output_delta);
+            turso_assert!(
+                !is_full_result,
+                "views that yield a complete result are filtered out before this loop"
+            );
+            outputs.deltas.insert(upstream_name.clone(), output_delta);
         }
         Ok(IOResult::Done(outputs))
     }
@@ -593,23 +640,30 @@ impl MaterializedViewCursor {
                 } => {
                     let target = *target;
                     let original_target_rowid = *original_target_rowid;
-                    let btree_result =
-                        return_if_io!(self.btree_cursor.seek(SeekKey::TableRowId(target), op));
 
-                    let changes = match btree_result {
-                        SeekResult::Found => return_if_io!(self.read_btree_delta_entry()),
-                        SeekResult::TryAdvance => {
-                            // Transition to Advancing state before calling next/prev.
-                            // This ensures that if next/prev returns IO, we resume in
-                            // Advancing state and don't redundantly call seek again.
-                            self.seek_state = SeekState::Advancing {
-                                target,
-                                original_target_rowid,
-                                op,
-                            };
-                            continue;
+                    // In full-result mode the overlay IS the whole view; the
+                    // btree rows are already part of it and merging them in
+                    // would count them twice.
+                    let changes = if self.full_result_mode {
+                        Vec::new()
+                    } else {
+                        let btree_result =
+                            return_if_io!(self.btree_cursor.seek(SeekKey::TableRowId(target), op));
+                        match btree_result {
+                            SeekResult::Found => return_if_io!(self.read_btree_delta_entry()),
+                            SeekResult::TryAdvance => {
+                                // Transition to Advancing state before calling next/prev.
+                                // This ensures that if next/prev returns IO, we resume in
+                                // Advancing state and don't redundantly call seek again.
+                                self.seek_state = SeekState::Advancing {
+                                    target,
+                                    original_target_rowid,
+                                    op,
+                                };
+                                continue;
+                            }
+                            SeekResult::NotFound => Vec::new(),
                         }
-                        SeekResult::NotFound => Vec::new(),
                     };
 
                     return_if_io!(self.process_btree_changes(

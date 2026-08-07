@@ -1068,6 +1068,53 @@ impl IncrementalView {
         delta
     }
 
+    /// True when uncommitted reads of this view yield its COMPLETE contents
+    /// instead of an incremental delta (see [`Self::execute_full_result`]).
+    /// Callers that feed this view's output into another circuit must check
+    /// this first: a complete result is not a delta and must never be added to
+    /// a downstream operator's state.
+    pub fn produces_full_result(&self) -> bool {
+        self.has_recursive_cte
+    }
+
+    /// Evaluate the view's SQL directly on the parent connection, which sees
+    /// committed plus uncommitted data, and return the COMPLETE result.
+    ///
+    /// The DBSP circuit cannot compute an uncommitted delta for a recursive CTE:
+    /// the recursive output carries computed columns (paths) whose values differ
+    /// between commit-time and read-time evaluation, and seen_counts/seen_rows
+    /// use value hashes that do not match across those contexts, so the circuit
+    /// either drops rows or over-counts them wildly.
+    pub fn execute_full_result(
+        &self,
+        conn: &crate::sync::Arc<crate::Connection>,
+    ) -> crate::Result<crate::types::IOResult<Delta>> {
+        let sql = self.select_stmt.to_string();
+        let mut stmt = conn.prepare(&sql)?;
+        let mut delta = super::dbsp::Delta::new();
+        let mut rowid = 1i64;
+        loop {
+            match stmt.step()? {
+                crate::vdbe::StepResult::Row => {
+                    if let Some(row) = stmt.row() {
+                        let values: Vec<crate::types::Value> = row.get_values().cloned().collect();
+                        delta.insert(rowid, values);
+                        rowid += 1;
+                    }
+                }
+                crate::vdbe::StepResult::Done => break,
+                crate::vdbe::StepResult::IO => {
+                    let completion = crate::io::Completion::new_yield();
+                    return Ok(crate::types::IOResult::IO(crate::types::IOCompletions(
+                        completion,
+                    )));
+                }
+                _ => break,
+            }
+        }
+        Ok(crate::types::IOResult::Done(delta))
+    }
+
     /// Execute the circuit with uncommitted changes to get processed delta
     /// Returns (delta, is_full_result). When is_full_result is true, the delta
     /// contains the COMPLETE matview output (not an incremental change), and the
@@ -1079,40 +1126,8 @@ impl IncrementalView {
         execute_state: &mut crate::incremental::compiler::ExecuteState,
         conn: &crate::sync::Arc<crate::Connection>,
     ) -> crate::Result<crate::types::IOResult<(Delta, bool)>> {
-        if self.has_recursive_cte {
-            // For recursive CTE matviews, the DBSP incremental circuit can't correctly
-            // compute uncommitted deltas because:
-            // - The recursive output includes computed columns (paths) whose values
-            //   differ between commit-time and read-time computations
-            // - seen_counts/seen_rows use value hashes that don't match across contexts
-            // - This causes either missing rows or massive over-counting
-            //
-            // Instead, evaluate the matview SQL directly on the parent connection
-            // (which sees committed + uncommitted data). Return the full result.
-            let sql = self.select_stmt.to_string();
-            let mut stmt = conn.prepare(&sql)?;
-            let mut delta = super::dbsp::Delta::new();
-            let mut rowid = 1i64;
-            loop {
-                match stmt.step()? {
-                    crate::vdbe::StepResult::Row => {
-                        if let Some(row) = stmt.row() {
-                            let values: Vec<crate::types::Value> =
-                                row.get_values().cloned().collect();
-                            delta.insert(rowid, values);
-                            rowid += 1;
-                        }
-                    }
-                    crate::vdbe::StepResult::Done => break,
-                    crate::vdbe::StepResult::IO => {
-                        let completion = crate::io::Completion::new_yield();
-                        return Ok(crate::types::IOResult::IO(crate::types::IOCompletions(
-                            completion,
-                        )));
-                    }
-                    _ => break,
-                }
-            }
+        if self.produces_full_result() {
+            let delta = return_if_io!(self.execute_full_result(conn));
             return Ok(crate::types::IOResult::Done((delta, true)));
         }
 
