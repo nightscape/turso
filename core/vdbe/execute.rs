@@ -5366,6 +5366,8 @@ pub fn op_auto_commit(
                 // is now rolled back; merging them at the next commit would corrupt
                 // the matview btree.
                 conn.view_transaction_states.clear();
+                // Same reason: these events describe writes this rollback undid.
+                conn.clear_staged_change_events();
                 conn.set_tx_state(TransactionState::None);
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 conn.set_cdc_transaction_id(-1);
@@ -20177,21 +20179,23 @@ pub fn op_notify_cdc_change(
         unreachable!()
     };
 
-    notify_change_callbacks(
-        program,
-        state,
-        *table_name_reg,
-        *change_type,
-        *rowid_reg,
-        *before_record_reg,
-        *after_record_reg,
-    );
+    if program.connection.has_change_callbacks() {
+        stage_cdc_change_event(
+            program,
+            state,
+            *table_name_reg,
+            *change_type,
+            *rowid_reg,
+            *before_record_reg,
+            *after_record_reg,
+        );
+    }
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
 
-fn notify_change_callbacks(
+fn stage_cdc_change_event(
     program: &Program,
     state: &ProgramState,
     table_name_reg: usize,
@@ -20200,7 +20204,6 @@ fn notify_change_callbacks(
     before_record_reg: usize,
     after_record_reg: usize,
 ) {
-    // Extract table name from register - translator guarantees this is Text
     let table_name = match &state.registers[table_name_reg].get_value() {
         Value::Text(t) => t.as_str().to_string(),
         other => unreachable!(
@@ -20209,7 +20212,6 @@ fn notify_change_callbacks(
         ),
     };
 
-    // Extract rowid - translator guarantees this is Integer
     let rowid = match &state.registers[rowid_reg].get_value() {
         Value::Numeric(Numeric::Integer(i)) => *i,
         other => unreachable!(
@@ -20218,8 +20220,7 @@ fn notify_change_callbacks(
         ),
     };
 
-    // Get column names from schema BEFORE acquiring callback lock (avoid lock ordering issues)
-    let column_names = program
+    let Some(column_names) = program
         .connection
         .schema
         .read()
@@ -20230,10 +20231,9 @@ fn notify_change_callbacks(
                 .iter()
                 .filter_map(|col| col.name.clone())
                 .collect::<Vec<String>>()
-        });
-
-    // If we can't get schema, skip the callback entirely rather than using fake column names
-    let Some(column_names) = column_names else {
+        })
+    else {
+        // Skip rather than stage an event with made-up column names.
         tracing::warn!(
             "NotifyCdcChange: Could not find schema for table '{}', skipping callback",
             table_name
@@ -20241,33 +20241,19 @@ fn notify_change_callbacks(
         return;
     };
 
-    // Extract before record if present
-    let before_record = if before_record_reg > 0 {
-        match &state.registers[before_record_reg].get_value() {
+    let record_in = |reg: usize| {
+        if reg == 0 {
+            return None;
+        }
+        match state.registers[reg].get_value() {
             Value::Blob(b) => Some(b.clone()),
             _ => None,
         }
-    } else {
-        None
     };
-
-    // Extract after record if present
-    let after_record = if after_record_reg > 0 {
-        match &state.registers[after_record_reg].get_value() {
-            Value::Blob(b) => Some(b.clone()),
-            _ => None,
-        }
-    } else {
-        None
-    };
-
-    // Build the DatabaseChange
-    let bin_record = after_record
-        .clone()
-        .or_else(|| before_record.clone())
+    let bin_record = record_in(after_record_reg)
+        .or_else(|| record_in(before_record_reg))
         .unwrap_or_default();
 
-    // Translator guarantees change_type is one of -1, 0, 1
     let change = match change_type {
         1 => crate::types::DatabaseChangeType::Insert { bin_record },
         0 => crate::types::DatabaseChangeType::Update { bin_record },
@@ -20275,53 +20261,21 @@ fn notify_change_callbacks(
         other => unreachable!("NotifyCdcChange: invalid change_type {}", other),
     };
 
-    let database_change = crate::types::DatabaseChange {
-        change_id: 0, // CDC table assigns the actual ID
-        change_time: 0,
-        change,
-        table_name: table_name.clone(),
-        id: rowid,
-    };
-
-    // Build the event
-    let event = crate::types::RelationChangeEvent {
-        relation_name: table_name.clone(),
-        columns: column_names,
-        changes: vec![database_change],
-    };
-
-    // Clone callbacks to avoid holding the lock during callback execution (race condition fix)
-    let callbacks_to_invoke: Vec<_> = {
-        let callbacks = program.connection.db.change_callbacks.read();
-        if callbacks.is_empty() {
-            return;
-        }
-        callbacks
-            .iter()
-            .filter(|(_id, filter, _callback)| {
-                filter
-                    .as_ref()
-                    .map(|f| f.contains(&table_name))
-                    .unwrap_or(true)
-            })
-            .map(|(_id, _filter, callback)| Arc::clone(callback))
-            .collect()
-    };
-    // Lock is now dropped
-
-    // Fire callbacks with panic protection to prevent unwinding through VDBE
-    for callback in callbacks_to_invoke {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            callback(&event);
-        }));
-        if let Err(panic_info) = result {
-            tracing::error!(
-                "CDC change callback panicked for table '{}': {:?}",
+    // Stage rather than fire: the row is not committed yet, and its event has to
+    // join the rest of this commit's fan-out. `commit_txn` announces the batch.
+    program
+        .connection
+        .stage_change_event(crate::types::RelationChangeEvent::staged(
+            table_name.clone(),
+            column_names,
+            vec![crate::types::DatabaseChange {
+                change_id: 0,
+                change_time: 0,
+                change,
                 table_name,
-                panic_info
-            );
-        }
-    }
+                id: rowid,
+            }],
+        ));
 }
 
 #[cfg(test)]
