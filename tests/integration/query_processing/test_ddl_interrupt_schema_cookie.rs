@@ -39,7 +39,7 @@ fn run_interrupted(
         match stmt.step()? {
             StepResult::Interrupt | StepResult::Busy => break true,
             StepResult::Done => break false,
-            StepResult::IO => tmp_db.io.step()?,
+            StepResult::IO | StepResult::Sleep { .. } => tmp_db.io.step()?,
             StepResult::Row | StepResult::Yield => {}
         }
     };

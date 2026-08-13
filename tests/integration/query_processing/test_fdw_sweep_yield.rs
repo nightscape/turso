@@ -100,7 +100,7 @@ fn exec(conn: &Arc<Connection>, io: &dyn IO, sql: &str) -> turso_core::Result<Ve
     let mut out = Vec::new();
     loop {
         match stmt.step()? {
-            StepResult::IO | StepResult::Yield => io.step()?,
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => io.step()?,
             StepResult::Row => out.push(stmt.row().unwrap().get_values().cloned().collect()),
             StepResult::Done => return Ok(out),
             StepResult::Interrupt | StepResult::Busy => {
@@ -122,7 +122,7 @@ fn exec_abandoning_at(
     let mut seen = 0usize;
     loop {
         match stmt.step()? {
-            StepResult::IO | StepResult::Yield => {
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                 seen += 1;
                 if seen == target {
                     drop(stmt);
