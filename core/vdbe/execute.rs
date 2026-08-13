@@ -15110,7 +15110,7 @@ fn sync_fdw_mirrors_inner(
                         }
                     }
                 }
-                StepResult::IO | StepResult::Yield => {
+                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
                     state.fdw_mirror_sync.in_flight = Some((mirror, phase, stmt));
                     return Ok(IOResult::IO(crate::types::IOCompletions(
                         crate::io::Completion::new_yield(),

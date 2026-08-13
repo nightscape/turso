@@ -961,6 +961,11 @@ impl Fuzzer {
                         );
                         return Err(anyhow::anyhow!("Oracle failure (redundant): {reason}"));
                     }
+                    OracleResult::Skipped(reason) => {
+                        stats.statements_skipped += 1;
+                        executed_sql.push(format!("-- SKIPPED REDUNDANT: {}", stmt.sql));
+                        tracing::debug!("Skipped redundant DML at statement {i}: {reason}");
+                    }
                 }
                 if !matview_info.is_empty() {
                     self.verify_matviews_match(&matview_info, stats, executed_sql)?;

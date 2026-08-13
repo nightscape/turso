@@ -2115,7 +2115,9 @@ impl IncrementalView {
                                         };
                                     return Err(LimboError::Busy);
                                 }
-                                crate::vdbe::StepResult::IO | crate::vdbe::StepResult::Yield => {
+                                crate::vdbe::StepResult::IO
+                                | crate::vdbe::StepResult::Yield
+                                | crate::vdbe::StepResult::Sleep { .. } => {
                                     // Save state and return I/O
                                     accumulated_deltas.insert(table_name.clone(), table_delta);
                                     self.populate_state =

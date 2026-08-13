@@ -635,6 +635,10 @@ mod tests {
             mutates_data: true,
             has_unordered_limit: false,
             unordered_limit_reason: None,
+            is_matview_ddl: false,
+            sqlite_sql: None,
+            matview_output_columns: None,
+            is_reopen: false,
         };
 
         let result = check_differential(&turso_conn, &sqlite_conn, &schema, &stmt);
