@@ -2138,12 +2138,69 @@ impl DbspCompiler {
         }
     }
 
+    /// Whether `expr` holds a subquery.
+    ///
+    /// `collect_column_refs` reports no columns for one, so a subquery's references to
+    /// either join side are invisible to anything reasoning from that list. Arms mirror
+    /// `collect_column_refs`: a nesting arm missing here hides a subquery.
+    fn contains_subquery(expr: &LogicalExpr) -> bool {
+        match expr {
+            LogicalExpr::InSubquery { .. }
+            | LogicalExpr::Exists { .. }
+            | LogicalExpr::ScalarSubquery(_) => true,
+            LogicalExpr::BinaryExpr { left, right, .. } => {
+                Self::contains_subquery(left) || Self::contains_subquery(right)
+            }
+            LogicalExpr::UnaryExpr { expr, .. }
+            | LogicalExpr::IsNull { expr, .. }
+            | LogicalExpr::Cast { expr, .. }
+            | LogicalExpr::Alias { expr, .. } => Self::contains_subquery(expr),
+            LogicalExpr::Like { expr, pattern, .. } => {
+                Self::contains_subquery(expr) || Self::contains_subquery(pattern)
+            }
+            LogicalExpr::Between {
+                expr, low, high, ..
+            } => {
+                Self::contains_subquery(expr)
+                    || Self::contains_subquery(low)
+                    || Self::contains_subquery(high)
+            }
+            LogicalExpr::InList { expr, list, .. } => {
+                Self::contains_subquery(expr) || list.iter().any(Self::contains_subquery)
+            }
+            LogicalExpr::ScalarFunction { args, .. }
+            | LogicalExpr::AggregateFunction { args, .. } => {
+                args.iter().any(Self::contains_subquery)
+            }
+            LogicalExpr::Case {
+                expr,
+                when_then,
+                else_expr,
+            } => {
+                expr.as_ref().is_some_and(|e| Self::contains_subquery(e))
+                    || when_then
+                        .iter()
+                        .any(|(w, t)| Self::contains_subquery(w) || Self::contains_subquery(t))
+                    || else_expr
+                        .as_ref()
+                        .is_some_and(|e| Self::contains_subquery(e))
+            }
+            LogicalExpr::Column(_) | LogicalExpr::Literal(_) => false,
+        }
+    }
+
     /// Classify which side of a join a filter expression references.
     fn classify_filter_side(
         expr: &LogicalExpr,
         left_schema: &LogicalSchema,
         right_schema: &LogicalSchema,
     ) -> FilterSide {
+        // A subquery's own references are invisible here, so any side this predicate
+        // resolves to is a guess. Cross keeps it above the join, where both sides exist.
+        if Self::contains_subquery(expr) {
+            return FilterSide::Cross;
+        }
+
         let cols = Self::collect_column_refs(expr);
         let mut refs_left = false;
         let mut refs_right = false;
