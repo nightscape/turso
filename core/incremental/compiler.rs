@@ -38,6 +38,7 @@ use crate::{return_and_restore_if_io, return_if_io, LimboError, Result};
 use rustc_hash::FxHashMap as HashMap;
 
 /// Which side of a join a filter expression references.
+#[derive(Debug, PartialEq)]
 enum FilterSide {
     LeftOnly,
     RightOnly,
@@ -7996,6 +7997,68 @@ mod tests {
             table: Some(table.to_string()),
             table_alias: None,
         }
+    }
+
+    /// `EXISTS (SELECT ...)` correlated to the outer query. The subquery's own plan is
+    /// irrelevant to join-side classification, so it is the cheapest one that type-checks.
+    fn make_exists_expr() -> LogicalExpr {
+        LogicalExpr::Exists {
+            subquery: Arc::new(LogicalPlan::EmptyRelation(
+                crate::translate::logical::EmptyRelation {
+                    produce_one_row: true,
+                    schema: SchemaRef::new(LogicalSchema::new(vec![])),
+                },
+            )),
+            negated: false,
+        }
+    }
+
+    fn side_of(expr: &LogicalExpr) -> FilterSide {
+        let left = LogicalSchema::new(vec![make_column_info("id", Type::Integer, "l")]);
+        let right = LogicalSchema::new(vec![make_column_info("w", Type::Integer, "r")]);
+        DbspCompiler::classify_filter_side(expr, &left, &right)
+    }
+
+    /// A conjunct mixing a subquery with a one-sided column must not be pushed to that
+    /// side: the subquery's correlation reaches the other side, so only the merged
+    /// post-join output can evaluate it.
+    #[test]
+    fn subquery_beside_a_right_column_is_not_right_only() {
+        let expr = LogicalExpr::BinaryExpr {
+            left: Box::new(make_exists_expr()),
+            op: BinaryOperator::Or,
+            right: Box::new(LogicalExpr::BinaryExpr {
+                left: Box::new(LogicalExpr::Column(Column {
+                    name: "w".to_string(),
+                    table: Some("r".to_string()),
+                })),
+                op: BinaryOperator::Equals,
+                right: Box::new(LogicalExpr::Literal(Value::from_i64(5))),
+            }),
+        };
+        assert_eq!(side_of(&expr), FilterSide::Cross);
+    }
+
+    #[test]
+    fn subquery_beside_a_left_column_is_not_left_only() {
+        let expr = LogicalExpr::BinaryExpr {
+            left: Box::new(make_exists_expr()),
+            op: BinaryOperator::Or,
+            right: Box::new(LogicalExpr::BinaryExpr {
+                left: Box::new(LogicalExpr::Column(Column {
+                    name: "id".to_string(),
+                    table: Some("l".to_string()),
+                })),
+                op: BinaryOperator::Equals,
+                right: Box::new(LogicalExpr::Literal(Value::from_i64(5))),
+            }),
+        };
+        assert_eq!(side_of(&expr), FilterSide::Cross);
+    }
+
+    #[test]
+    fn a_bare_subquery_is_cross() {
+        assert_eq!(side_of(&make_exists_expr()), FilterSide::Cross);
     }
 
     #[test]
