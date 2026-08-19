@@ -2368,9 +2368,16 @@ impl DbspCompiler {
                 dbsp_exprs.push(DbspExpr::Column(col.name.clone()));
             }
 
-            // Now add the expression as a computed column
-            let temp_column_name = "__temp_filter_expr";
-            let computed_expr = Self::extract_expression_from_predicate(predicate)?;
+            // One column per distinct computed sub-expression. Sharing a single column
+            // between different expressions makes their comparisons contradict, and the
+            // view answers empty for good.
+            let mut computed_exprs = Vec::new();
+            Self::collect_temp_exprs(predicate, &mut computed_exprs);
+            let temps: Vec<(LogicalExpr, String)> = computed_exprs
+                .into_iter()
+                .enumerate()
+                .map(|(i, e)| (e, Self::temp_column_name(i)))
+                .collect();
 
             // Compile the projection expressions.
             //
@@ -2394,11 +2401,13 @@ impl DbspCompiler {
                 aliases.push(None);
                 output_names.push(col.name.clone());
             }
-            let (compiled_computed, _alias) =
-                Self::compile_expression(&computed_expr, input_schema)?;
-            compiled_exprs.push(compiled_computed);
-            aliases.push(Some(temp_column_name.to_string()));
-            output_names.push(temp_column_name.to_string());
+            for (computed_expr, name) in &temps {
+                let (compiled_computed, _alias) =
+                    Self::compile_expression(computed_expr, input_schema)?;
+                compiled_exprs.push(compiled_computed);
+                aliases.push(Some(name.clone()));
+                output_names.push(name.clone());
+            }
 
             // Get input column names for ProjectOperator
             let input_column_names: Vec<String> = input_schema
@@ -2418,13 +2427,15 @@ impl DbspCompiler {
 
             // Create updated schema for the projection output
             let mut proj_schema_columns = input_schema.columns.clone();
-            proj_schema_columns.push(ColumnInfo {
-                name: temp_column_name.to_string(),
-                table: None,
-                database: None,
-                table_alias: None,
-                ty: Type::Integer, // Computed expressions default to Integer
-            });
+            for (_, name) in &temps {
+                proj_schema_columns.push(ColumnInfo {
+                    name: name.clone(),
+                    table: None,
+                    database: None,
+                    table_alias: None,
+                    ty: Type::Integer, // Computed expressions default to Integer
+                });
+            }
             let proj_schema = SchemaRef::new(LogicalSchema {
                 columns: proj_schema_columns,
             });
@@ -2442,7 +2453,7 @@ impl DbspCompiler {
             // Now create a filter that replaces the complex expression with the temp column
             // but keeps all other conditions intact
             let replaced_predicate =
-                Self::replace_complex_with_temp(predicate, temp_column_name, input_schema)?;
+                Self::replace_complex_with_temps(predicate, &temps, input_schema)?;
             let filter_predicate =
                 Self::compile_filter_predicate(&replaced_predicate, &proj_schema)?;
 
@@ -4043,59 +4054,101 @@ impl DbspCompiler {
         }
     }
 
-    /// Extract the expression part from a predicate that needs to be computed
-    fn extract_expression_from_predicate(expr: &LogicalExpr) -> Result<LogicalExpr> {
+    /// Every sub-expression the filter cannot evaluate, each listed once.
+    ///
+    /// Identical expressions share one column: they want the same value, so computing it
+    /// twice would only add work. Different expressions must not, which is the whole
+    /// point — one column for all of them makes their comparisons contradict.
+    fn collect_temp_exprs(expr: &LogicalExpr, out: &mut Vec<LogicalExpr>) {
         match expr {
-            LogicalExpr::BinaryExpr { left, op, right } => {
-                // Handle AND/OR - recursively find the complex expression
-                if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
-                    // Check left side first
-                    if Self::predicate_needs_projection(left) {
-                        return Self::extract_expression_from_predicate(left);
-                    }
-                    // Then check right side
-                    if Self::predicate_needs_projection(right) {
-                        return Self::extract_expression_from_predicate(right);
-                    }
-                    // Neither side needs projection (shouldn't happen if predicate_needs_projection was true)
-                    return Ok(expr.clone());
-                }
-
-                // For comparison expressions, check if we need to extract a subexpression
-                if matches!(
-                    op,
-                    BinaryOperator::Greater
-                        | BinaryOperator::GreaterEquals
-                        | BinaryOperator::Less
-                        | BinaryOperator::LessEquals
-                        | BinaryOperator::Equals
-                        | BinaryOperator::NotEquals
-                ) {
-                    // If the left side is complex (not a column), extract it
-                    if !matches!(
-                        left.as_ref(),
-                        LogicalExpr::Column(_) | LogicalExpr::Literal(_)
-                    ) {
-                        return Ok((**left).clone());
-                    }
-                    // If the right side is complex (not a literal), extract it
-                    if !matches!(
-                        right.as_ref(),
-                        LogicalExpr::Column(_) | LogicalExpr::Literal(_)
-                    ) {
-                        return Ok((**right).clone());
-                    }
-                    // Both sides are simple but the expression as a whole might need projection
-                    // (e.g., for arithmetic operations)
-                    Ok(expr.clone())
+            LogicalExpr::BinaryExpr { left, op, right }
+                if matches!(op, BinaryOperator::And | BinaryOperator::Or) =>
+            {
+                Self::collect_temp_exprs(left, out);
+                Self::collect_temp_exprs(right, out);
+            }
+            _ if !Self::predicate_needs_projection(expr) => {}
+            LogicalExpr::BinaryExpr { left, right, .. } => {
+                let unit = if !Self::is_simple_operand(left) {
+                    (**left).clone()
+                } else if !Self::is_simple_operand(right) {
+                    (**right).clone()
                 } else {
-                    // For other binary operators (arithmetic, etc.), return the whole expression
+                    expr.clone()
+                };
+                if !out.contains(&unit) {
+                    out.push(unit);
+                }
+            }
+            other => {
+                if !out.contains(other) {
+                    out.push(other.clone());
+                }
+            }
+        }
+    }
+
+    fn is_simple_operand(expr: &LogicalExpr) -> bool {
+        matches!(expr, LogicalExpr::Column(_) | LogicalExpr::Literal(_))
+    }
+
+    fn temp_column_name(index: usize) -> String {
+        format!("__temp_filter_expr_{index}")
+    }
+
+    /// Rewrite each computed sub-expression to the column holding its value.
+    fn replace_complex_with_temps(
+        expr: &LogicalExpr,
+        temps: &[(LogicalExpr, String)],
+        schema: &LogicalSchema,
+    ) -> Result<LogicalExpr> {
+        let column_for = |unit: &LogicalExpr| -> LogicalExpr {
+            let name = temps
+                .iter()
+                .find(|(candidate, _)| candidate == unit)
+                .map(|(_, name)| name.clone())
+                .expect("every computed sub-expression was given a column");
+            LogicalExpr::Column(Column { name, table: None })
+        };
+        match expr {
+            LogicalExpr::BinaryExpr { left, op, right }
+                if matches!(op, BinaryOperator::And | BinaryOperator::Or) =>
+            {
+                Ok(LogicalExpr::BinaryExpr {
+                    left: Box::new(Self::replace_complex_with_temps(left, temps, schema)?),
+                    op: *op,
+                    right: Box::new(Self::replace_complex_with_temps(right, temps, schema)?),
+                })
+            }
+            _ if !Self::predicate_needs_projection(expr) => Ok(expr.clone()),
+            LogicalExpr::BinaryExpr { left, op, right } => {
+                if !Self::is_simple_operand(left) {
+                    Self::ensure_projectable(left, schema)?;
+                    Ok(LogicalExpr::BinaryExpr {
+                        left: Box::new(column_for(left)),
+                        op: *op,
+                        right: right.clone(),
+                    })
+                } else if !Self::is_simple_operand(right) {
+                    Self::ensure_projectable(right, schema)?;
+                    Ok(LogicalExpr::BinaryExpr {
+                        left: left.clone(),
+                        op: *op,
+                        right: Box::new(column_for(right)),
+                    })
+                } else {
                     Ok(expr.clone())
                 }
             }
-            // For non-binary expressions (BETWEEN, IN, LIKE, functions, etc.),
-            // we need to compute the whole expression as a boolean
-            _ => Ok(expr.clone()),
+            other => {
+                Self::ensure_projectable(other, schema)?;
+                // The column holds the expression's own truth value.
+                Ok(LogicalExpr::BinaryExpr {
+                    left: Box::new(column_for(other)),
+                    op: BinaryOperator::Equals,
+                    right: Box::new(LogicalExpr::Literal(Value::from_i64(1))),
+                })
+            }
         }
     }
 
@@ -4109,89 +4162,6 @@ impl DbspCompiler {
     fn ensure_projectable(expr: &LogicalExpr, schema: &LogicalSchema) -> Result<()> {
         Self::logical_to_ast_expr_with_schema(expr, schema)?;
         Ok(())
-    }
-
-    fn replace_complex_with_temp(
-        expr: &LogicalExpr,
-        temp_column_name: &str,
-        schema: &LogicalSchema,
-    ) -> Result<LogicalExpr> {
-        match expr {
-            LogicalExpr::BinaryExpr { left, op, right } => {
-                // Handle AND/OR - recursively process both sides
-                if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
-                    let new_left = Self::replace_complex_with_temp(left, temp_column_name, schema)?;
-                    let new_right =
-                        Self::replace_complex_with_temp(right, temp_column_name, schema)?;
-                    return Ok(LogicalExpr::BinaryExpr {
-                        left: Box::new(new_left),
-                        op: *op,
-                        right: Box::new(new_right),
-                    });
-                }
-
-                // Check if this is a complex comparison that needs replacement
-                if Self::predicate_needs_projection(expr) {
-                    // Determine which side is complex and needs replacement
-                    let left_is_simple = matches!(
-                        left.as_ref(),
-                        LogicalExpr::Column(_) | LogicalExpr::Literal(_)
-                    );
-                    let right_is_simple = matches!(
-                        right.as_ref(),
-                        LogicalExpr::Column(_) | LogicalExpr::Literal(_)
-                    );
-
-                    if !left_is_simple {
-                        Self::ensure_projectable(left, schema)?;
-                        // Left side is complex - replace it with temp column
-                        return Ok(LogicalExpr::BinaryExpr {
-                            left: Box::new(LogicalExpr::Column(Column {
-                                name: temp_column_name.to_string(),
-                                table: None,
-                            })),
-                            op: *op,
-                            right: right.clone(),
-                        });
-                    } else if !right_is_simple {
-                        Self::ensure_projectable(right, schema)?;
-                        // Right side is complex - replace it with temp column
-                        return Ok(LogicalExpr::BinaryExpr {
-                            left: left.clone(),
-                            op: *op,
-                            right: Box::new(LogicalExpr::Column(Column {
-                                name: temp_column_name.to_string(),
-                                table: None,
-                            })),
-                        });
-                    } else {
-                        // Both sides are simple, but the expression as a whole needs projection
-                        // This shouldn't happen normally, but keep the expression as-is
-                        return Ok(expr.clone());
-                    }
-                }
-
-                // Simple comparison - keep as is
-                Ok(expr.clone())
-            }
-            // For non-binary expressions that need projection (BETWEEN, IN, etc.),
-            // replace the whole expression with a column reference to the temp column
-            // The temp column will hold the boolean result of evaluating the expression
-            _ if Self::predicate_needs_projection(expr) => {
-                Self::ensure_projectable(expr, schema)?;
-                // The complex expression result is in the temp column
-                // We need to check if it's true (non-zero)
-                Ok(LogicalExpr::BinaryExpr {
-                    left: Box::new(LogicalExpr::Column(Column {
-                        name: temp_column_name.to_string(),
-                        table: None,
-                    })),
-                    op: BinaryOperator::Equals,
-                    right: Box::new(LogicalExpr::Literal(Value::from_i64(1))), // true = 1 in SQL
-                })
-            }
-            _ => Ok(expr.clone()),
-        }
     }
 
     /// Compile a logical expression to a FilterPredicate for execution
