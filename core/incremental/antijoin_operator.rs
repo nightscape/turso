@@ -142,6 +142,16 @@ pub enum LRowResolve {
 }
 
 /// AntijoinOperator — produces the null-padded "unmatched" half of a
+/// What an unmatched-half row carries beyond its left columns.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EmitMode {
+    /// LEFT JOIN's unmatched half: `L ++ NULLs`.
+    NullPad { right_column_count: usize },
+    /// EXISTS: `L ++ [matched]`, emitted for every left row rather than only
+    /// unmatched ones, so a match flip retracts one row and inserts the other.
+    Indicator,
+}
+
 /// LEFT JOIN's output delta. Compiler wires it in parallel with an
 /// inner `JoinOperator` under a UNION-ALL `MergeOperator`.
 #[derive(Debug)]
@@ -149,8 +159,7 @@ pub struct AntijoinOperator {
     operator_id: i64,
     left_key_indices: Vec<usize>,
     right_key_indices: Vec<usize>,
-    /// Number of right-side columns — needed to construct NULL padding.
-    right_column_count: usize,
+    emit_mode: EmitMode,
     tracker: Option<Arc<Mutex<ComputationTracker>>>,
     commit_state: AntijoinCommitState,
 }
@@ -188,13 +197,13 @@ impl AntijoinOperator {
         operator_id: i64,
         left_key_indices: Vec<usize>,
         right_key_indices: Vec<usize>,
-        right_column_count: usize,
+        emit_mode: EmitMode,
     ) -> Self {
         Self {
             operator_id,
             left_key_indices,
             right_key_indices,
-            right_column_count,
+            emit_mode,
             tracker: None,
             commit_state: AntijoinCommitState::Idle,
         }
@@ -221,9 +230,15 @@ impl AntijoinOperator {
         key.values.iter().any(|v| matches!(v, Value::Null))
     }
 
-    fn null_pad(&self, l_row: &HashableRow) -> HashableRow {
+    /// The output row for one left row: NULL padding, or the match indicator.
+    fn emit_row(&self, l_row: &HashableRow, matched: bool) -> HashableRow {
         let mut values = l_row.values.to_vec();
-        values.extend(std::iter::repeat_n(Value::Null, self.right_column_count));
+        match &self.emit_mode {
+            EmitMode::NullPad { right_column_count } => {
+                values.extend(std::iter::repeat_n(Value::Null, *right_column_count));
+            }
+            EmitMode::Indicator => values.push(Value::from_i64(matched as i64)),
+        }
         let values: super::dbsp::RowValues = values.into();
         let temp = HashableRow::new(0, values.clone());
         HashableRow::new(temp.cached_hash().as_i64(), values)
@@ -604,8 +619,8 @@ impl AntijoinOperator {
                                 // Emit `L_pre(l,k) · indicator_delta`.
                                 let emit_weight = l_weight * indicator_delta;
                                 if emit_weight != 0 {
-                                    let padded = self.null_pad(&l_row);
-                                    output.changes.push((padded, emit_weight));
+                                    let row = self.emit_row(&l_row, false);
+                                    output.changes.push((row, emit_weight));
                                 }
                                 *outer = EvalState::Antijoin(Box::new(
                                     AntijoinEvalState::EmitRTransitions {
@@ -672,8 +687,8 @@ impl AntijoinOperator {
 
                         // L-term: emit `δL(l, k) · [c_post == 0]`.
                         if c_post == 0 && l_weight != 0 {
-                            let padded = self.null_pad(&l_row);
-                            output.changes.push((padded, l_weight));
+                            let row = self.emit_row(&l_row, false);
+                            output.changes.push((row, l_weight));
                         }
                         l_idx += 1;
                         *outer = EvalState::Antijoin(Box::new(AntijoinEvalState::ProcessLDelta {
