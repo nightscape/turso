@@ -630,6 +630,8 @@ pub enum DbspOperator {
         schema: SchemaRef,
         right_column_count: usize,
     },
+    /// EXISTS indicator: left rows plus a column saying whether the key matched.
+    ExistsIndicator { schema: SchemaRef, index: usize },
     /// Distinct operator - removes duplicates
     Distinct { schema: SchemaRef },
     /// Recursive operator - container for fixed-point computation
@@ -1985,6 +1987,13 @@ impl DbspCircuit {
                         schema.columns.len()
                     )?;
                 }
+                DbspOperator::ExistsIndicator { schema, index } => {
+                    writeln!(
+                        f,
+                        "{indent}ExistsIndicator[{node_id}]: __exists_{index} (schema: {})",
+                        schema.columns.len()
+                    )?;
+                }
                 DbspOperator::Distinct { schema } => {
                     writeln!(
                         f,
@@ -2227,6 +2236,117 @@ impl DbspCompiler {
         }
     }
 
+    /// Compile `WHERE … EXISTS (…) …` by giving each subquery an indicator column and
+    /// letting the ordinary filter machinery read it.
+    ///
+    /// The chain is left-deep: each indicator's left input is the plan built so far, so a
+    /// later subquery can correlate to columns an earlier one passed through.
+    fn compile_filter_with_exists(
+        &mut self,
+        filter: &crate::translate::logical::Filter,
+    ) -> Result<i64> {
+        use crate::incremental::decorrelate;
+
+        let base_schema = filter.input.schema();
+        decorrelate::reject_reserved_names(&base_schema)?;
+
+        let mut current_id = self.compile_plan(&filter.input)?;
+        let mut current_schema: SchemaRef = base_schema.clone();
+        let mut predicate = filter.predicate.clone();
+        let mut index = 1usize;
+
+        while let Some(exists) = decorrelate::first_exists(&predicate) {
+            let exists = exists.clone();
+            let LogicalExpr::Exists { subquery, .. } = &exists else {
+                unreachable!("first_exists returns only Exists nodes");
+            };
+            let correlated = decorrelate::analyze(subquery, &current_schema)?;
+
+            let source_schema = correlated.source.schema();
+            let (left_idx, _) = current_schema
+                .find_column(
+                    &correlated.outer_key.name,
+                    correlated.outer_key.table.as_deref(),
+                )
+                .ok_or_else(|| {
+                    LimboError::ParseError(format!(
+                        "correlation column '{}' is not available to the EXISTS subquery",
+                        correlated.outer_key.name
+                    ))
+                })?;
+            let (right_idx, _) = source_schema
+                .find_column(
+                    &correlated.inner_key.name,
+                    correlated.inner_key.table.as_deref(),
+                )
+                .ok_or_else(|| {
+                    LimboError::ParseError(format!(
+                        "correlation column '{}' is not a column of the EXISTS subquery",
+                        correlated.inner_key.name
+                    ))
+                })?;
+
+            let right_id = self.compile_plan(&correlated.source)?;
+            let output_schema =
+                SchemaRef::new(decorrelate::schema_with_indicator(&current_schema, index));
+            let operator_id = self.circuit.next_id;
+            let executable: Box<dyn IncrementalOperator> = Box::new(AntijoinOperator::new(
+                operator_id,
+                vec![left_idx],
+                vec![right_idx],
+                EmitMode::Indicator,
+            ));
+            current_id = self.circuit.add_node(
+                DbspOperator::ExistsIndicator {
+                    schema: output_schema.clone(),
+                    index,
+                },
+                vec![current_id, right_id],
+                executable,
+            );
+            predicate = decorrelate::substitute(&predicate, index, &exists);
+            current_schema = output_schema.clone();
+            index += 1;
+        }
+
+        let predicate = decorrelate::fold_indicator_negations(&predicate);
+        let filter_id = self.add_filter_node(current_id, &predicate, &current_schema)?;
+
+        // Drop the indicator columns so the view's schema is the one the user wrote.
+        let input_names: Vec<String> = current_schema
+            .columns
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        let mut exprs = Vec::new();
+        let mut aliases = Vec::new();
+        let mut names = Vec::new();
+        let mut dbsp_exprs = Vec::new();
+        for (i, column) in base_schema.columns.iter().enumerate() {
+            exprs.push(CompiledExpression {
+                executor: ExpressionExecutor::Trivial(TrivialExpression::Column(i)),
+                input_count: input_names.len(),
+            });
+            aliases.push(None);
+            names.push(column.name.clone());
+            dbsp_exprs.push(DbspExpr::Column(column.name.clone()));
+        }
+        let executable: Box<dyn IncrementalOperator> = Box::new(ProjectOperator::from_compiled(
+            exprs,
+            aliases,
+            input_names,
+            names,
+        )?);
+        Ok(self.circuit.add_node(
+            DbspOperator::Projection {
+                exprs: dbsp_exprs,
+                schema: base_schema.clone(),
+            },
+            vec![filter_id],
+            executable,
+        ))
+    }
+
     /// Add a filter node on top of an existing node.
     fn add_filter_node(
         &mut self,
@@ -2380,6 +2500,9 @@ impl DbspCompiler {
                 Ok(node_id)
             }
             LogicalPlan::Filter(filter) => {
+                if Self::contains_subquery(&filter.predicate) {
+                    return self.compile_filter_with_exists(filter);
+                }
                 // Compile the input first
                 let input_id = self.compile_plan(&filter.input)?;
 

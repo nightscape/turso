@@ -1305,6 +1305,19 @@ impl IncrementalView {
                 Ok(WalkControl::Continue)
             })?;
             for (name, table) in discovered {
+                // A foreign table is maintained through a mirror, and the mirror rewrite
+                // only reaches FROM and JOIN clauses (`rewrite_sources_to_mirrors`). A
+                // subquery source would keep reading the foreign table, which produces no
+                // deltas, so the view would answer as if the table were empty.
+                if let Some(schema_table) = schema.get_table(&name) {
+                    if let Table::Virtual(vtab) = schema_table.as_ref() {
+                        if vtab.foreign_wrapper().is_some() {
+                            return Err(LimboError::ParseError(format!(
+                                "foreign table '{name}' cannot be the source of a subquery in a                                  materialized view: it is maintained through a mirror, which only                                  covers FROM and JOIN clauses"
+                            )));
+                        }
+                    }
+                }
                 subquery_sources.insert(name.clone());
                 table_map.entry(name).or_insert(table);
             }
