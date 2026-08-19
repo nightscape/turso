@@ -9,6 +9,7 @@ use crate::schema::{
 use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
 use crate::sync::Mutex;
+use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::logical::LogicalPlanBuilder;
 use crate::types::{IOResult, Value};
 use crate::util::{extract_view_columns, normalize_ident, ViewColumnSchema};
@@ -1270,6 +1271,45 @@ impl IncrementalView {
                 }
             }
         }
+
+        // Tables a WHERE subquery reads. Writes to them change the view, so they need a
+        // dependency edge and a populate scan the same as a FROM-clause source.
+        let mut subquery_sources: HashSet<String> = HashSet::default();
+        if let ast::OneSelect::Select {
+            where_clause: Some(ref where_expr),
+            ..
+        } = select
+        {
+            let mut discovered = HashMap::default();
+            // A subquery's own WHERE is correlated to the outer query, so it cannot filter
+            // that subquery's scan. Collecting the conditions here and dropping them keeps
+            // them out of `table_conditions`, and the guard below scans these unfiltered.
+            let mut correlated_conditions = HashMap::default();
+            walk_expr(where_expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+                let subquery = match e {
+                    ast::Expr::Exists(select) | ast::Expr::Subquery(select) => Some(select),
+                    ast::Expr::InSelect { rhs, .. } => Some(rhs),
+                    _ => None,
+                };
+                if let Some(subquery) = subquery {
+                    Self::extract_all_tables_inner(
+                        subquery,
+                        schema,
+                        &mut discovered,
+                        aliases,
+                        qualified_names,
+                        &mut correlated_conditions,
+                        cte_names,
+                    )?;
+                }
+                Ok(WalkControl::Continue)
+            })?;
+            for (name, table) in discovered {
+                subquery_sources.insert(name.clone());
+                table_map.entry(name).or_insert(table);
+            }
+        }
+
         let null_extended_tables = if let ast::OneSelect::Select {
             from: Some(ref from),
             ..
@@ -1317,11 +1357,13 @@ impl IncrementalView {
                 })?;
                 if self_joined_tables.contains(table_name)
                     || null_extended_tables.contains(table_name)
+                    || subquery_sources.contains(table_name)
                 {
                     // Self-joined table: conditions reference different aliases of the same
                     // table. Null-extended table: the conditions describe the NULLs the outer
-                    // join pads in, not rows the scan can read. Either way we must fetch all
-                    // rows; the circuit handles filtering post-join.
+                    // join pads in, not rows the scan can read. Subquery source: the conditions
+                    // are correlated to the outer query. In every case we must fetch all rows;
+                    // the circuit handles filtering post-join.
                     conditions.push(None);
                     continue;
                 }
@@ -3248,10 +3290,15 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(queries.len(), 1);
-        // Since customers table has an INTEGER PRIMARY KEY (id), we should get SELECT *
-        // without rowid and without WHERE clause (all conditions are complex)
-        assert_eq!(queries[0], "SELECT * FROM customers");
+        // `orders` is read by the scalar subquery and the EXISTS, so it is a source too.
+        // Neither scan carries a WHERE: every condition here is either complex or
+        // correlated to the outer query.
+        let mut queries = queries;
+        queries.sort();
+        assert_eq!(
+            queries,
+            vec!["SELECT * FROM customers", "SELECT * FROM orders"]
+        );
     }
 
     #[test]
