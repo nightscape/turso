@@ -2413,7 +2413,11 @@ impl DbspCompiler {
                     // Now create a filter that replaces the complex expression with the temp column
                     // but keeps all other conditions intact
                     let replaced_predicate =
-                        Self::replace_complex_with_temp(&filter.predicate, temp_column_name)?;
+                        Self::replace_complex_with_temp(
+                            &filter.predicate,
+                            temp_column_name,
+                            input_schema,
+                        )?;
                     let filter_predicate =
                         Self::compile_filter_predicate(&replaced_predicate, &proj_schema)?;
 
@@ -3899,16 +3903,29 @@ impl DbspCompiler {
     }
 
     /// Replace complex expressions in the predicate with references to the temp column
+    /// Reject a sub-expression the temp column cannot stand in for.
+    ///
+    /// The rewrite points every complex conjunct at one temp column, so a conjunct the
+    /// projection cannot compute would be replaced by an unrelated value instead of
+    /// failing. `logical_to_ast_expr_with_schema` decides what the projection can
+    /// compute, and its error names the offending expression.
+    fn ensure_projectable(expr: &LogicalExpr, schema: &LogicalSchema) -> Result<()> {
+        Self::logical_to_ast_expr_with_schema(expr, schema)?;
+        Ok(())
+    }
+
     fn replace_complex_with_temp(
         expr: &LogicalExpr,
         temp_column_name: &str,
+        schema: &LogicalSchema,
     ) -> Result<LogicalExpr> {
         match expr {
             LogicalExpr::BinaryExpr { left, op, right } => {
                 // Handle AND/OR - recursively process both sides
                 if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
-                    let new_left = Self::replace_complex_with_temp(left, temp_column_name)?;
-                    let new_right = Self::replace_complex_with_temp(right, temp_column_name)?;
+                    let new_left = Self::replace_complex_with_temp(left, temp_column_name, schema)?;
+                    let new_right =
+                        Self::replace_complex_with_temp(right, temp_column_name, schema)?;
                     return Ok(LogicalExpr::BinaryExpr {
                         left: Box::new(new_left),
                         op: *op,
@@ -3929,6 +3946,7 @@ impl DbspCompiler {
                     );
 
                     if !left_is_simple {
+                        Self::ensure_projectable(left, schema)?;
                         // Left side is complex - replace it with temp column
                         return Ok(LogicalExpr::BinaryExpr {
                             left: Box::new(LogicalExpr::Column(Column {
@@ -3939,6 +3957,7 @@ impl DbspCompiler {
                             right: right.clone(),
                         });
                     } else if !right_is_simple {
+                        Self::ensure_projectable(right, schema)?;
                         // Right side is complex - replace it with temp column
                         return Ok(LogicalExpr::BinaryExpr {
                             left: left.clone(),
@@ -3962,6 +3981,7 @@ impl DbspCompiler {
             // replace the whole expression with a column reference to the temp column
             // The temp column will hold the boolean result of evaluating the expression
             _ if Self::predicate_needs_projection(expr) => {
+                Self::ensure_projectable(expr, schema)?;
                 // The complex expression result is in the temp column
                 // We need to check if it's true (non-zero)
                 Ok(LogicalExpr::BinaryExpr {
