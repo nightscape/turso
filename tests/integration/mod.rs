@@ -15,6 +15,7 @@ mod functions;
 mod fuzz_transaction;
 mod index_method;
 mod integrity_check;
+mod matview_left_join_antijoin;
 mod mvcc;
 mod pragma;
 mod query_processing;
