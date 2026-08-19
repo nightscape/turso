@@ -616,11 +616,33 @@ impl AntijoinOperator {
                                 ));
                             }
                             Some((l_hash, l_row, l_weight)) => {
-                                // Emit `L_pre(l,k) · indicator_delta`.
-                                let emit_weight = l_weight * indicator_delta;
-                                if emit_weight != 0 {
-                                    let row = self.emit_row(&l_row, false);
-                                    output.changes.push((row, emit_weight));
+                                match self.emit_mode {
+                                    EmitMode::NullPad { .. } => {
+                                        // Emit `L_pre(l,k) · indicator_delta`.
+                                        let emit_weight = l_weight * indicator_delta;
+                                        if emit_weight != 0 {
+                                            let row = self.emit_row(&l_row, false);
+                                            output.changes.push((row, emit_weight));
+                                        }
+                                    }
+                                    EmitMode::Indicator => {
+                                        // The row is in the view under both indicator
+                                        // values, so a flip retracts one and inserts the
+                                        // other. `indicator_delta` is `[c_post==0] −
+                                        // [c_pre==0]`, so +1 means the key just lost its
+                                        // last match.
+                                        if l_weight != 0 {
+                                            let matched_pre = indicator_delta == 1;
+                                            output.changes.push((
+                                                self.emit_row(&l_row, matched_pre),
+                                                -l_weight,
+                                            ));
+                                            output.changes.push((
+                                                self.emit_row(&l_row, !matched_pre),
+                                                l_weight,
+                                            ));
+                                        }
+                                    }
                                 }
                                 *outer = EvalState::Antijoin(Box::new(
                                     AntijoinEvalState::EmitRTransitions {
@@ -684,11 +706,30 @@ impl AntijoinOperator {
                             take_process_l_delta(outer);
                         let dr = right_count_deltas.get(&l_key_hash).copied().unwrap_or(0);
                         let c_post = c_pre + dr;
+                        // `compute_r_count_deltas` keeps NULL-keyed right rows out of
+                        // R_COUNT, which is what makes `x = NULL` unmatched here. State the
+                        // dependency so a change there fails loudly instead of turning
+                        // EXISTS true for a NULL correlation key.
+                        crate::turso_assert!(
+                            !Self::key_has_null(&l_key) || c_post == 0,
+                            "NULL-keyed left row matched {c_post} right rows"
+                        );
 
-                        // L-term: emit `δL(l, k) · [c_post == 0]`.
-                        if c_post == 0 && l_weight != 0 {
-                            let row = self.emit_row(&l_row, false);
-                            output.changes.push((row, l_weight));
+                        match self.emit_mode {
+                            EmitMode::NullPad { .. } => {
+                                // L-term: emit `δL(l, k) · [c_post == 0]`.
+                                if c_post == 0 && l_weight != 0 {
+                                    let row = self.emit_row(&l_row, false);
+                                    output.changes.push((row, l_weight));
+                                }
+                            }
+                            EmitMode::Indicator => {
+                                // Every left row is in the view, carrying its match state.
+                                if l_weight != 0 {
+                                    let row = self.emit_row(&l_row, c_post > 0);
+                                    output.changes.push((row, l_weight));
+                                }
+                            }
                         }
                         l_idx += 1;
                         *outer = EvalState::Antijoin(Box::new(AntijoinEvalState::ProcessLDelta {
