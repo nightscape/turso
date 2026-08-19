@@ -486,6 +486,34 @@ impl IncrementalView {
         Ok(())
     }
 
+    /// Tables an outer join in `from` can pad with NULLs.
+    ///
+    /// `LEFT JOIN` null-extends the table it joins in. `RIGHT` and `FULL` null-extend
+    /// some prefix of the tables to their left, which the accumulated left-hand side no
+    /// longer distinguishes, so they mark every table in the clause.
+    fn null_extended_tables(
+        from: &ast::FromClause,
+        table_map: &HashMap<String, Arc<BTreeTable>>,
+    ) -> HashSet<String> {
+        let mut null_extended = HashSet::default();
+        for join in &from.joins {
+            let ast::JoinOperator::TypedJoin(Some(join_type)) = join.operator else {
+                continue;
+            };
+            if join_type.contains(ast::JoinType::RIGHT) {
+                return table_map.keys().cloned().collect();
+            }
+            if join_type.contains(ast::JoinType::LEFT) {
+                if let ast::SelectTable::Table(name, _, _) = join.table.as_ref() {
+                    null_extended.insert(name.name.as_str().to_string());
+                }
+            } else if join_type.contains(ast::JoinType::OUTER) {
+                return table_map.keys().cloned().collect();
+            }
+        }
+        null_extended
+    }
+
     fn extract_one_statement(
         select: &ast::OneSelect,
         schema: &Schema,
@@ -528,6 +556,27 @@ impl IncrementalView {
                 }
             }
         }
+        let null_extended_tables = if let ast::OneSelect::Select {
+            from: Some(ref from),
+            ..
+        } = select
+        {
+            Self::null_extended_tables(from, table_map)
+        } else {
+            HashSet::default()
+        };
+
+        // Detect self-joined tables (same table under multiple aliases)
+        let mut alias_count: HashMap<String, usize> = HashMap::default();
+        for (_alias, table_name) in aliases.iter() {
+            *alias_count.entry(table_name.clone()).or_insert(0) += 1;
+        }
+        let self_joined_tables: HashSet<String> = alias_count
+            .into_iter()
+            .filter(|(_, count)| *count > 1)
+            .map(|(name, _)| name)
+            .collect();
+
         // Extract WHERE conditions for this SELECT
         let where_expr = if let ast::OneSelect::Select {
             where_clause: Some(ref where_expr),
@@ -547,6 +596,21 @@ impl IncrementalView {
         // Extract and store table-specific conditions from the WHERE clause
         if let Some(ref where_expr) = where_expr {
             for table_name in table_map.keys() {
+                let conditions = table_conditions.get_mut(table_name).ok_or_else(|| {
+                    LimboError::InternalError(
+                        "table_conditions should have entry for table_name".to_string(),
+                    )
+                })?;
+                if self_joined_tables.contains(table_name)
+                    || null_extended_tables.contains(table_name)
+                {
+                    // Self-joined table: conditions reference different aliases of the same
+                    // table. Null-extended table: the conditions describe the NULLs the outer
+                    // join pads in, not rows the scan can read. Either way we must fetch all
+                    // rows; the circuit handles filtering post-join.
+                    conditions.push(None);
+                    continue;
+                }
                 let all_tables: Vec<String> = table_map.keys().cloned().collect();
                 let table_specific_condition = Self::extract_conditions_for_table(
                     where_expr,
@@ -1878,6 +1942,46 @@ mod tests {
         assert!(queries
             .iter()
             .any(|q| q == "SELECT * FROM orders WHERE total > 100"));
+    }
+
+    #[test]
+    fn test_sql_for_populate_left_join_keeps_null_side_conditions_out_of_its_scan() {
+        let schema = create_test_schema();
+        let select = parse_select(
+            "SELECT * FROM customers c \
+             LEFT JOIN orders o ON o.customer_id = c.id \
+             WHERE c.id > 10 AND o.customer_id IS NULL",
+        );
+
+        let (tables, aliases, qualified_names, table_conditions) =
+            extract_all_tables(&select, &schema).unwrap();
+        let view = IncrementalView::new(
+            "test_view".to_string(),
+            select.clone(),
+            tables,
+            aliases,
+            qualified_names,
+            table_conditions,
+            extract_view_columns(&select, &schema).unwrap(),
+            &schema,
+            1, // main_data_root
+            2, // internal_state_root
+            3, // internal_state_index_root
+        )
+        .unwrap();
+
+        let queries = view.sql_for_populate().unwrap();
+
+        assert_eq!(queries.len(), 2);
+        assert!(queries
+            .iter()
+            .any(|q| q == "SELECT * FROM customers WHERE id > 10"));
+        // `o.customer_id IS NULL` matches the padding the LEFT JOIN adds, so pushing it
+        // into this scan would read no rows and null-pad every customer.
+        assert!(
+            queries.iter().any(|q| q == "SELECT * FROM orders"),
+            "orders scan must be unfiltered, got {queries:?}"
+        );
     }
 
     #[test]

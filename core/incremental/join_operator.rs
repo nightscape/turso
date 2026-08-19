@@ -376,6 +376,12 @@ impl JoinOperator {
         right_columns: Vec<String>,
     ) -> Result<Self> {
         // Check for unsupported join types
+        //
+        // When LEFT support lands, IncrementalView::extract_conditions_for_table's
+        // null_extended_tables guard (core/incremental/view.rs) already skips populate-scan
+        // predicate pushdown on the null-supplying side — restore
+        // tests/integration/matview_left_join_antijoin.rs's correctness assertion instead of
+        // its current DDL-refusal one.
         match join_type {
             JoinType::Left => {
                 return Err(crate::LimboError::ParseError(
