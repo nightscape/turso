@@ -2649,6 +2649,75 @@ mod tests {
         ))
     }
 
+    /// A table reached only through a WHERE subquery is still a source: writes to it change
+    /// the view's contents. Missing it costs the view its dependency edge (`schema.rs:2302`
+    /// reads this list) and its populate scan, both silently.
+    const SELECT_WITH_SUBQUERY_SOURCE: &str = "SELECT c.id FROM customers c \
+         WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id)";
+
+    #[test]
+    fn subquery_source_is_a_referenced_table() {
+        let schema = create_test_schema();
+        let select = parse_select(SELECT_WITH_SUBQUERY_SOURCE);
+
+        let names = IncrementalView::referenced_table_names(&select, &schema).unwrap();
+
+        assert!(
+            names.iter().any(|n| n == "orders"),
+            "orders is read by the WHERE subquery, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn subquery_source_gets_a_populate_scan() {
+        let schema = create_test_schema();
+        let select = parse_select(SELECT_WITH_SUBQUERY_SOURCE);
+
+        let (tables, aliases, qualified, conditions) =
+            extract_all_tables(&select, &schema).unwrap();
+        let queries = IncrementalView::generate_populate_queries(
+            &select,
+            &tables,
+            &aliases,
+            &qualified,
+            &conditions,
+        )
+        .unwrap();
+
+        assert!(
+            queries.iter().any(|q| q.contains("FROM orders")),
+            "no populate scan reads orders, got {queries:?}"
+        );
+    }
+
+    /// The correlation `o.customer_id = c.id` names the outer query, so it cannot be
+    /// evaluated by a scan of `orders` alone.
+    #[test]
+    fn subquery_source_is_scanned_unfiltered() {
+        let schema = create_test_schema();
+        let select = parse_select(SELECT_WITH_SUBQUERY_SOURCE);
+
+        let (tables, aliases, qualified, conditions) =
+            extract_all_tables(&select, &schema).unwrap();
+        let queries = IncrementalView::generate_populate_queries(
+            &select,
+            &tables,
+            &aliases,
+            &qualified,
+            &conditions,
+        )
+        .unwrap();
+
+        let orders = queries
+            .iter()
+            .find(|q| q.contains("FROM orders"))
+            .expect("orders must have a populate scan");
+        assert!(
+            !orders.contains("WHERE"),
+            "orders scan carries a correlated predicate: {orders}"
+        );
+    }
+
     #[test]
     fn test_extract_single_table() {
         let schema = create_test_schema();
