@@ -350,25 +350,3 @@ pub(crate) fn schema_with_indicator(base: &LogicalSchema, index: usize) -> Logic
     });
     LogicalSchema::new(columns)
 }
-
-/// Project the indicator columns back off, restoring the pre-rewrite schema.
-pub(crate) fn projection_dropping_indicators(
-    input: Arc<LogicalPlan>,
-    base: &LogicalSchema,
-) -> LogicalPlan {
-    let exprs = base
-        .columns
-        .iter()
-        .map(|col| {
-            LogicalExpr::Column(Column {
-                name: col.name.clone(),
-                table: col.table_alias.clone().or_else(|| col.table.clone()),
-            })
-        })
-        .collect();
-    LogicalPlan::Projection(Projection {
-        input,
-        exprs,
-        schema: Arc::new(base.clone()),
-    })
-}
