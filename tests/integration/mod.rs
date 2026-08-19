@@ -13,6 +13,7 @@ mod functions;
 mod fuzz_transaction;
 mod index_method;
 mod integrity_check;
+mod matview_computed_conjuncts;
 mod matview_exists_decorrelation;
 mod matview_left_join_antijoin;
 mod mvcc;
