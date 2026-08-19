@@ -242,3 +242,180 @@ fn a_foreign_table_cannot_be_a_subquery_source() {
         "foreign table",
     );
 }
+
+const NOW_READY: &str = "SELECT b.id FROM block b \
+     WHERE json_extract(b.properties, '$.task_state') = 'TODO' \
+       AND NOT EXISTS (SELECT 1 FROM block_requires br WHERE br.block_id = b.id)";
+
+fn seed_now(conn: &Arc<Connection>) {
+    limbo_exec_rows(
+        conn,
+        "CREATE TABLE block (id INTEGER PRIMARY KEY, properties TEXT)",
+    );
+    limbo_exec_rows(
+        conn,
+        "CREATE TABLE block_requires (block_id INTEGER, required_id INTEGER)",
+    );
+    limbo_exec_rows(
+        conn,
+        "INSERT INTO block VALUES \
+         (1,'{\"task_state\":\"TODO\"}'),(2,'{\"task_state\":\"TODO\"}'), \
+         (3,'{\"task_state\":\"DONE\"}'),(4,'{\"task_state\":\"TODO\"}'),(5,'{\"task_state\":\"TODO\"}')",
+    );
+    limbo_exec_rows(conn, "INSERT INTO block_requires VALUES (2,1),(4,3)");
+}
+
+#[track_caller]
+fn assert_ready_matches(conn: &Arc<Connection>, stage: &str) {
+    assert_eq!(
+        ids(limbo_exec_rows(conn, "SELECT id FROM ready")),
+        ids(limbo_exec_rows(conn, NOW_READY)),
+        "matview disagrees with a fresh recompute after {stage}"
+    );
+}
+
+/// The readiness query this feature exists for: a computed conjunct beside a correlated
+/// NOT EXISTS. It is the shape that originally reported success and answered empty.
+#[test]
+fn a_computed_conjunct_beside_not_exists_maintains() {
+    let db = TempDatabase::builder().with_views(true).build();
+    let conn = db.connect_limbo();
+    seed_now(&conn);
+
+    limbo_exec_rows(
+        &conn,
+        &format!("CREATE MATERIALIZED VIEW ready AS {NOW_READY}"),
+    );
+    assert_ready_matches(&conn, "materializing over existing rows");
+
+    limbo_exec_rows(&conn, "INSERT INTO block_requires VALUES (1,3)");
+    assert_ready_matches(&conn, "blocking a ready row");
+
+    limbo_exec_rows(&conn, "DELETE FROM block_requires WHERE block_id = 2");
+    assert_ready_matches(&conn, "freeing a blocked row");
+
+    limbo_exec_rows(
+        &conn,
+        "UPDATE block SET properties = '{\"task_state\":\"DONE\"}' WHERE id = 5",
+    );
+    assert_ready_matches(&conn, "the computed conjunct flipping for a row");
+
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO block VALUES (6,'{\"task_state\":\"TODO\"}')",
+    );
+    assert_ready_matches(&conn, "inserting a ready row");
+}
+
+/// Same shape with the subquery reading a matview, so the computed conjunct and the
+/// indicator have to compose with a delta arriving through an upstream circuit.
+#[test]
+fn a_computed_conjunct_beside_not_exists_over_a_matview_source_maintains() {
+    let db = TempDatabase::builder().with_views(true).build();
+    let conn = db.connect_limbo();
+    limbo_exec_rows(
+        &conn,
+        "CREATE TABLE block (id INTEGER PRIMARY KEY, properties TEXT)",
+    );
+    limbo_exec_rows(
+        &conn,
+        "CREATE TABLE req_raw (block_id INTEGER, required_id INTEGER, live INTEGER)",
+    );
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO block VALUES \
+         (1,'{\"task_state\":\"TODO\"}'),(2,'{\"task_state\":\"TODO\"}'), \
+         (3,'{\"task_state\":\"DONE\"}'),(4,'{\"task_state\":\"TODO\"}')",
+    );
+    limbo_exec_rows(&conn, "INSERT INTO req_raw VALUES (2,1,1),(4,3,0)");
+    limbo_exec_rows(
+        &conn,
+        "CREATE MATERIALIZED VIEW block_requires AS \
+         SELECT block_id, required_id FROM req_raw WHERE live = 1",
+    );
+
+    limbo_exec_rows(
+        &conn,
+        &format!("CREATE MATERIALIZED VIEW ready AS {NOW_READY}"),
+    );
+    assert_ready_matches(&conn, "materializing over a matview source");
+
+    limbo_exec_rows(&conn, "UPDATE req_raw SET live = 1 WHERE block_id = 4");
+    assert_ready_matches(&conn, "an upstream row entering the matview");
+}
+
+/// A disjunction of two subqueries beside a computed conjunct: three indicator columns
+/// feed one predicate, and the OR is evaluated over them.
+#[test]
+fn a_computed_conjunct_beside_an_or_of_exists_maintains() {
+    let db = TempDatabase::builder().with_views(true).build();
+    let conn = db.connect_limbo();
+    limbo_exec_rows(
+        &conn,
+        "CREATE TABLE block (id INTEGER PRIMARY KEY, properties TEXT)",
+    );
+    limbo_exec_rows(
+        &conn,
+        "CREATE TABLE block_tags (block_id INTEGER, tag TEXT)",
+    );
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO block VALUES \
+         (1,'{\"task_state\":\"TODO\"}'),(2,'{\"task_state\":\"TODO\"}'), \
+         (3,'{\"task_state\":\"DONE\"}'),(4,'{\"task_state\":\"TODO\"}')",
+    );
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO block_tags VALUES (1,'agent'),(2,'human-only')",
+    );
+
+    const AGENT_READY: &str = "SELECT b.id FROM block b \
+         WHERE json_extract(b.properties, '$.task_state') = 'TODO' \
+           AND (EXISTS (SELECT 1 FROM block_tags bt WHERE bt.block_id = b.id AND bt.tag = 'agent') \
+                OR NOT EXISTS (SELECT 1 FROM block_tags bt WHERE bt.block_id = b.id AND bt.tag = 'human-only'))";
+
+    limbo_exec_rows(
+        &conn,
+        &format!("CREATE MATERIALIZED VIEW agent_ready AS {AGENT_READY}"),
+    );
+    let check = |stage: &str| {
+        assert_eq!(
+            ids(limbo_exec_rows(&conn, "SELECT id FROM agent_ready")),
+            ids(limbo_exec_rows(&conn, AGENT_READY)),
+            "matview disagrees with a fresh recompute after {stage}"
+        );
+    };
+    check("materializing over existing rows");
+
+    // Both branches true at once, then only the first.
+    limbo_exec_rows(&conn, "INSERT INTO block_tags VALUES (2,'agent')");
+    check("tagging a human-only row as agent");
+
+    limbo_exec_rows(&conn, "INSERT INTO block_tags VALUES (4,'human-only')");
+    check("marking a free row human-only");
+
+    limbo_exec_rows(&conn, "DELETE FROM block_tags WHERE block_id = 1");
+    check("removing the agent tag");
+}
+
+/// Guards against over-reach: a computed expression with no subquery beside it still
+/// compiles and materializes.
+#[test]
+fn a_computed_expression_alone_still_materializes() {
+    let db = TempDatabase::builder().with_views(true).build();
+    let conn = db.connect_limbo();
+    seed_now(&conn);
+
+    limbo_exec_rows(
+        &conn,
+        "CREATE MATERIALIZED VIEW todos AS SELECT b.id FROM block b \
+         WHERE json_extract(b.properties, '$.task_state') = 'TODO'",
+    );
+    assert_eq!(
+        ids(limbo_exec_rows(&conn, "SELECT id FROM todos")),
+        ids(limbo_exec_rows(
+            &conn,
+            "SELECT b.id FROM block b WHERE json_extract(b.properties, '$.task_state') = 'TODO'"
+        ))
+    );
+}
