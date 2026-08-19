@@ -206,3 +206,39 @@ fn a_reserved_indicator_column_name_is_refused() {
         "__exists_",
     );
 }
+
+/// A foreign table is kept current through a mirror, and the mirror rewrite reaches only
+/// FROM and JOIN clauses. Left unfenced, a subquery over one reads a table that never
+/// receives deltas, so the view answers as though it were empty.
+#[test]
+fn a_foreign_table_cannot_be_a_subquery_source() {
+    let db = TempDatabase::builder().with_views(true).build();
+    let conn = db.connect_limbo();
+    let csv = db.path.parent().unwrap().join("blocked.csv");
+    std::fs::write(&csv, "id,name\n1,alice\n3,carol\n").unwrap();
+    limbo_exec_rows(
+        &conn,
+        "CREATE TABLE block (id INTEGER PRIMARY KEY, tag TEXT)",
+    );
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO block VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d')",
+    );
+    limbo_exec_rows(&conn, "CREATE SERVER csv_srv OPTIONS (driver 'csv')");
+    limbo_exec_rows(
+        &conn,
+        &format!(
+            "CREATE FOREIGN TABLE blocked (id TEXT, name TEXT) SERVER csv_srv \
+             OPTIONS (path '{}', skip_header 'true')",
+            csv.display()
+        ),
+    );
+
+    assert_refused_naming(
+        &db,
+        &conn,
+        "CREATE MATERIALIZED VIEW free AS SELECT b.id FROM block b \
+         WHERE NOT EXISTS (SELECT 1 FROM blocked f WHERE f.id = b.id)",
+        "foreign table",
+    );
+}

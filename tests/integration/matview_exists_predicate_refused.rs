@@ -3,9 +3,10 @@
 //!
 //! The computed expression sends the whole predicate through the IVM compiler's
 //! projection rewrite, which carries one sub-expression in a temp column and points
-//! every other complex conjunct at that same column. The subquery never reaches the
-//! conversion that rejects it, so CREATE reports success for a circuit that cannot
-//! compute the query and the view answers empty forever.
+//! every other complex conjunct at that same column. Once the subquery is rewritten to
+//! an indicator column the pair is a computed expression beside a column test, which
+//! that path still cannot express — it must say so rather than report success for a
+//! circuit that cannot compute the query.
 
 use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
 use std::sync::Arc;
@@ -34,11 +35,15 @@ fn seed(conn: &Arc<Connection>) {
 #[track_caller]
 fn assert_ddl_refused(db: &TempDatabase, conn: &Arc<Connection>, sql: &str) {
     let err = limbo_exec_rows_fallible(db, conn, sql)
-        .expect_err("a correlated subquery in a matview WHERE has no IVM support");
+        .expect_err("a computed expression beside a subquery has no IVM support");
+    let msg = err.to_string();
     assert!(
-        err.to_string()
-            .contains("Cannot convert LogicalExpr to AST Expr"),
-        "unexpected DDL error: {err}"
+        msg.contains("Filter predicate must be"),
+        "unexpected DDL error: {msg}"
+    );
+    assert!(
+        !msg.contains("Cannot convert LogicalExpr"),
+        "refusal must be actionable, not a debug dump: {msg}"
     );
 }
 

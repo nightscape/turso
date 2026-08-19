@@ -6,7 +6,7 @@
 //! null-supplying side of an outer join the conjunct describes the padding the
 //! join produces, not the rows the scan reads, so it belongs above the join.
 
-use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
+use crate::common::{limbo_exec_rows, TempDatabase};
 use rusqlite::types::Value;
 use std::sync::Arc;
 use turso_core::Connection;
@@ -71,26 +71,4 @@ fn antijoin_matview_matches_recompute_across_maintenance() {
         "UPDATE block SET properties = '{\"task_state\":\"DONE\"}' WHERE id = 4",
     );
     assert_matches_recompute(&conn, "updating an outer row's properties");
-}
-
-/// The correlated `NOT EXISTS` spelling of the same anti-join. The IVM compiler
-/// has no `LogicalExpr::Exists` arm, so this is refused at DDL time.
-#[test]
-fn correlated_not_exists_matview_is_refused_at_ddl() {
-    let db = TempDatabase::builder().with_views(true).build();
-    let conn = db.connect_limbo();
-    seed(&conn);
-
-    let err = limbo_exec_rows_fallible(
-        &db,
-        &conn,
-        "CREATE MATERIALIZED VIEW unblocked AS SELECT b.id FROM block b \
-         WHERE NOT EXISTS (SELECT 1 FROM block_requires br WHERE br.block_id = b.id)",
-    )
-    .expect_err("NOT EXISTS has no IVM compiler support");
-    assert!(
-        err.to_string()
-            .contains("Cannot convert LogicalExpr to AST Expr"),
-        "unexpected DDL error: {err}"
-    );
 }
