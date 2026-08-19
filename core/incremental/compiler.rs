@@ -2310,7 +2310,9 @@ impl DbspCompiler {
         }
 
         let predicate = decorrelate::fold_indicator_negations(&predicate);
-        let filter_id = self.add_filter_node(current_id, &predicate, &current_schema)?;
+        // The indicator test is a plain column comparison, so a computed conjunct beside it
+        // still routes through the temp-column projection exactly as it would on its own.
+        let filter_id = self.compile_predicate_over(current_id, &current_schema, &predicate)?;
 
         // Drop the indicator columns so the view's schema is the one the user wrote.
         let input_names: Vec<String> = current_schema
@@ -2345,6 +2347,174 @@ impl DbspCompiler {
             vec![filter_id],
             executable,
         ))
+    }
+
+    /// Compile `predicate` over an already-compiled input, adding the temp-column
+    /// projection when the predicate holds an expression the filter cannot evaluate.
+    fn compile_predicate_over(
+        &mut self,
+        input_id: i64,
+        input_schema: &SchemaRef,
+        predicate: &LogicalExpr,
+    ) -> Result<i64> {
+        // Check if the predicate contains expressions that need to be computed
+        if Self::predicate_needs_projection(predicate) {
+            // Complex expression in WHERE clause - need to add projection first
+            // 1. Create projection that adds the computed expression as a new column
+
+            // First, get all existing columns
+            let mut dbsp_exprs = Vec::new();
+            for col in &input_schema.columns {
+                dbsp_exprs.push(DbspExpr::Column(col.name.clone()));
+            }
+
+            // Now add the expression as a computed column
+            let temp_column_name = "__temp_filter_expr";
+            let computed_expr = Self::extract_expression_from_predicate(predicate)?;
+
+            // Compile the projection expressions.
+            //
+            // The passthrough part is a pure 1:1 copy of
+            // `input_schema.columns`, so bind it POSITIONALLY. Rebuilding
+            // it as unqualified `LogicalExpr::Column`s and re-resolving
+            // those by name is lossy: when this filter's input is a join
+            // whose two sides carry columns with the same bare name (a
+            // self-join, or a recursive CTE mirroring its base table),
+            // every such reference resolves to the FIRST match, silently
+            // wiring the output column to the wrong side.
+            let input_len = input_schema.columns.len();
+            let mut compiled_exprs = Vec::new();
+            let mut aliases = Vec::new();
+            let mut output_names = Vec::new();
+            for (i, col) in input_schema.columns.iter().enumerate() {
+                compiled_exprs.push(CompiledExpression {
+                    executor: ExpressionExecutor::Trivial(TrivialExpression::Column(i)),
+                    input_count: input_len,
+                });
+                aliases.push(None);
+                output_names.push(col.name.clone());
+            }
+            let (compiled_computed, _alias) =
+                Self::compile_expression(&computed_expr, input_schema)?;
+            compiled_exprs.push(compiled_computed);
+            aliases.push(Some(temp_column_name.to_string()));
+            output_names.push(temp_column_name.to_string());
+
+            // Get input column names for ProjectOperator
+            let input_column_names: Vec<String> = input_schema
+                .columns
+                .iter()
+                .map(|col| col.name.clone())
+                .collect();
+
+            // Create projection operator
+            let proj_executable: Box<dyn IncrementalOperator> =
+                Box::new(ProjectOperator::from_compiled(
+                    compiled_exprs.clone(),
+                    aliases.clone(),
+                    input_column_names,
+                    output_names.clone(),
+                )?);
+
+            // Create updated schema for the projection output
+            let mut proj_schema_columns = input_schema.columns.clone();
+            proj_schema_columns.push(ColumnInfo {
+                name: temp_column_name.to_string(),
+                table: None,
+                database: None,
+                table_alias: None,
+                ty: Type::Integer, // Computed expressions default to Integer
+            });
+            let proj_schema = SchemaRef::new(LogicalSchema {
+                columns: proj_schema_columns,
+            });
+
+            // Add projection node
+            let proj_id = self.circuit.add_node(
+                DbspOperator::Projection {
+                    exprs: dbsp_exprs.clone(),
+                    schema: proj_schema.clone(),
+                },
+                vec![input_id],
+                proj_executable,
+            );
+
+            // Now create a filter that replaces the complex expression with the temp column
+            // but keeps all other conditions intact
+            let replaced_predicate =
+                Self::replace_complex_with_temp(predicate, temp_column_name, input_schema)?;
+            let filter_predicate =
+                Self::compile_filter_predicate(&replaced_predicate, &proj_schema)?;
+
+            let filter_executable: Box<dyn IncrementalOperator> =
+                Box::new(FilterOperator::new(filter_predicate));
+
+            // Create filter node
+            let filter_id = self.circuit.add_node(
+                DbspOperator::Filter {
+                    predicate: Self::compile_expr(&replaced_predicate)?,
+                },
+                vec![proj_id],
+                filter_executable,
+            );
+
+            // Finally, project again to remove the temporary column
+            let mut final_exprs = Vec::new();
+            let mut final_aliases = Vec::new();
+            let mut final_names = Vec::new();
+            let mut final_dbsp_exprs = Vec::new();
+
+            for (i, column) in input_schema.columns.iter().enumerate() {
+                let col_name = &column.name;
+                final_exprs.push(compiled_exprs[i].clone());
+                final_aliases.push(None);
+                final_names.push(col_name.clone());
+                final_dbsp_exprs.push(DbspExpr::Column(col_name.clone()));
+            }
+
+            // Input names for the final projection include the temp column
+            let filter_output_names = output_names.clone();
+
+            let final_proj_executable: Box<dyn IncrementalOperator> =
+                Box::new(ProjectOperator::from_compiled(
+                    final_exprs,
+                    final_aliases,
+                    filter_output_names,
+                    final_names.clone(),
+                )?);
+
+            let final_id = self.circuit.add_node(
+                DbspOperator::Projection {
+                    exprs: final_dbsp_exprs,
+                    schema: input_schema.clone(), // Back to original schema
+                },
+                vec![filter_id],
+                final_proj_executable,
+            );
+
+            Ok(final_id)
+        } else {
+            // Simple filter - use existing implementation
+            // Convert predicate to DBSP expression
+            let dbsp_predicate = Self::compile_expr(predicate)?;
+
+            // Convert to FilterPredicate
+            let filter_predicate = Self::compile_filter_predicate(predicate, input_schema)?;
+
+            // Create executable operator
+            let executable: Box<dyn IncrementalOperator> =
+                Box::new(FilterOperator::new(filter_predicate));
+
+            // Create filter node
+            let node_id = self.circuit.add_node(
+                DbspOperator::Filter {
+                    predicate: dbsp_predicate,
+                },
+                vec![input_id],
+                executable,
+            );
+            Ok(node_id)
+        }
     }
 
     /// Add a filter node on top of an existing node.
@@ -2509,169 +2679,7 @@ impl DbspCompiler {
                 // Get input schema for column resolution
                 let input_schema = filter.input.schema();
 
-                // Check if the predicate contains expressions that need to be computed
-                if Self::predicate_needs_projection(&filter.predicate) {
-                    // Complex expression in WHERE clause - need to add projection first
-                    // 1. Create projection that adds the computed expression as a new column
-
-                    // First, get all existing columns
-                    let mut dbsp_exprs = Vec::new();
-                    for col in &input_schema.columns {
-                        dbsp_exprs.push(DbspExpr::Column(col.name.clone()));
-                    }
-
-                    // Now add the expression as a computed column
-                    let temp_column_name = "__temp_filter_expr";
-                    let computed_expr = Self::extract_expression_from_predicate(&filter.predicate)?;
-
-                    // Compile the projection expressions.
-                    //
-                    // The passthrough part is a pure 1:1 copy of
-                    // `input_schema.columns`, so bind it POSITIONALLY. Rebuilding
-                    // it as unqualified `LogicalExpr::Column`s and re-resolving
-                    // those by name is lossy: when this filter's input is a join
-                    // whose two sides carry columns with the same bare name (a
-                    // self-join, or a recursive CTE mirroring its base table),
-                    // every such reference resolves to the FIRST match, silently
-                    // wiring the output column to the wrong side.
-                    let input_len = input_schema.columns.len();
-                    let mut compiled_exprs = Vec::new();
-                    let mut aliases = Vec::new();
-                    let mut output_names = Vec::new();
-                    for (i, col) in input_schema.columns.iter().enumerate() {
-                        compiled_exprs.push(CompiledExpression {
-                            executor: ExpressionExecutor::Trivial(TrivialExpression::Column(i)),
-                            input_count: input_len,
-                        });
-                        aliases.push(None);
-                        output_names.push(col.name.clone());
-                    }
-                    let (compiled_computed, _alias) =
-                        Self::compile_expression(&computed_expr, input_schema)?;
-                    compiled_exprs.push(compiled_computed);
-                    aliases.push(Some(temp_column_name.to_string()));
-                    output_names.push(temp_column_name.to_string());
-
-                    // Get input column names for ProjectOperator
-                    let input_column_names: Vec<String> = input_schema
-                        .columns
-                        .iter()
-                        .map(|col| col.name.clone())
-                        .collect();
-
-                    // Create projection operator
-                    let proj_executable: Box<dyn IncrementalOperator> =
-                        Box::new(ProjectOperator::from_compiled(
-                            compiled_exprs.clone(),
-                            aliases.clone(),
-                            input_column_names,
-                            output_names.clone(),
-                        )?);
-
-                    // Create updated schema for the projection output
-                    let mut proj_schema_columns = input_schema.columns.clone();
-                    proj_schema_columns.push(ColumnInfo {
-                        name: temp_column_name.to_string(),
-                        table: None,
-                        database: None,
-                        table_alias: None,
-                        ty: Type::Integer, // Computed expressions default to Integer
-                    });
-                    let proj_schema = SchemaRef::new(LogicalSchema {
-                        columns: proj_schema_columns,
-                    });
-
-                    // Add projection node
-                    let proj_id = self.circuit.add_node(
-                        DbspOperator::Projection {
-                            exprs: dbsp_exprs.clone(),
-                            schema: proj_schema.clone(),
-                        },
-                        vec![input_id],
-                        proj_executable,
-                    );
-
-                    // Now create a filter that replaces the complex expression with the temp column
-                    // but keeps all other conditions intact
-                    let replaced_predicate =
-                        Self::replace_complex_with_temp(
-                            &filter.predicate,
-                            temp_column_name,
-                            input_schema,
-                        )?;
-                    let filter_predicate =
-                        Self::compile_filter_predicate(&replaced_predicate, &proj_schema)?;
-
-                    let filter_executable: Box<dyn IncrementalOperator> =
-                        Box::new(FilterOperator::new(filter_predicate));
-
-                    // Create filter node
-                    let filter_id = self.circuit.add_node(
-                        DbspOperator::Filter {
-                            predicate: Self::compile_expr(&replaced_predicate)?,
-                        },
-                        vec![proj_id],
-                        filter_executable,
-                    );
-
-                    // Finally, project again to remove the temporary column
-                    let mut final_exprs = Vec::new();
-                    let mut final_aliases = Vec::new();
-                    let mut final_names = Vec::new();
-                    let mut final_dbsp_exprs = Vec::new();
-
-                    for (i, column) in input_schema.columns.iter().enumerate() {
-                        let col_name = &column.name;
-                        final_exprs.push(compiled_exprs[i].clone());
-                        final_aliases.push(None);
-                        final_names.push(col_name.clone());
-                        final_dbsp_exprs.push(DbspExpr::Column(col_name.clone()));
-                    }
-
-                    // Input names for the final projection include the temp column
-                    let filter_output_names = output_names.clone();
-
-                    let final_proj_executable: Box<dyn IncrementalOperator> =
-                        Box::new(ProjectOperator::from_compiled(
-                            final_exprs,
-                            final_aliases,
-                            filter_output_names,
-                            final_names.clone(),
-                        )?);
-
-                    let final_id = self.circuit.add_node(
-                        DbspOperator::Projection {
-                            exprs: final_dbsp_exprs,
-                            schema: input_schema.clone(), // Back to original schema
-                        },
-                        vec![filter_id],
-                        final_proj_executable,
-                    );
-
-                    Ok(final_id)
-                } else {
-                    // Simple filter - use existing implementation
-                    // Convert predicate to DBSP expression
-                    let dbsp_predicate = Self::compile_expr(&filter.predicate)?;
-
-                    // Convert to FilterPredicate
-                    let filter_predicate =
-                        Self::compile_filter_predicate(&filter.predicate, input_schema)?;
-
-                    // Create executable operator
-                    let executable: Box<dyn IncrementalOperator> =
-                        Box::new(FilterOperator::new(filter_predicate));
-
-                    // Create filter node
-                    let node_id = self.circuit.add_node(
-                        DbspOperator::Filter {
-                            predicate: dbsp_predicate,
-                        },
-                        vec![input_id],
-                        executable,
-                    );
-                    Ok(node_id)
-                }
+                self.compile_predicate_over(input_id, &input_schema, &filter.predicate)
             }
             LogicalPlan::Aggregate(agg) => {
                 // Compile the input first
