@@ -206,3 +206,107 @@ fn removing_a_left_row_retracts_its_indicator() {
 
     assert_eq!(out, vec![tagged_w(1, true, -1)]);
 }
+
+/// Fires one mid-balance yield inside the DBSP state btree, so the operator must
+/// resume its persistence loop from the state it recorded before the write.
+#[derive(Debug)]
+struct OneShotBalanceYield {
+    selection_key: u64,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+impl crate::mvcc::yield_points::YieldInjector for OneShotBalanceYield {
+    fn should_yield(
+        &self,
+        _instance_id: u64,
+        selection_key: u64,
+        point: crate::mvcc::yield_points::YieldPoint,
+    ) -> bool {
+        use crate::mvcc::yield_hooks::YieldPointMarker;
+        point
+            == crate::storage::btree::BTreeWriteYieldPoint::AfterInsertOverflowCellBeforeBalance
+                .point()
+            && (selection_key == self.selection_key || self.selection_key == 0)
+            && !self.fired.swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
+}
+
+/// Enough left rows that persisting L_INDEX fills a leaf and the next insert balances.
+const BALANCE_ROWS: i64 = 400;
+
+fn flip_sequence(op: &mut AntijoinOperator, pager: &Arc<Pager>, cursors: &mut DbspStateCursors) {
+    let mut left = Delta::new();
+    for k in 0..BALANCE_ROWS {
+        left.insert(
+            k,
+            vec![Value::from_i64(k), Value::from_text("x".repeat(600))],
+        );
+    }
+    commit(op, pager, cursors, left, Delta::new());
+}
+
+#[test]
+fn a_mid_balance_yield_does_not_change_the_emitted_delta() {
+    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let conn = db.connect().unwrap();
+    let pager = conn.pager.load().clone();
+    let _ = pager.io.block(|| pager.allocate_page1());
+    let table_root = pager
+        .io
+        .block(|| pager.btree_create(&CreateBTreeFlags::new_table()))
+        .unwrap() as i64;
+    let index_root = pager
+        .io
+        .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
+        .unwrap() as i64;
+    let mut table_cursor = BTreeCursor::new_table(pager.clone(), table_root, 5);
+    let index_def = create_dbsp_state_index(index_root);
+    let mut index_cursor =
+        BTreeCursor::new_index(pager.clone(), index_root, &index_def, 3).unwrap();
+    // The cursor snapshots the pager's injector when the context is installed, so the
+    // injector must be on the connection first.
+    let injector = Arc::new(OneShotBalanceYield {
+        selection_key: 0,
+        fired: std::sync::atomic::AtomicBool::new(false),
+    });
+    conn.set_yield_injector(Some(injector.clone()));
+    crate::incremental::operator::install_dbsp_yield_context(&mut table_cursor, &pager);
+    crate::incremental::operator::install_dbsp_yield_context(&mut index_cursor, &pager);
+    let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+    let mut op = indicator_operator();
+    flip_sequence(&mut op, &pager, &mut cursors);
+    // Every key gains its first match: each left row must retract unmatched and insert matched.
+    let mut right = Delta::new();
+    for k in 0..BALANCE_ROWS {
+        right.insert(k + 100_000, vec![Value::from_i64(k)]);
+    }
+    let out = commit(&mut op, &pager, &mut cursors, Delta::new(), right);
+
+    conn.set_yield_injector(None);
+    assert!(
+        injector.fired.load(std::sync::atomic::Ordering::Acquire),
+        "no mid-balance yield was injected; the test does not exercise re-entry"
+    );
+
+    let (_, mut cursors_ref) = harness();
+    let mut op_ref = indicator_operator();
+    flip_sequence(&mut op_ref, &pager, &mut cursors_ref);
+    let mut right_ref = Delta::new();
+    for k in 0..BALANCE_ROWS {
+        right_ref.insert(k + 100_000, vec![Value::from_i64(k)]);
+    }
+    let expected = commit(
+        &mut op_ref,
+        &pager,
+        &mut cursors_ref,
+        Delta::new(),
+        right_ref,
+    );
+
+    assert_eq!(
+        out, expected,
+        "a mid-balance yield changed the output delta"
+    );
+}
