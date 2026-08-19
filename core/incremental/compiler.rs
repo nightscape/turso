@@ -13,7 +13,7 @@ use crate::incremental::expr_compiler::{
 use crate::incremental::literal_operator::LiteralOperator;
 use crate::incremental::operator::{
     create_dbsp_state_index, generate_storage_id, install_dbsp_yield_context, AntijoinOperator,
-    DbspStateCursors, EvalState, FilterOperator, FilterPredicate, IncrementalOperator,
+    DbspStateCursors, EmitMode, EvalState, FilterOperator, FilterPredicate, IncrementalOperator,
     InputOperator, JoinOperator, JoinType, ProjectOperator,
 };
 use crate::incremental::persistence::WriteRow;
@@ -3099,7 +3099,7 @@ impl DbspCompiler {
                                 aj_op_id,
                                 left_key_indices.clone(),
                                 right_key_indices.clone(),
-                                right_column_count,
+                                EmitMode::NullPad { right_column_count },
                             ));
                         let mc_id = self.circuit.add_node(
                             DbspOperator::Antijoin {

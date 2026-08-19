@@ -1,4 +1,6 @@
 pub mod aggregate_operator;
+#[cfg(test)]
+mod antijoin_indicator;
 pub mod antijoin_operator;
 pub mod compiler;
 pub mod cursor;

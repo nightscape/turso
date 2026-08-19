@@ -5,7 +5,7 @@
 pub use crate::incremental::aggregate_operator::{
     AggregateEvalState, AggregateFunction, AggregateState,
 };
-pub use crate::incremental::antijoin_operator::{AntijoinEvalState, AntijoinOperator};
+pub use crate::incremental::antijoin_operator::{AntijoinEvalState, AntijoinOperator, EmitMode};
 pub use crate::incremental::filter_operator::{FilterOperator, FilterPredicate};
 pub use crate::incremental::input_operator::InputOperator;
 pub use crate::incremental::join_operator::{JoinEvalState, JoinOperator, JoinType};
