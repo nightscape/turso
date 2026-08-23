@@ -1,0 +1,80 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+
+# count(x) counts non-NULL values of x, while count(*) counts rows.
+# The views also select sum(x)/avg(x) so that count(x) is exercised next to
+# other aggregates in the same persisted state blob. sum(x)/avg(x) results are
+# deliberately not asserted: both still diverge from SQLite over NULL-only
+# input and on integer typing, which is a separate gap, not an oversight here.
+# All expectations below were taken from sqlite3 running the same query
+# against a plain (non-materialized) view.
+
+test matview-count-column-ignores-null-column-values {
+    CREATE TABLE t(id INTEGER, x INTEGER);
+    INSERT INTO t VALUES (1, NULL), (2, NULL);
+    CREATE MATERIALIZED VIEW v AS
+        SELECT count(x) AS cx, sum(x) AS sx, avg(x) AS ax, count(*) AS n FROM t;
+    SELECT cx, n FROM v;
+}
+expect {
+    0|2
+}
+
+test matview-count-column-tracks-inserts-and-deletes {
+    CREATE TABLE t(id INTEGER, x INTEGER);
+    INSERT INTO t VALUES (1, NULL), (2, NULL);
+    CREATE MATERIALIZED VIEW v AS
+        SELECT count(x) AS cx, sum(x) AS sx, avg(x) AS ax, count(*) AS n FROM t;
+    INSERT INTO t VALUES (3, 10);
+    SELECT cx, n FROM v;
+    DELETE FROM t WHERE id = 3;
+    SELECT cx, n FROM v;
+}
+expect {
+    1|3
+    0|2
+}
+
+# A row that changes from NULL to a value and back must move count(x) with it.
+test matview-count-column-tracks-updates {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, NULL), (2, 4);
+    CREATE MATERIALIZED VIEW v AS
+        SELECT count(x) AS cx, sum(x) AS sx, avg(x) AS ax FROM t;
+    SELECT cx FROM v;
+    UPDATE t SET x = NULL WHERE id = 2;
+    SELECT cx FROM v;
+    UPDATE t SET x = 6 WHERE id = 1;
+    SELECT cx FROM v;
+}
+expect {
+    1
+    0
+    1
+}
+
+test matview-count-column-ignores-nulls-per-group {
+    CREATE TABLE g(k TEXT, x INTEGER);
+    INSERT INTO g VALUES ('a', NULL), ('a', 5), ('b', NULL);
+    CREATE MATERIALIZED VIEW v AS
+        SELECT k, count(x) AS cx, sum(x) AS sx, avg(x) AS ax, count(*) AS n
+        FROM g GROUP BY k;
+    SELECT k, cx, n FROM v ORDER BY k;
+}
+expect {
+    a|1|2
+    b|0|1
+}
+
+# count(*) and count(<constant>) count every row, NULLs included.
+test matview-count-star-and-constant-count-rows {
+    CREATE TABLE t(id INTEGER, x INTEGER);
+    INSERT INTO t VALUES (1, NULL), (2, 7), (3, NULL);
+    CREATE MATERIALIZED VIEW v AS
+        SELECT count(*) AS n, count(1) AS c1, count(x) AS cx FROM t;
+    SELECT n, c1, cx FROM v;
+}
+expect {
+    3|3|1
+}
