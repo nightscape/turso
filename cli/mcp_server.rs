@@ -77,7 +77,11 @@ impl StmtClass {
             | Stmt::CreateTrigger { .. }
             | Stmt::CreateView { .. }
             | Stmt::CreateMaterializedView { .. }
+            | Stmt::RefreshMaterializedView { .. }
             | Stmt::CreateVirtualTable(_)
+            | Stmt::CreateServer(_)
+            | Stmt::CreateForeignTable(_)
+            | Stmt::DropServer { .. }
             | Stmt::CreateType { .. }
             | Stmt::CreateDomain { .. }
             | Stmt::CreateSequence { .. }
@@ -87,11 +91,7 @@ impl StmtClass {
             | Stmt::DropView { .. }
             | Stmt::DropType { .. }
             | Stmt::DropDomain { .. }
-            | Stmt::DropSequence { .. }
-            | Stmt::RefreshMaterializedView { .. }
-            | Stmt::CreateServer(_)
-            | Stmt::CreateForeignTable(_)
-            | Stmt::DropServer { .. } => Some(Self::Schema),
+            | Stmt::DropSequence { .. } => Some(Self::Schema),
             Stmt::Analyze { .. }
             | Stmt::Attach { .. }
             | Stmt::Begin { .. }
