@@ -94,7 +94,8 @@ fn hash_value(value: &Value, column_idx: usize) -> Hash128 {
     row.cached_hash()
 }
 
-// Serialization type codes for aggregate functions
+// Serialization type codes for aggregate functions. These are persisted in the
+// aggregate state blob, so a code must never be renumbered or reused.
 const AGG_FUNC_COUNT: i64 = 0;
 const AGG_FUNC_SUM: i64 = 1;
 const AGG_FUNC_AVG: i64 = 2;
@@ -107,10 +108,12 @@ const AGG_FUNC_GROUP_CONCAT: i64 = 8;
 const AGG_FUNC_GROUP_CONCAT_DISTINCT: i64 = 9;
 const AGG_FUNC_JSON_GROUP_ARRAY: i64 = 10;
 const AGG_FUNC_JSON_GROUP_ARRAY_DISTINCT: i64 = 11;
+const AGG_FUNC_COUNT_COLUMN: i64 = 12;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AggregateFunction {
     Count,
+    CountColumn(usize),   // COUNT(column_index), which skips NULLs
     CountDistinct(usize), // COUNT(DISTINCT column_index)
     Sum(usize),           // Column index
     SumDistinct(usize),   // SUM(DISTINCT column_index)
@@ -130,6 +133,7 @@ impl Display for AggregateFunction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AggregateFunction::Count => write!(f, "COUNT(*)"),
+            AggregateFunction::CountColumn(idx) => write!(f, "COUNT(col{idx})"),
             AggregateFunction::CountDistinct(idx) => write!(f, "COUNT(DISTINCT col{idx})"),
             AggregateFunction::Sum(idx) => write!(f, "SUM(col{idx})"),
             AggregateFunction::SumDistinct(idx) => write!(f, "SUM(DISTINCT col{idx})"),
@@ -163,6 +167,12 @@ impl AggregateFunction {
     pub fn to_values(&self) -> Vec<Value> {
         match self {
             AggregateFunction::Count => vec![Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT))],
+            AggregateFunction::CountColumn(idx) => {
+                vec![
+                    Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT_COLUMN)),
+                    Value::from_i64(*idx as i64),
+                ]
+            }
             AggregateFunction::CountDistinct(idx) => {
                 vec![
                     Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT_DISTINCT)),
@@ -245,6 +255,20 @@ impl AggregateFunction {
             Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT)) => {
                 *cursor += 1;
                 AggregateFunction::Count
+            }
+            Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT_COLUMN)) => {
+                *cursor += 1;
+                let idx = values.get(*cursor).ok_or_else(|| {
+                    LimboError::InternalError("Missing COUNT(column) column index".into())
+                })?;
+                if let Value::Numeric(Numeric::Integer(idx)) = idx {
+                    *cursor += 1;
+                    AggregateFunction::CountColumn(*idx as usize)
+                } else {
+                    return Err(LimboError::InternalError(format!(
+                        "Expected Integer for COUNT(column) column index, got {idx:?}"
+                    )));
+                }
             }
             Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT_DISTINCT)) => {
                 *cursor += 1;
@@ -424,7 +448,12 @@ impl AggregateFunction {
         match func {
             Func::Agg(agg_func) => {
                 match agg_func {
-                    AggFunc::Count | AggFunc::Count0 => Some(AggregateFunction::Count),
+                    AggFunc::Count0 => Some(AggregateFunction::Count),
+                    AggFunc::Count => {
+                        Some(input_column_idx.map_or(AggregateFunction::Count, |idx| {
+                            AggregateFunction::CountColumn(idx)
+                        }))
+                    }
                     AggFunc::Sum => input_column_idx.map(AggregateFunction::Sum),
                     AggFunc::Avg => input_column_idx.map(AggregateFunction::Avg),
                     AggFunc::Min => input_column_idx.map(AggregateFunction::Min),
@@ -586,6 +615,8 @@ pub struct AggregateOperator {
 pub struct AggregateState {
     // For COUNT: just the count
     pub count: i64,
+    // For COUNT(column): column_index -> number of non-NULL values
+    pub column_counts: HashMap<usize, i64>,
     // For SUM: column_index -> sum value
     pub sums: HashMap<usize, f64>,
     // For AVG: column_index -> (sum, count) for computing average
@@ -740,9 +771,11 @@ impl AggregateEvalState {
                     } else if let Some(rowid) = rowid {
                         let key = SeekKey::TableRowId(*rowid);
                         // Regular aggregates - read the blob
-                        let state = return_if_io!(
-                            read_record_state.read_record(key, &mut cursors.table_cursor)
-                        );
+                        let state = return_if_io!(read_record_state.read_record(
+                            key,
+                            &mut cursors.table_cursor,
+                            &operator.aggregates
+                        ));
                         // Process the fetched state
                         if let Some(state) = state {
                             let mut old_row = group_key.clone();
@@ -880,6 +913,10 @@ impl AggregateState {
                 AggregateFunction::Count => {
                     // Count state is already stored at the beginning
                 }
+                AggregateFunction::CountColumn(col_idx) => {
+                    let count = self.column_counts.get(col_idx).copied().unwrap_or(0);
+                    values.push(Value::from_i64(count));
+                }
                 AggregateFunction::CountDistinct(col_idx) => {
                     // Store the distinct count for this column
                     let count = self.distinct_counts.get(col_idx).copied().unwrap_or(0);
@@ -954,10 +991,17 @@ impl AggregateState {
         values
     }
 
-    /// Reconstruct aggregate state from a vector of Values
-    pub fn from_value_vector(values: &[Value]) -> Result<Self> {
+    /// Reconstruct aggregate state from a vector of Values.
+    ///
+    /// `expected` is the aggregate list the compiler built for the view. The
+    /// blob carries its own function codes, and state written under a
+    /// different list cannot be interpreted under this one -- the values would
+    /// be read into the wrong accumulators. Any disagreement is an error, not
+    /// something to reconcile.
+    pub fn from_value_vector(values: &[Value], expected: &[AggregateFunction]) -> Result<Self> {
         let mut cursor = 0;
         let mut state = Self::new();
+        let mut persisted = Vec::with_capacity(expected.len());
 
         // Read count
         let count = values
@@ -990,11 +1034,25 @@ impl AggregateState {
         for _ in 0..num_aggregates {
             // Deserialize the aggregate function metadata
             let agg_fn = AggregateFunction::from_values(values, &mut cursor)?;
+            persisted.push(agg_fn.clone());
 
             // Read the state for this aggregate
             match agg_fn {
                 AggregateFunction::Count => {
                     // Count state is already stored at the beginning
+                }
+                AggregateFunction::CountColumn(col_idx) => {
+                    let count = values.get(cursor).ok_or_else(|| {
+                        LimboError::InternalError("Missing COUNT(column) value".into())
+                    })?;
+                    if let Value::Numeric(Numeric::Integer(count)) = count {
+                        state.column_counts.insert(col_idx, *count);
+                        cursor += 1;
+                    } else {
+                        return Err(LimboError::InternalError(format!(
+                            "Expected Integer for COUNT(column) value, got {count:?}"
+                        )));
+                    }
                 }
                 AggregateFunction::CountDistinct(col_idx) => {
                     let count = values.get(cursor).ok_or_else(|| {
@@ -1230,6 +1288,14 @@ impl AggregateState {
             }
         }
 
+        if persisted != expected {
+            return Err(LimboError::InternalError(format!(
+                "Persisted aggregate state was written for a different set of \
+                 aggregates (stored {persisted:?}, view expects {expected:?}). \
+                 Rebuild the view with REFRESH MATERIALIZED VIEW."
+            )));
+        }
+
         Ok(state)
     }
 
@@ -1248,7 +1314,7 @@ impl AggregateState {
         Ok(record.into_payload())
     }
 
-    pub fn from_blob(blob: &[u8]) -> Result<(Self, Vec<Value>)> {
+    pub fn from_blob(blob: &[u8], expected: &[AggregateFunction]) -> Result<(Self, Vec<Value>)> {
         let record = ImmutableRecordRef::from_bin_record(blob);
         let mut all_values = record.get_values_owned()?;
 
@@ -1291,7 +1357,7 @@ impl AggregateState {
         let state_values = &all_values[group_key_count..];
 
         // Reconstruct the aggregate state
-        let state = Self::from_value_vector(state_values)?;
+        let state = Self::from_value_vector(state_values, expected)?;
 
         Ok((state, group_key))
     }
@@ -1340,6 +1406,13 @@ impl AggregateState {
             match agg {
                 AggregateFunction::Count => {
                     // Already handled above
+                }
+                AggregateFunction::CountColumn(col_idx) => {
+                    if let Some(val) = values.get(*col_idx) {
+                        if !matches!(val, Value::Null) {
+                            *self.column_counts.entry(*col_idx).or_insert(0) += weight as i64;
+                        }
+                    }
                 }
                 AggregateFunction::CountDistinct(col_idx) => {
                     // Only update count if we haven't processed this column yet
@@ -1503,6 +1576,10 @@ impl AggregateState {
             match agg {
                 AggregateFunction::Count => {
                     result.push(Value::from_i64(self.count));
+                }
+                AggregateFunction::CountColumn(col_idx) => {
+                    let count = self.column_counts.get(col_idx).copied().unwrap_or(0);
+                    result.push(Value::from_i64(count));
                 }
                 AggregateFunction::CountDistinct(col_idx) => {
                     // Return the computed DISTINCT count
@@ -3637,5 +3714,99 @@ impl MinMaxPersistState {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_with_count(count: i64) -> AggregateState {
+        let mut state = AggregateState::new();
+        state.count = count;
+        state
+    }
+
+    /// A blob written when count(x) serialized as plain COUNT carries no
+    /// per-column count. Read under a list that says CountColumn, the counter
+    /// would silently restart from zero and a later INSERT would move the
+    /// count DOWN.
+    #[test]
+    fn state_written_as_plain_count_is_rejected_for_count_column() {
+        let persisted = state_with_count(3).to_value_vector(&[AggregateFunction::Count]);
+
+        let err =
+            AggregateState::from_value_vector(&persisted, &[AggregateFunction::CountColumn(1)])
+                .expect_err("must not read plain COUNT state into a CountColumn aggregate");
+        assert!(
+            err.to_string().contains("REFRESH MATERIALIZED VIEW"),
+            "the error must name the recovery, got: {err}"
+        );
+    }
+
+    /// The check compares the whole aggregate list, so it also catches a
+    /// column index that moved under the view.
+    #[test]
+    fn state_written_for_a_different_column_is_rejected() {
+        let persisted = state_with_count(3).to_value_vector(&[AggregateFunction::CountColumn(1)]);
+
+        AggregateState::from_value_vector(&persisted, &[AggregateFunction::CountColumn(2)])
+            .expect_err("a different column index must be rejected");
+    }
+
+    /// ... and an aggregate list that gained or lost a function.
+    #[test]
+    fn state_written_for_a_different_number_of_aggregates_is_rejected() {
+        let persisted = state_with_count(3).to_value_vector(&[AggregateFunction::Count]);
+
+        AggregateState::from_value_vector(
+            &persisted,
+            &[AggregateFunction::Count, AggregateFunction::CountColumn(1)],
+        )
+        .expect_err("a longer aggregate list must be rejected");
+    }
+
+    /// The guard is generic over the whole enum, not written around
+    /// CountColumn: any two different functions over the same column disagree.
+    #[test]
+    fn state_written_for_a_different_function_is_rejected() {
+        let persisted = state_with_count(3).to_value_vector(&[AggregateFunction::Sum(1)]);
+
+        AggregateState::from_value_vector(&persisted, &[AggregateFunction::Avg(1)])
+            .expect_err("a different aggregate function must be rejected");
+    }
+
+    /// The matching case must still round-trip, guard included.
+    #[test]
+    fn matching_aggregate_list_round_trips() {
+        let aggregates = vec![AggregateFunction::CountColumn(1), AggregateFunction::Count];
+        let mut state = state_with_count(3);
+        state.column_counts.insert(1, 2);
+
+        let restored =
+            AggregateState::from_value_vector(&state.to_value_vector(&aggregates), &aggregates)
+                .unwrap();
+
+        assert_eq!(
+            restored.to_values(&aggregates).unwrap()[0],
+            Value::from_i64(2)
+        );
+
+        // The restored counter keeps counting from what the blob held.
+        let mut restored = restored;
+        restored
+            .apply_delta(
+                &[Value::from_i64(4), Value::from_i64(9)],
+                1,
+                &aggregates,
+                &[],
+                &HashMap::default(),
+                &[None, None],
+            )
+            .unwrap();
+        assert_eq!(
+            restored.to_values(&aggregates).unwrap()[0],
+            Value::from_i64(3)
+        );
     }
 }

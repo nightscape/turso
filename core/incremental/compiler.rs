@@ -2805,6 +2805,14 @@ impl DbspCompiler {
                                             "Only column references are supported in aggregate functions for incremental views".to_string()
                                         ));
                                     }
+                                } else if let Some(LogicalExpr::Column(col)) = args.first() {
+                                    // COUNT(column) skips NULLs. COUNT(*) and
+                                    // COUNT(<constant>) count every row.
+                                    let (col_idx, _) = input_schema.find_column(&col.name, col.table.as_deref())
+                                        .ok_or_else(|| LimboError::ParseError(
+                                            format!("COUNT column '{}' not found in input", col.name)
+                                        ))?;
+                                    aggregate_functions.push(AggregateFunction::CountColumn(col_idx));
                                 } else {
                                     aggregate_functions.push(AggregateFunction::Count);
                                 }
@@ -3035,7 +3043,7 @@ impl DbspCompiler {
                 let agg_col_idx = |af: &crate::incremental::aggregate_operator::AggregateFunction| -> Option<usize> {
                     use crate::incremental::aggregate_operator::AggregateFunction;
                     match af {
-                        AggregateFunction::Count => None,
+                        AggregateFunction::Count | AggregateFunction::CountColumn(_) => None,
                         AggregateFunction::CountDistinct(c)
                         | AggregateFunction::Sum(c)
                         | AggregateFunction::SumDistinct(c)
