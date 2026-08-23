@@ -329,18 +329,16 @@ pub fn plan_satisfies_order_target(
                 EqualityPrefixScope::ConstantEquality,
             ),
             AccessMethodParams::Subquery { iter_dir } => match &table_ref.table {
-                Table::FromClauseSubquery(from_clause_subquery) => {
-                    OrderConsumption {
-                        consumed: subquery_intrinsic_order_consumed(
-                            table_ref.internal_id,
-                            from_clause_subquery,
-                            *iter_dir,
-                            &order_target.columns[target_col_idx..],
-                            schema,
-                        ),
-                        includes_rowid: false,
-                    }
-                }
+                Table::FromClauseSubquery(from_clause_subquery) => OrderConsumption {
+                    consumed: subquery_intrinsic_order_consumed(
+                        table_ref.internal_id,
+                        from_clause_subquery,
+                        *iter_dir,
+                        &order_target.columns[target_col_idx..],
+                        schema,
+                    ),
+                    includes_rowid: false,
+                },
                 // Any non-FromClauseSubquery table paired with a `Subquery` access
                 // method is not one whose ordering the sort-elimination optimizer
                 // may rely on. Report "no usable ordering" (0 columns consumed) so

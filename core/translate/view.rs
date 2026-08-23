@@ -268,6 +268,7 @@ fn emit_delete_schema_rows(
     program.emit_insn(Insn::Next {
         cursor_id: sqlite_schema_cursor_id,
         pc_if_next: loop_label,
+        fullscan: false,
     });
     program.preassign_label_to_next_insn(end_label);
 }
@@ -635,6 +636,7 @@ pub fn translate_create_materialized_view(
     program.emit_insn(Insn::Next {
         cursor_id: sqlite_schema_cursor_id,
         pc_if_next: dbsp_cleanup_loop_label,
+        fullscan: false,
     });
     program.preassign_label_to_next_insn(dbsp_cleanup_end_label);
 
@@ -952,6 +954,7 @@ fn emit_clear_btree(program: &mut ProgramBuilder, cursor_id: usize, table_name: 
     program.emit_insn(Insn::Next {
         cursor_id,
         pc_if_next: clear_loop_label,
+        fullscan: false,
     });
 
     program.preassign_label_to_next_insn(clear_done_label);

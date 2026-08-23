@@ -555,6 +555,12 @@ impl InputDeltas {
         Self::from_delta_set(DeltaSet::from_map(deltas))
     }
 
+    /// Every table this overlay can serve a delta for: overlay entries plus the
+    /// shared base.
+    pub fn table_names(&self) -> impl Iterator<Item = &str> {
+        self.overlay.table_names().chain(self.base.table_names())
+    }
+
     /// Get delta for a table, overlay first, then base.
     pub fn get(&self, table_name: &str) -> Delta {
         self.overlay
@@ -917,8 +923,8 @@ impl DbspCircuit {
     /// Every delta handed to the circuit must name one of its Input nodes.
     /// A key that matches nothing would silently feed an empty delta and leave
     /// the view stale, so a mismatch is a bug in whoever produced the key.
-    fn assert_inputs_known(&self, deltas: &DeltaSet) {
-        for requested in deltas.table_names() {
+    fn assert_inputs_known<'n>(&self, table_names: impl Iterator<Item = &'n str>) {
+        for requested in table_names {
             let known = self.nodes.values().any(|node| {
                 matches!(&node.operator, DbspOperator::Input { name, .. } if name == requested)
             });
@@ -977,7 +983,7 @@ impl DbspCircuit {
         if let Some(root_id) = self.root {
             self.restore_recursive_operators_if_needed(&pager)?;
             if let ExecuteState::Init { input_data } = &*execute_state {
-                self.assert_inputs_known(input_data);
+                self.assert_inputs_known(input_data.table_names());
             }
             // Create temporary cursors for execute (non-commit) operations
             let mut cursors = self.new_state_cursors(pager.clone())?;
@@ -1212,7 +1218,7 @@ impl DbspCircuit {
 
         // Convert input_data to DeltaSet once, outside the loop
         let input_delta_set = Arc::new(DeltaSet::from_map(input_data));
-        self.assert_inputs_known(&input_delta_set);
+        self.assert_inputs_known(input_delta_set.table_names());
 
         loop {
             // Take ownership of the state for processing, to avoid borrow checker issues (we have

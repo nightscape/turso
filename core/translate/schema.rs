@@ -2048,6 +2048,7 @@ pub fn translate_drop_server(
     program.emit_insn(Insn::Next {
         cursor_id: sqlite_schema_cursor_id,
         pc_if_next: loop_label,
+        fullscan: false,
     });
     program.preassign_label_to_next_insn(end_label);
 

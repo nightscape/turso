@@ -1125,14 +1125,21 @@ impl<'a> LogicalPlanBuilder<'a> {
                     }
                     // For regular CTEs, create a CTERef for later resolution
                     return Ok(LogicalPlan::CTERef(CTERef {
-                        name: written_name.clone(),
+                        name: table_name.clone(),
                         schema: cte_plan.schema().clone(),
                     }));
                 }
 
                 // Regular table scan
+                let table = self.schema.get_table(&table_name).ok_or_else(|| {
+                    LimboError::ParseError(format!("Table '{table_name}' not found"))
+                })?;
+                // Record the table under the schema's own spelling. Matview delta
+                // routing keys on this name, so every producer must agree on it.
+                let table_name = table.get_name().to_string();
                 let table_alias = alias.as_ref().map(|a| Self::normalized_name(a.name()));
-                let table_schema = self.get_table_schema(&table_name, table_alias.as_deref())?;
+                let table_schema =
+                    Self::build_table_schema(&table, &table_name, table_alias.as_deref());
                 Ok(LogicalPlan::TableScan(TableScan {
                     table_name,
                     alias: table_alias,
