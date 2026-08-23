@@ -268,6 +268,8 @@ fn emit_delete_schema_rows(
     program.emit_insn(Insn::Next {
         cursor_id: sqlite_schema_cursor_id,
         pc_if_next: loop_label,
+        fullscan: false,
+        is_index: false,
     });
     program.preassign_label_to_next_insn(end_label);
 }
