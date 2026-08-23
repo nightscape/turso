@@ -21,6 +21,7 @@ mod test_ivm_chained_agg_reopen_reseed_dup;
 mod test_ivm_chained_matview_reopen;
 mod test_ivm_chained_population_in_transaction;
 mod test_ivm_chained_recursive_cte_cdc;
+mod test_ivm_count_column_reopen;
 mod test_ivm_cross_session;
 mod test_ivm_dbsp_chain_break;
 mod test_ivm_dirty_pages;
