@@ -3625,16 +3625,15 @@ pub struct DatabaseChange {
 }
 
 impl DatabaseChange {
-    /// Parse the binary record data into a vector of owned values.
-    /// Returns Some(values) for Insert and Update changes, None for Delete changes.
-    /// Each value corresponds to a column in the table.
-    pub fn parse_record(&self) -> Option<Vec<Value>> {
+    /// Parse the binary record data into a vector of owned values, one per column.
+    /// Insert, Update and Delete all carry a row image and parse the same way.
+    pub fn parse_record(&self) -> Result<Vec<Value>> {
         match &self.change {
             DatabaseChangeType::Insert { bin_record }
             | DatabaseChangeType::Update { bin_record }
             | DatabaseChangeType::Delete { bin_record } => {
                 let record = ImmutableRecord::from_bin_record(bin_record.clone());
-                record.get_values_owned().ok()
+                record.get_values_owned()
             }
         }
     }
@@ -4971,5 +4970,36 @@ mod tests {
         for value in values {
             assert_eq!(value.try_clone().unwrap(), value);
         }
+    }
+
+    fn database_change(change: DatabaseChangeType) -> DatabaseChange {
+        DatabaseChange {
+            change_id: 1,
+            change_time: 0,
+            change,
+            table_name: "t".to_string(),
+            id: 1,
+        }
+    }
+
+    #[test]
+    fn parse_record_reads_the_row_image_of_a_delete() {
+        let values = [Value::from_i64(7), Value::build_text("gone")];
+        let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+        let change = database_change(DatabaseChangeType::Delete {
+            bin_record: record.get_payload().to_vec(),
+        });
+
+        assert_eq!(change.parse_record().unwrap(), values);
+    }
+
+    #[test]
+    fn parse_record_fails_on_a_corrupt_row_image() {
+        // Header claims one 4-byte integer, data section holds nothing.
+        let change = database_change(DatabaseChangeType::Insert {
+            bin_record: vec![0x02, 0x04],
+        });
+
+        assert!(change.parse_record().is_err());
     }
 }

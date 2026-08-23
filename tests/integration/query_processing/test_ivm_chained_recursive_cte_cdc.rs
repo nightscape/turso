@@ -178,9 +178,8 @@ fn test_chained_matview_cdc_delivers_new_value(tmp_db: TempDatabase) -> anyhow::
     conn.set_change_callback(move |event| {
         if event.relation_name == "mv_tree" {
             for change in &event.changes {
-                if let Some(values) = change.parse_record() {
-                    records_clone.lock().unwrap().push(format!("{:?}", values));
-                }
+                let values = change.parse_record().expect("CDC record must decode");
+                records_clone.lock().unwrap().push(format!("{:?}", values));
             }
         }
     });

@@ -137,9 +137,8 @@ fn test_json_set_cdc_delivers_new_value(tmp_db: TempDatabase) -> anyhow::Result<
         if event.relation_name == "mv" {
             count_clone.fetch_add(event.changes.len(), std::sync::atomic::Ordering::SeqCst);
             for change in &event.changes {
-                if let Some(values) = change.parse_record() {
-                    records_clone.lock().unwrap().push(format!("{:?}", values));
-                }
+                let values = change.parse_record().expect("CDC record must decode");
+                records_clone.lock().unwrap().push(format!("{:?}", values));
             }
         }
     });
