@@ -13,7 +13,7 @@ struct Recorded {
     relation: String,
     kind: &'static str,
     columns: Vec<String>,
-    parsed: Option<Vec<String>>,
+    parsed: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -36,7 +36,10 @@ impl Recorder {
                     columns: event.columns.clone(),
                     parsed: change
                         .parse_record()
-                        .map(|values| values.iter().map(|v| format!("{v:?}")).collect()),
+                        .expect("CDC record must decode")
+                        .iter()
+                        .map(|v| format!("{v:?}"))
+                        .collect(),
                 });
             }
         });
@@ -53,16 +56,10 @@ impl Recorder {
             eprintln!("CDCM {scenario} | NO EVENTS");
         }
         for rec in log.iter() {
-            let parsed_len = match &rec.parsed {
-                Some(values) => values.len().to_string(),
-                None => "None".to_string(),
-            };
-            let values = match &rec.parsed {
-                Some(values) => format!("[{}]", values.join(", ")),
-                None => "None".to_string(),
-            };
+            let parsed_len = rec.parsed.len();
+            let values = rec.parsed.join(", ");
             eprintln!(
-                "CDCM {scenario} | rel={} | kind={} | columns.len={} | parsed.len={} | columns=[{}] | values={}",
+                "CDCM {scenario} | rel={} | kind={} | columns.len={} | parsed.len={} | columns=[{}] | values=[{}]",
                 rec.relation,
                 rec.kind,
                 rec.columns.len(),

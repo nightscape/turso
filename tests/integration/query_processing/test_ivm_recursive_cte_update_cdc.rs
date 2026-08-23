@@ -38,7 +38,7 @@ fn install_capture(
                 DatabaseChangeType::Delete { .. } => "Delete",
                 DatabaseChangeType::Update { .. } => "Update",
             };
-            let values = change.parse_record().unwrap_or_default();
+            let values = change.parse_record().expect("CDC record must decode");
             guard.push(CapturedChange { kind, values });
         }
     });
