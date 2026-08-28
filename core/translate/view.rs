@@ -46,11 +46,12 @@ fn validate_materialized(
         bail_parse_error!("Object name reserved for internal use: {normalized_view_name}",);
     }
 
-    // Check if view already exists (including broken sqlite_schema rows,
-    // which must be dropped before the name can be reused)
+    // Check if view already exists (including a sqlite_schema row this
+    // connection could not load, which must be dropped before the name can be
+    // reused)
     if resolver.with_schema(database_id, |s| {
         s.get_materialized_view(normalized_view_name).is_some()
-            || s.broken_views.contains(normalized_view_name)
+            || s.is_unusable_view(normalized_view_name)
     }) {
         if if_not_exists {
             return Ok(true);
@@ -298,7 +299,7 @@ pub fn translate_create_materialized_view(
         && resolver.with_schema(database_id, |s| {
             s.get_view(&normalized_view_name).is_some()
                 || s.is_materialized_view(&normalized_view_name)
-                || s.broken_views.contains(&normalized_view_name)
+                || s.is_unusable_view(&normalized_view_name)
         })
     {
         return Ok(());
@@ -970,13 +971,13 @@ fn validate_create_view(
     view_name: &ast::Name,
     normalized_view_name: &str,
 ) -> Result<()> {
-    // Check if view already exists. A broken view (unparseable sqlite_schema
-    // row) also counts: creating over it would produce a duplicate row, so
-    // the user must DROP VIEW it first.
+    // Check if view already exists. A view this connection could not load
+    // also counts: creating over it would produce a duplicate row, so the user
+    // must DROP VIEW it first.
     if resolver.with_schema(database_id, |s| {
         s.get_view(normalized_view_name).is_some()
             || s.is_materialized_view(normalized_view_name)
-            || s.broken_views.contains(normalized_view_name)
+            || s.is_unusable_view(normalized_view_name)
     }) {
         return Err(crate::LimboError::ParseError(format!(
             "view {} already exists",
@@ -1016,7 +1017,7 @@ pub fn translate_create_view(
         && resolver.with_schema(database_id, |s| {
             s.get_view(&normalized_view_name).is_some()
                 || s.is_materialized_view(&normalized_view_name)
-                || s.broken_views.contains(&normalized_view_name)
+                || s.is_unusable_view(&normalized_view_name)
         })
     {
         return Ok(());
@@ -1131,19 +1132,20 @@ pub fn translate_drop_view(
     program.begin_write_on_database(database_id, schema_cookie)?;
     let normalized_view_name = normalize_ident(view_name.name.as_str());
 
-    // Check if view exists: regular, materialized, or a broken sqlite_schema
-    // row whose stored SQL failed to parse at load time. Broken views have no
-    // in-memory representation, but DROP VIEW must still delete their row so
-    // affected databases can be cleaned up.
-    let (is_regular_view, is_materialized_view, is_broken_view) =
+    // Check if view exists: regular, materialized, or a sqlite_schema row this
+    // connection could not load — its SQL did not parse, or it no longer
+    // compiles against the current schema. Neither has an in-memory
+    // representation, but DROP VIEW must still delete their row so affected
+    // databases can be cleaned up.
+    let (is_regular_view, is_materialized_view, is_unusable_view) =
         resolver.with_schema(database_id, |s| {
             (
                 s.get_view(&normalized_view_name).is_some(),
                 s.is_materialized_view(&normalized_view_name),
-                s.broken_views.contains(&normalized_view_name),
+                s.is_unusable_view(&normalized_view_name),
             )
         });
-    let view_exists = is_regular_view || is_materialized_view || is_broken_view;
+    let view_exists = is_regular_view || is_materialized_view || is_unusable_view;
 
     if !view_exists && !if_exists {
         return Err(crate::LimboError::ParseError(format!(

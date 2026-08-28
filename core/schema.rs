@@ -1213,6 +1213,15 @@ impl Schema {
         f(&views)
     }
 
+    /// A `sqlite_schema` view row this connection could not turn into a working
+    /// view: its SQL did not parse (`broken_views`), or it parsed but no longer
+    /// compiles against the current schema (`incompatible_views`). Either way it
+    /// still occupies its name on disk, so CREATE must refuse it and DROP must
+    /// delete its row.
+    pub fn is_unusable_view(&self, name: &str) -> bool {
+        self.broken_views.contains(name) || self.incompatible_views.contains_key(name)
+    }
+
     pub fn remove_view(&mut self, name: &str) -> Result<()> {
         let name = normalize_ident(name);
 
@@ -2216,19 +2225,44 @@ impl Schema {
         }
 
         if !pending.is_empty() {
-            // Distinguish permanently broken views from circular dependencies.
-            // A view is permanently broken if its SQL doesn't reference any other
-            // pending view — no amount of reordering will fix it (e.g., it references
-            // a dropped table).
-            let pending_names: HashSet<String> =
-                pending.iter().map(|view| view.name.clone()).collect();
+            // Distinguish views that sit on a genuine dependency cycle from views
+            // that are simply unusable. Edges come from the parsed SELECT: a
+            // substring test on the raw SQL makes every reader of a pending view
+            // look circular, so one view whose stored definition no longer
+            // compiles would fail the whole database open.
+            let pending_names: HashSet<String> = pending
+                .iter()
+                .map(|view| normalize_ident(&view.name))
+                .collect();
+            let mut edges: HashMap<String, HashSet<String>> = HashMap::default();
+            for view in &pending {
+                let key = normalize_ident(&view.name);
+                let sources = match matview_source_names(&view.sql) {
+                    Ok(sources) => sources,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Cannot read the sources of materialized view '{}' ({}); treating it as depending on nothing",
+                            view.name,
+                            e
+                        );
+                        HashSet::default()
+                    }
+                };
+                let targets = sources
+                    .into_iter()
+                    .filter(|source| *source != key && pending_names.contains(source))
+                    .collect();
+                edges.insert(key, targets);
+            }
+
+            // Only a view reachable from itself is circular. A view that merely
+            // reads a view which failed permanently is degraded, not circular, and
+            // takes the same `incompatible_views` channel as any other unusable view.
             let mut stale = Vec::new();
             let mut circular = Vec::new();
             for view in pending {
-                let references_pending_view = pending_names
-                    .iter()
-                    .any(|other| *other != view.name && view.sql.contains(other.as_str()));
-                if references_pending_view {
+                let key = normalize_ident(&view.name);
+                if reachable_matviews(&key, &edges).contains(&key) {
                     circular.push(view.name);
                 } else {
                     stale.push((view.name, view.last_error));
@@ -6441,6 +6475,315 @@ impl Index {
             BindingBehavior::ResultColumnsNotAllowed,
         )?;
         Ok(Some(*expr))
+    }
+}
+
+/// The table and view names a stored `CREATE MATERIALIZED VIEW` statement reads,
+/// normalized and with CTE names removed.
+///
+/// `IncrementalView::extract_all_tables` answers the same question but resolves
+/// every name against the schema, so it cannot be asked about a view whose
+/// sources are gone — which is exactly the view we need to reason about here.
+fn matview_source_names(sql: &str) -> Result<HashSet<String>> {
+    let mut parser = Parser::new(sql.as_bytes());
+    let cmd = parser.next_cmd()?;
+    let Some(Cmd::Stmt(Stmt::CreateMaterializedView { select, .. })) = cmd else {
+        return Err(LimboError::ParseError(format!(
+            "Stored materialized view definition is not a CREATE MATERIALIZED VIEW statement: {sql}"
+        )));
+    };
+    let mut names = HashSet::default();
+    collect_select_sources(&select, &HashSet::default(), &mut names)?;
+    Ok(names)
+}
+
+fn collect_select_sources(
+    select: &ast::Select,
+    parent_ctes: &HashSet<String>,
+    out: &mut HashSet<String>,
+) -> Result<()> {
+    let mut ctes = parent_ctes.clone();
+    if let Some(with) = &select.with {
+        // Names first: a recursive CTE refers to itself from inside its own body.
+        for cte in &with.ctes {
+            ctes.insert(normalize_ident(cte.tbl_name.as_str()));
+        }
+        for cte in &with.ctes {
+            collect_select_sources(&cte.select, &ctes, out)?;
+        }
+    }
+    collect_one_select_sources(&select.body.select, &ctes, out)?;
+    for compound in &select.body.compounds {
+        collect_one_select_sources(&compound.select, &ctes, out)?;
+    }
+    Ok(())
+}
+
+fn collect_one_select_sources(
+    select: &ast::OneSelect,
+    ctes: &HashSet<String>,
+    out: &mut HashSet<String>,
+) -> Result<()> {
+    let ast::OneSelect::Select {
+        from, where_clause, ..
+    } = select
+    else {
+        return Ok(());
+    };
+    if let Some(from) = from {
+        collect_from_sources(from, ctes, out)?;
+    }
+    if let Some(where_expr) = where_clause {
+        walk_expr(where_expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+            let subquery = match e {
+                ast::Expr::Exists(select) | ast::Expr::Subquery(select) => Some(select),
+                ast::Expr::InSelect { rhs, .. } => Some(rhs),
+                _ => None,
+            };
+            if let Some(subquery) = subquery {
+                collect_select_sources(subquery, ctes, out)?;
+            }
+            Ok(WalkControl::Continue)
+        })?;
+    }
+    Ok(())
+}
+
+fn collect_from_sources(
+    from: &ast::FromClause,
+    ctes: &HashSet<String>,
+    out: &mut HashSet<String>,
+) -> Result<()> {
+    collect_select_table_sources(from.select.as_ref(), ctes, out)?;
+    for join in &from.joins {
+        collect_select_table_sources(join.table.as_ref(), ctes, out)?;
+    }
+    Ok(())
+}
+
+fn collect_select_table_sources(
+    table: &ast::SelectTable,
+    ctes: &HashSet<String>,
+    out: &mut HashSet<String>,
+) -> Result<()> {
+    match table {
+        ast::SelectTable::Table(name, _, _) | ast::SelectTable::TableCall(name, _, _) => {
+            let name = normalize_ident(name.name.as_str());
+            if !ctes.contains(&name) {
+                out.insert(name);
+            }
+        }
+        ast::SelectTable::Select(select, _) => collect_select_sources(select, ctes, out)?,
+        ast::SelectTable::Sub(from, _) => collect_from_sources(from, ctes, out)?,
+    }
+    Ok(())
+}
+
+/// Every node reachable from `start` by following `edges`. `start` appears in the
+/// result only when it lies on a cycle.
+fn reachable_matviews(start: &str, edges: &HashMap<String, HashSet<String>>) -> HashSet<String> {
+    let mut seen: HashSet<String> = HashSet::default();
+    let mut stack: Vec<String> = edges
+        .get(start)
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    while let Some(node) = stack.pop() {
+        if !seen.insert(node.clone()) {
+            continue;
+        }
+        if let Some(next) = edges.get(&node) {
+            stack.extend(next.iter().cloned());
+        }
+    }
+    seen
+}
+
+#[cfg(test)]
+mod matview_dependency_classification_tests {
+    use super::*;
+    use crate::alloc::vec;
+
+    fn sources(sql: &str) -> Vec<String> {
+        let mut names: Vec<String> = matview_source_names(sql).unwrap().into_iter().collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn source_names_come_from_the_parse_not_from_substrings() {
+        // `block` is a substring of `block_requires`, and of the column name
+        // `block_id`, but the only real sources are the two tables.
+        let names = sources(
+            "CREATE MATERIALIZED VIEW v AS SELECT br.block_id FROM block_requires br \
+             JOIN block b ON b.id = br.required_id",
+        );
+        assert_eq!(
+            names,
+            vec!["block".to_string(), "block_requires".to_string()]
+        );
+    }
+
+    #[test]
+    fn recursive_cte_names_are_not_sources() {
+        let names = sources(
+            "CREATE MATERIALIZED VIEW v AS WITH RECURSIVE paths AS ( \
+               SELECT id, parent FROM block WHERE parent IS NULL \
+               UNION ALL SELECT b.id, b.parent FROM block b JOIN paths p ON b.parent = p.id \
+             ) SELECT * FROM paths",
+        );
+        assert_eq!(names, vec!["block".to_string()]);
+    }
+
+    #[test]
+    fn a_view_reachable_from_itself_is_the_only_circular_one() {
+        let mut edges: HashMap<String, HashSet<String>> = HashMap::default();
+        // a -> b -> c -> b, plus d -> a. Only b and c sit on the cycle.
+        edges.insert("a".into(), ["b".to_string()].into_iter().collect());
+        edges.insert("b".into(), ["c".to_string()].into_iter().collect());
+        edges.insert("c".into(), ["b".to_string()].into_iter().collect());
+        edges.insert("d".into(), ["a".to_string()].into_iter().collect());
+
+        let on_cycle = |name: &str| reachable_matviews(name, &edges).contains(name);
+        assert!(on_cycle("b"));
+        assert!(on_cycle("c"));
+        assert!(!on_cycle("a"));
+        assert!(!on_cycle("d"));
+    }
+
+    fn schema_with_base_tables() -> Schema {
+        let mut schema = Schema::new();
+        for sql in [
+            "CREATE TABLE block_raw (id INTEGER PRIMARY KEY, parent INTEGER)",
+            "CREATE TABLE block_requires (block_id INTEGER, required_id INTEGER)",
+        ] {
+            schema
+                .add_btree_table(Arc::new(BTreeTable::from_sql(sql, 2).unwrap()))
+                .unwrap();
+        }
+        schema
+    }
+
+    fn view_info(views: &[(&str, &str)]) -> HashMap<String, (String, i64)> {
+        views
+            .iter()
+            .map(|(name, sql)| (name.to_string(), (sql.to_string(), 2i64)))
+            .collect()
+    }
+
+    /// A DBSP state root for every view. Without one,
+    /// `populate_one_materialized_view` stamps the view `VersionMismatch`-incompatible
+    /// before its SQL is ever compiled, so `incompatible_views` would hold entries
+    /// that say nothing about how the leftover classifier routed them. Supplying
+    /// roots leaves the classifier as the only writer.
+    fn dbsp_roots(views: &[(&str, &str)]) -> HashMap<String, i64> {
+        views
+            .iter()
+            .map(|(name, _)| (name.to_string(), 2i64))
+            .collect()
+    }
+
+    #[test]
+    fn dependents_of_a_permanently_broken_view_do_not_fail_the_open() {
+        // `block` is what an older binary stored: it still selects a column
+        // `block_raw` no longer has, so it can never compile. Its three
+        // dependents are a fan-out, not a cycle.
+        let mut schema = schema_with_base_tables();
+        let views: &[(&str, &str)] = &[
+                (
+                    "block",
+                    "CREATE MATERIALIZED VIEW block AS SELECT b.id, b.depth FROM block_raw b",
+                ),
+                (
+                    "block_requirement_edges",
+                    "CREATE MATERIALIZED VIEW block_requirement_edges AS \
+                     SELECT br.block_id, b.id FROM block_requires br JOIN block b ON b.id = br.required_id",
+                ),
+                (
+                    "block_with_path",
+                    "CREATE MATERIALIZED VIEW block_with_path AS \
+                     WITH RECURSIVE paths AS ( \
+                       SELECT id, parent FROM block WHERE parent IS NULL \
+                       UNION ALL SELECT b.id, b.parent FROM block b JOIN paths p ON b.parent = p.id \
+                     ) SELECT id, parent FROM paths",
+                ),
+                (
+                    "watch_view_896c82d172bdae55",
+                    "CREATE MATERIALIZED VIEW watch_view_896c82d172bdae55 AS SELECT * FROM block",
+                ),
+            ];
+        let result = schema.populate_materialized_views(
+            view_info(views),
+            dbsp_roots(views),
+            HashMap::default(),
+        );
+
+        assert!(
+            result.is_ok(),
+            "one stale definition must not fail the open: {result:?}"
+        );
+        // With a DBSP root supplied for every view, the leftover classifier's
+        // `stale` branch is the ONLY writer of `incompatible_views` here, and a
+        // view it routed to `circular` would have returned Err above instead of
+        // being recorded. So this loop witnesses the routing itself: each name
+        // is present, carrying the compile failure that stopped it.
+        let recorded: HashSet<&str> = schema
+            .incompatible_views
+            .keys()
+            .map(|name| name.as_str())
+            .collect();
+        assert_eq!(
+            recorded.len(),
+            4,
+            "exactly the four pending views should be recorded: {recorded:?}"
+        );
+        for name in [
+            "block",
+            "block_requirement_edges",
+            "block_with_path",
+            "watch_view_896c82d172bdae55",
+        ] {
+            match schema.incompatible_views.get(name) {
+                Some(IncompatibleViewReason::CompileFailure(cause)) => {
+                    assert!(
+                        cause.contains("not found in schema"),
+                        "'{name}' should record why it could not compile: {cause}"
+                    );
+                }
+                other => panic!(
+                    "'{name}' should be a compile failure in `incompatible_views`, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn a_genuine_cycle_still_fails_the_open() {
+        let mut schema = schema_with_base_tables();
+        let views: &[(&str, &str)] = &[
+            (
+                "ping",
+                "CREATE MATERIALIZED VIEW ping AS SELECT id FROM pong",
+            ),
+            (
+                "pong",
+                "CREATE MATERIALIZED VIEW pong AS SELECT id FROM ping",
+            ),
+        ];
+        let result = schema.populate_materialized_views(
+            view_info(views),
+            dbsp_roots(views),
+            HashMap::default(),
+        );
+
+        let err = result.expect_err("mutually referencing views are a real cycle");
+        let message = err.to_string();
+        assert!(message.contains("circular dependency"), "{message}");
+        assert!(
+            message.contains("ping") && message.contains("pong"),
+            "{message}"
+        );
     }
 }
 

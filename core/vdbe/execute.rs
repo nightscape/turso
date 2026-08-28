@@ -13714,7 +13714,10 @@ pub fn op_drop_view(
     let conn = program.connection.clone();
     conn.with_database_schema_mut(*db, |schema| {
         schema.remove_view(view_name).ok();
+        // A view row that never became an in-memory view is dropped by clearing
+        // the record of why it could not be loaded.
         schema.broken_views.remove(view_name);
+        schema.incompatible_views.remove(view_name);
     })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
