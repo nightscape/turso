@@ -27,6 +27,7 @@ mod test_ivm_dbsp_chain_break;
 mod test_ivm_dirty_pages;
 mod test_ivm_empty_cdc_batches;
 mod test_ivm_join_cursor_corruption;
+mod test_ivm_join_rowid_identity;
 mod test_ivm_json_group_array_multiset_negative;
 mod test_ivm_json_set;
 mod test_ivm_left_join;
