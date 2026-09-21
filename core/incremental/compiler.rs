@@ -66,7 +66,11 @@ pub enum WriteRowView {
     InsertRow {
         final_weight: isize,
     },
-    Done,
+    /// `row_is_live` is false when the row ended up deleted (or never existed):
+    /// secondary-index maintenance keys off it.
+    Done {
+        row_is_live: bool,
+    },
 }
 
 impl WriteRowView {
@@ -82,20 +86,22 @@ impl WriteRowView {
     /// * `build_record` - Function that builds the record values to insert.
     ///   Takes the final_weight and returns the complete record values.
     /// * `weight` - The weight delta to apply
+    ///
+    /// Returns whether the row is live in the view afterwards.
     pub fn write_row(
         &mut self,
         cursor: &mut BTreeCursor,
         key: SeekKey,
         build_record: impl Fn(isize) -> Vec<Value>,
         weight: isize,
-    ) -> IOResultOr<()> {
+    ) -> IOResultOr<bool> {
         loop {
             match self {
                 WriteRowView::GetRecord => {
                     let res = return_if_io!(cursor.seek(key.clone(), SeekOp::GE { eq_only: true }));
                     if !matches!(res, SeekResult::Found) {
                         if weight <= 0 {
-                            *self = WriteRowView::Done;
+                            *self = WriteRowView::Done { row_is_live: false };
                         } else {
                             *self = WriteRowView::Insert {
                                 final_weight: weight,
@@ -139,7 +145,7 @@ impl WriteRowView {
                 }
                 WriteRowView::Delete => {
                     return_if_io!(cursor.delete());
-                    *self = WriteRowView::Done;
+                    *self = WriteRowView::Done { row_is_live: false };
                 }
                 WriteRowView::Insert { final_weight } => {
                     return_if_io!(cursor.seek(key.clone(), SeekOp::GE { eq_only: true }));
@@ -168,11 +174,137 @@ impl WriteRowView {
                     let btree_key = BTreeKey::new_table_rowid(key_i64, Some(&immutable_record));
 
                     return_if_io!(cursor.insert(&btree_key));
-                    *self = WriteRowView::Done;
+                    *self = WriteRowView::Done { row_is_live: true };
                 }
-                WriteRowView::Done => {
-                    return Ok(IOResult::Done(()));
+                WriteRowView::Done { row_is_live } => {
+                    return Ok(IOResult::Done(*row_is_live));
                 }
+            }
+        }
+    }
+}
+
+/// One secondary index defined on a materialized view, reduced to what delta
+/// application needs: where its btree lives, which output columns form the
+/// key, and how those keys compare.
+#[derive(Debug, Clone)]
+pub struct MatviewIndex {
+    pub root_page: i64,
+    /// Positions in the view's output row that make up the key, in key order.
+    pub key_positions: Vec<usize>,
+    pub index_info: crate::types::IndexInfo,
+}
+
+impl MatviewIndex {
+    /// The on-disk entry for a row: `[key values..., rowid]`, the layout an
+    /// ordinary secondary index on a rowid table uses.
+    fn entry(&self, values: &[Value], rowid: i64) -> Result<ImmutableRecord> {
+        let mut key: Vec<Value> = Vec::with_capacity(self.key_positions.len() + 1);
+        for pos in &self.key_positions {
+            let v = values.get(*pos).ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "matview index key position {pos} out of range for a {}-column row",
+                    values.len()
+                ))
+            })?;
+            key.push(v.clone());
+        }
+        key.push(Value::from_i64(rowid));
+        ImmutableRecord::from_values(&key, key.len())
+    }
+}
+
+/// State machine for one index entry's insert or delete during delta
+/// application. One cursor op per poll, advance only when it completes.
+///
+/// A key that lands on a leaf-page boundary comes back as `TryAdvance`, and
+/// `next()` is what resolves it — re-seeking there would throw the advance away
+/// and spin forever. `next()` can land on a DIFFERENT key, so `Check` verifies
+/// the entry under the cursor before it is treated as this row's, exactly as
+/// `seek_dbsp_index_key` (`core/incremental/persistence.rs`) and the antijoin's
+/// R_COUNT lookup do. Without that check a retraction for a key that owns no
+/// entry would delete the neighbouring row's entry.
+///
+/// The seek stays `eq_only: true`: this path INSERTS from the position the seek
+/// leaves, which is the contract `op_idx_insert` relies on. `eq_only: false`
+/// may park the cursor on an interior cell, and `insert` refuses that
+/// (`btree.rs:2909`) — see `lane-logs/eq-only-false-with-check.log`.
+#[derive(Debug, Default, Clone)]
+pub enum WriteIndexEntry {
+    #[default]
+    Start,
+    Advancing,
+    Check,
+    Inserting,
+    Deleting,
+    Done,
+}
+
+impl WriteIndexEntry {
+    /// `present` is whether the row is live in the view AFTER this delta entry
+    /// was applied to the view's table btree: live rows own an index entry,
+    /// retracted rows must not.
+    pub fn write(
+        &mut self,
+        cursor: &mut BTreeCursor,
+        entry: &ImmutableRecord,
+        present: bool,
+    ) -> IOResultOr<()> {
+        let seek_key = SeekKey::IndexKey(entry.as_record_ref());
+        // With no entry of ours there, an insert is the whole job and a delete
+        // has nothing to do.
+        let absent = if present {
+            WriteIndexEntry::Inserting
+        } else {
+            WriteIndexEntry::Done
+        };
+        loop {
+            match self {
+                WriteIndexEntry::Start => {
+                    let res =
+                        return_if_io!(cursor.seek(seek_key.clone(), SeekOp::GE { eq_only: true }));
+                    *self = match res {
+                        SeekResult::Found => WriteIndexEntry::Check,
+                        SeekResult::TryAdvance => WriteIndexEntry::Advancing,
+                        SeekResult::NotFound => absent.clone(),
+                    };
+                }
+                WriteIndexEntry::Advancing => {
+                    return_if_io!(cursor.next());
+                    *self = if cursor.has_record() {
+                        WriteIndexEntry::Check
+                    } else {
+                        absent.clone()
+                    };
+                }
+                // The key carries the rowid, so an entry with this exact key IS
+                // this row's entry: a live row overwrites it, a retracted row
+                // deletes it. Anything else belongs to another row.
+                WriteIndexEntry::Check => {
+                    let at_cursor = return_if_io!(cursor.record());
+                    let is_ours = match at_cursor {
+                        Some(r) => r.get_values_owned()? == entry.get_values_owned()?,
+                        None => false,
+                    };
+                    *self = if is_ours {
+                        if present {
+                            WriteIndexEntry::Inserting
+                        } else {
+                            WriteIndexEntry::Deleting
+                        }
+                    } else {
+                        absent.clone()
+                    };
+                }
+                WriteIndexEntry::Inserting => {
+                    return_if_io!(cursor.insert(&BTreeKey::new_index_key(entry.as_record_ref())));
+                    *self = WriteIndexEntry::Done;
+                }
+                WriteIndexEntry::Deleting => {
+                    return_if_io!(cursor.delete());
+                    *self = WriteIndexEntry::Done;
+                }
+                WriteIndexEntry::Done => return Ok(IOResult::Done(())),
             }
         }
     }
@@ -357,6 +489,23 @@ pub enum CommitState {
         view_order_by: super::view::MatviewOrderBy,
     },
 
+    /// Bringing the view's secondary indexes in step with the delta row that
+    /// `UpdateView` just wrote, one index at a time, before advancing to the
+    /// next row.
+    UpdateViewIndexes {
+        delta: Delta,
+        /// The row in `delta.changes` whose index entries are being written.
+        current_index: usize,
+        /// Whether that row is live in the view after the table write.
+        row_is_live: bool,
+        /// Position in the circuit's `output_indexes`.
+        index_pos: usize,
+        entry_state: WriteIndexEntry,
+        index_cursor: Box<BTreeCursor>,
+        num_columns: usize,
+        view_order_by: super::view::MatviewOrderBy,
+    },
+
     /// Persisting each recursive operator's rowid-bookkeeping state to the DBSP
     /// internal-state btree, after the view has been updated. Runs last so the
     /// blob reflects the committed transaction; restored on reopen so retractions
@@ -409,6 +558,19 @@ impl std::fmt::Debug for CommitState {
                 .field("current_index", current_index)
                 .field("write_row_state", write_row_state)
                 .field("has_view_cursor", &true)
+                .finish(),
+            Self::UpdateViewIndexes {
+                current_index,
+                index_pos,
+                row_is_live,
+                entry_state,
+                ..
+            } => f
+                .debug_struct("UpdateViewIndexes")
+                .field("current_index", current_index)
+                .field("index_pos", index_pos)
+                .field("row_is_live", row_is_live)
+                .field("entry_state", entry_state)
                 .finish(),
             Self::PersistRecursive {
                 ops,
@@ -755,6 +917,11 @@ pub struct DbspCircuit {
     /// LIMIT clause (None if no LIMIT)
     pub limit: Option<i64>,
 
+    /// Secondary indexes on this view's output, refreshed from the schema by
+    /// the caller before every delta application. Empty unless the user ran
+    /// `CREATE INDEX` on the view.
+    output_indexes: Vec<MatviewIndex>,
+
     /// Per-circuit-run memo of node outputs.
     ///
     /// In a diamond DAG (e.g. dual `LEFT OUTER JOIN`, where the first LJ's
@@ -803,8 +970,15 @@ impl DbspCircuit {
             internal_state_index_root,
             order_by,
             limit,
+            output_indexes: Vec::new(),
             exec_node_cache: HashMap::default(),
         }
+    }
+
+    /// Replace the set of secondary indexes maintained alongside the view's
+    /// btree. The schema owns this list; the circuit only applies it.
+    pub fn set_output_indexes(&mut self, indexes: Vec<MatviewIndex>) {
+        self.output_indexes = indexes;
     }
 
     /// Convenience constructor for tests and internal use where ORDER BY is not needed.
@@ -972,6 +1146,19 @@ impl DbspCircuit {
         } else {
             BTreeCursor::new_table(pager.clone(), self.main_data_root, num_columns)
         };
+        install_dbsp_yield_context(&mut cursor, pager);
+        Box::new(cursor)
+    }
+
+    /// Cursor over one of the view's secondary index btrees.
+    fn new_index_cursor(&self, pager: &Arc<Pager>, index: &MatviewIndex) -> Box<BTreeCursor> {
+        let num_columns = index.key_positions.len() + 1;
+        let mut cursor = BTreeCursor::new_index_with_index_info(
+            pager.clone(),
+            index.root_page,
+            index.index_info.clone(),
+            num_columns,
+        );
         install_dbsp_yield_context(&mut cursor, pager);
         Box::new(cursor)
     }
@@ -1372,6 +1559,7 @@ impl DbspCircuit {
                                 self.new_view_cursor(&pager, is_index, view_order_by, nc);
                         }
 
+                        let mut row_is_live = false;
                         if is_index {
                             let (composite_seek_key, full_record) = Self::build_composite_keys(
                                 &row.values,
@@ -1400,11 +1588,33 @@ impl DbspCircuit {
                                 values
                             };
 
-                            return_and_restore_if_io!(
+                            row_is_live = return_and_restore_if_io!(
                                 &mut self.commit_state,
                                 state,
                                 write_row_state.write_row(view_cursor, key, build_fn, weight)
                             );
+                        }
+
+                        if !self.output_indexes.is_empty() {
+                            crate::turso_assert!(
+                                !is_index,
+                                "CREATE INDEX is refused on an ORDER BY matview, so an \
+                                 index-organized view can never carry secondary indexes"
+                            );
+                            let delta = std::mem::take(delta);
+                            let index_cursor =
+                                self.new_index_cursor(&pager, &self.output_indexes[0]);
+                            self.commit_state = CommitState::UpdateViewIndexes {
+                                delta,
+                                current_index: *current_index,
+                                row_is_live,
+                                index_pos: 0,
+                                entry_state: WriteIndexEntry::default(),
+                                index_cursor,
+                                num_columns: nc,
+                                view_order_by: view_order_by.clone(),
+                            };
+                            continue;
                         }
 
                         // Move to next row
@@ -1423,6 +1633,56 @@ impl DbspCircuit {
                             is_index_organized: is_index,
                             num_columns: nc,
                             view_order_by: view_order_by.clone(),
+                        };
+                    }
+                }
+                CommitState::UpdateViewIndexes {
+                    delta,
+                    current_index,
+                    row_is_live,
+                    index_pos,
+                    entry_state,
+                    index_cursor,
+                    num_columns,
+                    view_order_by,
+                } => {
+                    let (row, _) = delta.changes[*current_index].clone();
+                    let index = self.output_indexes[*index_pos].clone();
+                    let entry = index.entry(&row.values, row.rowid)?;
+                    return_and_restore_if_io!(
+                        &mut self.commit_state,
+                        state,
+                        entry_state.write(index_cursor, &entry, *row_is_live)
+                    );
+
+                    let next_pos = *index_pos + 1;
+                    let delta = std::mem::take(delta);
+                    if next_pos < self.output_indexes.len() {
+                        let index_cursor =
+                            self.new_index_cursor(&pager, &self.output_indexes[next_pos]);
+                        self.commit_state = CommitState::UpdateViewIndexes {
+                            delta,
+                            current_index: *current_index,
+                            row_is_live: *row_is_live,
+                            index_pos: next_pos,
+                            entry_state: WriteIndexEntry::default(),
+                            index_cursor,
+                            num_columns: *num_columns,
+                            view_order_by: view_order_by.clone(),
+                        };
+                    } else {
+                        let nc = *num_columns;
+                        let view_order_by = view_order_by.clone();
+                        let view_cursor = self.new_view_cursor(&pager, false, &view_order_by, nc);
+                        self.commit_state = CommitState::UpdateView {
+                            delta,
+                            current_index: *current_index + 1,
+                            write_row_state: WriteRowView::new(),
+                            write_row_index_state: WriteRowViewIndex::new(),
+                            view_cursor,
+                            is_index_organized: false,
+                            num_columns: nc,
+                            view_order_by,
                         };
                     }
                 }

@@ -1461,6 +1461,32 @@ pub fn translate_drop_view(
         program.preassign_label_to_next_insn(dbsp_end_loop_label);
     }
 
+    // Indexes the user created ON the view. Their btrees go with the view's,
+    // and their sqlite_schema rows with the view's row — otherwise the next
+    // open reads an index entry pointing at a freed root page.
+    let view_indexes: Vec<(String, i64)> = if is_materialized_view {
+        resolver.with_schema(database_id, |s| {
+            s.get_indices(&normalized_view_name)
+                .map(|i| (i.name.clone(), i.root_page))
+                .collect()
+        })
+    } else {
+        Vec::new()
+    };
+    let view_index_targets: Vec<(&'static str, String)> = view_indexes
+        .into_iter()
+        .map(|(name, root_page)| {
+            program.emit_insn(Insn::Destroy {
+                db: database_id,
+                root: root_page,
+                former_root_reg: 0, // No autovacuum
+                is_temp: 0,
+            });
+            ("index", name)
+        })
+        .collect();
+    emit_delete_schema_rows(program, sqlite_schema_cursor_id, &view_index_targets);
+
     // Delete the mirrors' sqlite_schema rows. Their btrees were destroyed above.
     let mirror_schema_targets: Vec<(&'static str, String)> = mirror_table_names
         .iter()

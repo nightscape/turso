@@ -15513,6 +15513,7 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                     dbsp_state_roots,
                     dbsp_state_index_roots,
                 );
+                schema.attach_deferred_matview_indexes(&syms)?;
 
                 // Store the modified schema back
                 if db == crate::TEMP_DB_ID {
@@ -16056,6 +16057,9 @@ pub fn op_populate_materialized_views(
                 // mirror-fed rebuild.)
                 conn.view_transaction_states.mark_absorbed(&view_name);
             }
+            // A repopulate rewrites every row of the view's btree, so the
+            // view's secondary indexes must be maintained along with it.
+            view.set_output_indexes(conn.schema.read().matview_indexes(&view_name)?);
             // Now populate it with the cursor for writing
             return_if_io!(
                 state,

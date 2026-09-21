@@ -3190,6 +3190,7 @@ impl Connection {
                 Err(LimboError::ExtensionError(msg)) => eprintln!("Warning: {msg}"),
                 Err(e) => return Err(e),
             }
+            schema.attach_deferred_matview_indexes(&syms)?;
             Ok(())
         })?
     }
