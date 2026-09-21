@@ -203,6 +203,7 @@ pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 /// Unparsed index that comes from a sql query, i.e not an automatic index
 ///
 /// CREATE INDEX idx ON table_name(sql)
+#[derive(Clone, Debug)]
 pub struct UnparsedFromSqlIndex {
     pub table_name: String,
     pub root_page: i64,
@@ -329,6 +330,7 @@ pub fn parse_schema_rows(
         inner.dbsp_state_roots,
         inner.dbsp_state_index_roots,
     )?;
+    schema.attach_deferred_matview_indexes(syms)?;
 
     Ok(IOResult::Done(()))
 }

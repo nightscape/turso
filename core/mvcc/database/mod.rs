@@ -8715,6 +8715,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             dbsp_state_roots,
             dbsp_state_index_roots,
         )?;
+        fresh.attach_deferred_matview_indexes(&syms)?;
         Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
 
         Ok(Arc::new(fresh))
@@ -9678,6 +9679,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             dbsp_state_roots,
             dbsp_state_index_roots,
         )?;
+        fresh.attach_deferred_matview_indexes(&syms)?;
         Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
 
         Ok(Arc::new(fresh))

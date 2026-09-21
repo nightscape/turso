@@ -151,8 +151,42 @@ pub fn translate_create_index(
             .unwrap_or_else(|| "main".to_string());
         crate::bail_parse_error!("no such table: {}.{}", db_name, original_tbl_name.as_str());
     };
+    // A materialized view is an ordinary rowid btree table, so an index on it
+    // is an ordinary secondary index: built by the same backfill scan, read by
+    // the same seek. Only the maintenance is the view's own, and the delta
+    // applier (`core/incremental/compiler.rs`) can express a plain, total,
+    // non-unique key over the view's output columns — nothing else.
     if resolver.with_schema(database_id, |s| s.is_materialized_view(&tbl_name)) {
-        crate::bail_parse_error!("Error: cannot create index on materialized view '{tbl_name}'.");
+        let is_index_organized = resolver.with_schema(database_id, |s| {
+            s.get_materialized_view(&tbl_name)
+                .is_some_and(|v| !v.lock().order_by.is_empty())
+        });
+        if is_index_organized {
+            crate::bail_parse_error!(
+                "Error: cannot create index on materialized view '{tbl_name}': the view has \
+                 ORDER BY, so its own storage is an index btree."
+            );
+        }
+        if unique {
+            crate::bail_parse_error!(
+                "Error: UNIQUE index on materialized view '{tbl_name}' is not supported."
+            );
+        }
+        if where_clause.is_some() {
+            crate::bail_parse_error!(
+                "Error: partial index on materialized view '{tbl_name}' is not supported."
+            );
+        }
+        if using.is_some() {
+            crate::bail_parse_error!(
+                "Error: index method on materialized view '{tbl_name}' is not supported."
+            );
+        }
+        if columns.iter().any(|c| !matches!(*c.expr, ast::Expr::Id(_))) {
+            crate::bail_parse_error!(
+                "Error: expression index on materialized view '{tbl_name}' is not supported."
+            );
+        }
     }
     let Some(tbl) = table.btree() else {
         crate::bail_parse_error!("virtual tables may not be indexed");

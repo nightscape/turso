@@ -2519,6 +2519,10 @@ impl Program {
                     let schema = self.connection.schema.read();
                     if let Some(view_mutex) = schema.get_materialized_view(view_name) {
                         let mut view = view_mutex.lock();
+                        // The schema owns the view's secondary indexes; hand the
+                        // circuit the current set before it writes any row, so a
+                        // CREATE INDEX since the last commit is honoured.
+                        view.set_output_indexes(schema.matview_indexes(view_name)?);
 
                         // Create a DeltaSet from the per-table deltas
                         let mut delta_set = crate::incremental::compiler::DeltaSet::new();

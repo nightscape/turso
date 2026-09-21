@@ -969,6 +969,13 @@ impl IncrementalView {
         &self.name
     }
 
+    /// Hand the circuit the secondary indexes it must keep in step with the
+    /// view's btree. The schema owns that list, so every caller that drives a
+    /// delta into the view refreshes it first.
+    pub fn set_output_indexes(&mut self, indexes: Vec<crate::incremental::compiler::MatviewIndex>) {
+        self.circuit.set_output_indexes(indexes);
+    }
+
     /// Parse ORDER BY and LIMIT from the SELECT statement.
     /// Returns (order_by, limit) where order_by columns are indices into the
     /// expanded column_schema.
