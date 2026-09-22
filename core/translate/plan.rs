@@ -2515,6 +2515,15 @@ fn query_output_columns(
     Ok(columns)
 }
 
+/// The cursor type that reads `btree`'s rows. A materialized view is read
+/// through its own cursor, which merges the view's transaction overlay.
+pub(crate) fn read_cursor_type(btree: &Arc<BTreeTable>, schema: &Schema) -> CursorType {
+    match schema.get_materialized_view(&btree.name) {
+        Some(view_mutex) => CursorType::MaterializedView(btree.clone(), view_mutex),
+        None => CursorType::BTreeTable(btree.clone()),
+    }
+}
+
 impl JoinedTable {
     /// Returns the btree table for this table reference, if it is a BTreeTable.
     pub fn btree(&self) -> Option<Arc<BTreeTable>> {
@@ -2814,16 +2823,9 @@ impl JoinedTable {
                         },
                     ))
                 } else {
-                    // Check if this is a materialized view
-                    let cursor_type =
-                        if let Some(view_mutex) = schema.get_materialized_view(&btree.name) {
-                            CursorType::MaterializedView(btree.clone(), view_mutex)
-                        } else {
-                            CursorType::BTreeTable(btree.clone())
-                        };
                     Some(program.alloc_cursor_id_keyed_if_not_exists(
                         CursorKey::table(self.internal_id),
-                        cursor_type,
+                        read_cursor_type(btree, schema),
                     ))
                 };
 

@@ -18266,24 +18266,9 @@ pub fn op_hash_build(
     // Get the rowid from the cursor
     if op_state.rowid.is_none() {
         let cursor = state.get_cursor(data.cursor_id);
-        let rowid_val = match cursor {
-            Cursor::BTree(_) | Cursor::Dyn(_) => {
-                let btree_cursor = cursor.as_btree_mut();
-                let rowid_opt = match btree_cursor.rowid() {
-                    Ok(IOResult::Done(v)) => v,
-                    Ok(IOResult::IO(io)) => {
-                        *state.active_op_state.hash_build() = Some(op_state);
-                        return Ok(state.suspend_on_io(io));
-                    }
-                    Err(e) => {
-                        *state.active_op_state.hash_build() = Some(op_state);
-                        return Err(e);
-                    }
-                };
-                rowid_opt.ok_or_else(|| {
-                    LimboError::InternalError("HashBuild: cursor has no rowid".to_string())
-                })?
-            }
+        let rowid_result = match cursor {
+            Cursor::BTree(_) | Cursor::Dyn(_) => cursor.as_btree_mut().rowid(),
+            Cursor::MaterializedView(mv_cursor) => mv_cursor.rowid(),
             _ => {
                 return Err(LimboError::InternalError(
                     "HashBuild: unsupported cursor type".to_string(),
@@ -18291,6 +18276,20 @@ pub fn op_hash_build(
                 .into());
             }
         };
+        let rowid_opt = match rowid_result {
+            Ok(IOResult::Done(v)) => v,
+            Ok(IOResult::IO(io)) => {
+                *state.active_op_state.hash_build() = Some(op_state);
+                return Ok(state.suspend_on_io(io));
+            }
+            Err(e) => {
+                *state.active_op_state.hash_build() = Some(op_state);
+                return Err(e);
+            }
+        };
+        let rowid_val = rowid_opt.ok_or_else(|| {
+            LimboError::InternalError("HashBuild: cursor has no rowid".to_string())
+        })?;
         op_state.rowid = Some(rowid_val);
     }
 
