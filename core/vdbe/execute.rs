@@ -2150,30 +2150,10 @@ fn op_column_deferred(
                 rowid,
                 table_cursor_id,
             } => {
-                {
-                    let table_cursor = state.get_cursor(table_cursor_id);
-                    // MaterializedView cursors shouldn't go through deferred seek logic
-                    // but if we somehow get here, handle it appropriately
-                    match table_cursor {
-                        Cursor::MaterializedView(mv_cursor) => {
-                            // Seek to the rowid in the materialized view
-                            return_if_io!(
-                                state,
-                                mv_cursor
-                                    .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                            );
-                        }
-                        _ => {
-                            // Regular btree cursor
-                            let table_cursor = table_cursor.as_btree_mut();
-                            return_if_io!(
-                                state,
-                                table_cursor
-                                    .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                            );
-                        }
-                    }
-                }
+                return_if_io!(
+                    state,
+                    seek_deferred_table_row(state.get_cursor(table_cursor_id), rowid)
+                );
                 state.metrics.btree_seeks = state.metrics.btree_seeks.wrapping_add(1);
                 state.metrics.btree_table_seeks = state.metrics.btree_table_seeks.wrapping_add(1);
                 state.metrics.btree_deferred_seeks =
@@ -6238,6 +6218,18 @@ pub fn op_row_id(
     op_row_id_deferred(state, *cursor_id, *dest)
 }
 
+/// Complete a `DeferredSeek`: position the table cursor on the row the index
+/// entry names. A materialized view is positioned through its own cursor, which
+/// merges the transaction overlay.
+fn seek_deferred_table_row(table_cursor: &mut Cursor, rowid: i64) -> IOResultOr<SeekResult> {
+    let key = SeekKey::TableRowId(rowid);
+    let op = SeekOp::GE { eq_only: true };
+    match table_cursor {
+        Cursor::MaterializedView(mv_cursor) => mv_cursor.seek(key, op),
+        _ => table_cursor.as_btree_mut().seek(key, op),
+    }
+}
+
 /// RowId when a deferred seek is pending or the read was suspended for IO
 /// inside the seek: drives the op-state machine to completion.
 #[inline(never)]
@@ -6290,14 +6282,10 @@ fn op_row_id_deferred(state: &mut ProgramState, cursor_id: usize, dest: usize) -
                 rowid,
                 table_cursor_id,
             } => {
-                {
-                    let table_cursor = state.get_cursor(table_cursor_id);
-                    let table_cursor = table_cursor.as_btree_mut();
-                    return_if_io!(
-                        state,
-                        table_cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                    );
-                }
+                return_if_io!(
+                    state,
+                    seek_deferred_table_row(state.get_cursor(table_cursor_id), rowid)
+                );
                 *state.active_op_state.row_id() = OpRowIdState::GetRowid;
             }
             OpRowIdState::GetRowid => {
