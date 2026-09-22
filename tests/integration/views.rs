@@ -207,6 +207,27 @@ fn identity_view_over_five_rows() -> (TempDatabase, Arc<turso_core::Connection>)
     (tmp_db, conn)
 }
 
+#[test]
+fn materialized_view_rowid_seek_applies_numeric_affinity_to_the_key() {
+    let (_tmp_db, conn) = identity_view_over_five_rows();
+    conn.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY, vid)")
+        .unwrap();
+    conn.execute("INSERT INTO probe VALUES (1, 1), (2, 1.0), (3, '1'), (4, 'x'), (5, NULL)")
+        .unwrap();
+    assert_view_reads_like_its_table(
+        &conn,
+        "SELECT p.id, @.rowid, @.k FROM probe p LEFT JOIN @ ON @.rowid = p.vid ORDER BY p.id",
+    );
+    for id in 1..=5 {
+        assert_view_reads_like_its_table(
+            &conn,
+            &format!(
+                "SELECT rowid, k FROM @ WHERE rowid = (SELECT vid FROM probe WHERE id = {id})"
+            ),
+        );
+    }
+}
+
 const ROWID_RANGE_READS: [&str; 6] = [
     "SELECT rowid, k FROM @ WHERE rowid > 1 AND rowid < 4 ORDER BY rowid",
     "SELECT rowid, k FROM @ WHERE rowid > 2 ORDER BY rowid",
