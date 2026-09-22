@@ -1,17 +1,23 @@
 pub mod aggregate_operator;
+pub mod antijoin_operator;
 pub mod compiler;
 pub mod cursor;
 pub mod dbsp;
 #[cfg(test)]
 mod eq_only_seek_boundary;
 pub mod expr_compiler;
+pub mod fdw_mirror;
 pub mod filter_operator;
 pub mod input_operator;
 pub mod join_operator;
+pub mod literal_operator;
 pub mod merge_operator;
 pub mod operator;
 pub mod persistence;
 pub mod project_operator;
+pub mod recursive_operator;
+#[cfg(test)]
+mod temp_cursor_lifetime;
 pub mod view;
 
 #[cfg(test)]

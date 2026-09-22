@@ -151,6 +151,9 @@ pub fn translate_create_index(
             .unwrap_or_else(|| "main".to_string());
         crate::bail_parse_error!("no such table: {}.{}", db_name, original_tbl_name.as_str());
     };
+    if resolver.with_schema(database_id, |s| s.is_materialized_view(&tbl_name)) {
+        crate::bail_parse_error!("Error: cannot create index on materialized view '{tbl_name}'.");
+    }
     let Some(tbl) = table.btree() else {
         crate::bail_parse_error!("virtual tables may not be indexed");
     };

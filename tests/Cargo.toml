@@ -33,7 +33,6 @@ tokio = { workspace = true, features = ["full"] }
 rusqlite.workspace = true
 tempfile = { workspace = true }
 log = "0.4.22"
-assert_cmd = "^2"
 rand_chacha = { workspace = true }
 rand = { workspace = true }
 serde_json = { workspace = true }
@@ -45,6 +44,7 @@ turso_parser = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tracing = { workspace = true }
 turso-dbhash.workspace = true
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 [dev-dependencies]
 similar-asserts.workspace = true
@@ -54,7 +54,10 @@ test-log = { version = "0.2.17", features = ["trace"] }
 turso_macros.workspace = true
 
 [features]
-default = ["test_helper", "fts", "io_uring"]
+# io_memory_yield defers every IO completion, forcing the engine through its
+# resume path at every boundary. Out of the default set, the coverage behind
+# `#![cfg(feature = "io_memory_yield")]` compiles away and silently never runs.
+default = ["test_helper", "fts", "io_uring", "io_memory_yield"]
 checksum = ["turso_core/checksum"]
 test_helper = ["turso_core/test_helper"]
 fts = ["turso_core/fts"]

@@ -87,7 +87,11 @@ impl StmtClass {
             | Stmt::DropView { .. }
             | Stmt::DropType { .. }
             | Stmt::DropDomain { .. }
-            | Stmt::DropSequence { .. } => Some(Self::Schema),
+            | Stmt::DropSequence { .. }
+            | Stmt::RefreshMaterializedView { .. }
+            | Stmt::CreateServer(_)
+            | Stmt::CreateForeignTable(_)
+            | Stmt::DropServer { .. } => Some(Self::Schema),
             Stmt::Analyze { .. }
             | Stmt::Attach { .. }
             | Stmt::Begin { .. }

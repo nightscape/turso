@@ -468,8 +468,10 @@ pub fn emit_program_for_update(
     )?;
 
     program.preassign_label_to_next_insn(after_main_loop_label);
-    if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
-        emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
+    if !plan.contains_constant_false_condition {
+        if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
+            emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
+        }
     }
     // Emit scan-back loop for buffered RETURNING results.
     // All DML is complete at this point; now yield the buffered rows to the caller.
@@ -2328,7 +2330,9 @@ fn emit_update_insns<'a>(
                 } else {
                     InsertFlags::new().skip_last_rowid()
                 },
-                table_name: target_table.identifier.clone(),
+                // The identifier may be an alias, and materialized view maintenance
+                // routes on the table's own name, as the sibling Delete does.
+                table_name: table_name.to_string(),
             });
 
             // MVCC AUTOINCREMENT: an UPDATE that moves the rowid forward

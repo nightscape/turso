@@ -1,0 +1,37 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@requires materialized_views "requires materialized view support"
+
+# Repro for the Holon "json_group_array multiset went negative" panic.
+#
+# Trigger: matview with TWO LEFT JOINs to junction tables + GROUP BY a base-table
+# column that is then UPDATEd inside a transaction, followed by INSERTs into both
+# junction tables. The dual-LEFT-JOIN circuit emits a phantom -1 delta carrying
+# the stale group-by value, which decrements the json_group_array multiset
+# below zero and panics in aggregate_operator.rs::apply_delta.
+#
+# Minimized from /tmp/holon-turso-crash.sql (5077 directives -> 12 lines) via
+# tools/sql-replay minimize.
+
+test dual-leftjoin-update-and-junction-insert {
+    CREATE TABLE base (id TEXT PRIMARY KEY, v INTEGER);
+    CREATE TABLE j1 (id TEXT, x TEXT, PRIMARY KEY(id, x));
+    CREATE TABLE j2 (id TEXT, y TEXT, PRIMARY KEY(id, y));
+    CREATE MATERIALIZED VIEW mv AS
+        SELECT b.id, b.v,
+               COALESCE(json_group_array(j2.y) FILTER (WHERE j2.y IS NOT NULL), '[]') AS ys
+        FROM base b
+        LEFT JOIN j1 ON j1.id = b.id
+        LEFT JOIN j2 ON j2.id = b.id
+        GROUP BY b.id, b.v;
+    INSERT INTO base VALUES ('a', 1);
+    BEGIN;
+    UPDATE base SET v = 2 WHERE id = 'a';
+    INSERT INTO j2 VALUES ('a', 'Y');
+    INSERT INTO j1 VALUES ('a', 'X');
+    COMMIT;
+    SELECT id, v, ys FROM mv WHERE id = 'a';
+}
+expect {
+    a|2|["Y"]
+}

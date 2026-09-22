@@ -10,6 +10,7 @@ pub enum Pragma {
         database: Option<String>,
         mode: CheckpointMode,
     },
+    CaptureDataChanges(CdcMode),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -27,6 +28,13 @@ pub enum VacuumMode {
     Full,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CdcMode {
+    #[default]
+    Off,
+    Full,
+}
+
 impl Display for Pragma {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -37,8 +45,7 @@ impl Display for Pragma {
                     VacuumMode::Full => "full",
                 };
 
-                write!(f, "PRAGMA auto_vacuum={mode}")?;
-                Ok(())
+                write!(f, "PRAGMA auto_vacuum={mode}")
             }
             Pragma::ForeignKeyList(table_name) => {
                 let table_name = table_name.replace('\'', "''");
@@ -59,6 +66,14 @@ impl Display for Pragma {
                         CheckpointMode::Truncate => "TRUNCATE",
                     }
                 )
+            }
+            Pragma::CaptureDataChanges(cdc_mode) => {
+                let mode = match cdc_mode {
+                    CdcMode::Off => "off",
+                    CdcMode::Full => "full",
+                };
+
+                write!(f, "PRAGMA unstable_capture_data_changes_conn('{mode}')")
             }
         }
     }

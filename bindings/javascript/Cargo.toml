@@ -20,7 +20,7 @@ napi = { version = "3.8.3", default-features = false, features = ["napi6"] }
 napi-derive = { version = "3.5.2", default-features = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tracing.workspace = true
-chrono = { workspace = true, default-features = false, features = ["clock"] }
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [features]
 browser = []

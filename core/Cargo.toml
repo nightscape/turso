@@ -148,6 +148,7 @@ crc32c = "0.6.8"
 bigdecimal = "0.4"
 num-bigint = "0.4"
 num-traits = "0.2"
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
 stacker = { version = "0.1", optional = true }
 
 [target.'cfg(not(any(target_family = "wasm", all(target_os = "windows", target_arch = "aarch64"))))'.dependencies]
@@ -305,6 +306,10 @@ harness = false
 
 [[bench]]
 name = "select_star_benchmark"
+harness = false
+
+[[bench]]
+name = "matview_benchmark"
 harness = false
 
 [[bench]]

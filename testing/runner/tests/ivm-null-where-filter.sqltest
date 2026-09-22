@@ -1,0 +1,138 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@requires materialized_views "requires materialized view support"
+
+test ivm-null-where-neq-string {
+    CREATE TABLE items (id TEXT PRIMARY KEY, name TEXT);
+    INSERT INTO items VALUES ('a', 'Alice');
+    INSERT INTO items VALUES ('b', 'Bob');
+    INSERT INTO items VALUES ('c', NULL);
+    INSERT INTO items VALUES ('d', NULL);
+    INSERT INTO items VALUES ('e', '');
+
+    CREATE MATERIALIZED VIEW named AS SELECT id, name FROM items WHERE name != '';
+
+    SELECT id, name FROM named ORDER BY id;
+}
+expect {
+    a|Alice
+    b|Bob
+}
+
+test ivm-null-where-lt-string {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t VALUES (1, 'apple');
+    INSERT INTO t VALUES (2, NULL);
+    INSERT INTO t VALUES (3, 'banana');
+    INSERT INTO t VALUES (4, NULL);
+    INSERT INTO t VALUES (5, 'cherry');
+
+    CREATE MATERIALIZED VIEW mv_lt AS SELECT id, val FROM t WHERE val < 'cherry';
+
+    SELECT id, val FROM mv_lt ORDER BY id;
+}
+expect {
+    1|apple
+    3|banana
+}
+
+test ivm-null-where-neq-incremental {
+    CREATE TABLE data (id INTEGER PRIMARY KEY, status TEXT);
+
+    CREATE MATERIALIZED VIEW active AS SELECT id, status FROM data WHERE status != 'deleted';
+
+    INSERT INTO data VALUES (1, 'active');
+    INSERT INTO data VALUES (2, NULL);
+    INSERT INTO data VALUES (3, 'pending');
+    INSERT INTO data VALUES (4, NULL);
+
+    SELECT id, status FROM active ORDER BY id;
+}
+expect {
+    1|active
+    3|pending
+}
+
+test ivm-null-where-neq-after-update {
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT);
+
+    CREATE MATERIALIZED VIEW mv2 AS SELECT id, val FROM t2 WHERE val != '';
+
+    INSERT INTO t2 VALUES (1, 'hello');
+    INSERT INTO t2 VALUES (2, NULL);
+    INSERT INTO t2 VALUES (3, 'world');
+
+    UPDATE t2 SET val = NULL WHERE id = 1;
+
+    SELECT id, val FROM mv2 ORDER BY id;
+}
+expect {
+    3|world
+}
+
+test ivm-null-where-compound-and-incremental {
+    CREATE TABLE n (id INTEGER PRIMARY KEY, a TEXT, b TEXT);
+
+    CREATE MATERIALIZED VIEW mv_n AS
+    SELECT a, b FROM n WHERE a IS NOT NULL AND b IS NOT NULL;
+
+    INSERT INTO n (a, b) VALUES ('x', NULL);
+    INSERT INTO n (a, b) VALUES (NULL, 'y');
+    INSERT INTO n (a, b) VALUES ('x', 'y');
+    INSERT INTO n (a, b) VALUES (NULL, NULL);
+
+    SELECT a, b FROM mv_n ORDER BY a, b;
+}
+expect {
+    x|y
+}
+
+test ivm-null-where-compound-mixed-incremental {
+    CREATE TABLE nh (id INTEGER PRIMARY KEY AUTOINCREMENT, region TEXT NOT NULL, block_id TEXT, ts INTEGER NOT NULL, closed_at TEXT);
+
+    CREATE MATERIALIZED VIEW focus_roots AS
+    SELECT region, block_id AS root_id, ts AS added_ts, id AS history_id
+    FROM nh
+    WHERE closed_at IS NULL AND block_id IS NOT NULL;
+
+    INSERT INTO nh (region, block_id, ts) VALUES ('main', NULL, 1000);
+    INSERT INTO nh (region, block_id, ts) VALUES ('main', 'block:a', 1001);
+    INSERT INTO nh (region, block_id, ts) VALUES ('main', 'block:b', 1002);
+
+    SELECT region, root_id FROM focus_roots ORDER BY history_id;
+}
+expect {
+    main|block:a
+    main|block:b
+}
+
+test ivm-null-where-compound-update-to-null {
+    CREATE TABLE u (id INTEGER PRIMARY KEY, a TEXT, b TEXT);
+
+    CREATE MATERIALIZED VIEW mv_u AS
+    SELECT a, b FROM u WHERE a IS NOT NULL AND b IS NOT NULL;
+
+    INSERT INTO u (id, a, b) VALUES (1, 'x', 'y');
+
+    UPDATE u SET b = NULL WHERE id = 1;
+
+    SELECT a, b FROM mv_u ORDER BY a, b;
+}
+expect {
+}
+
+test ivm-null-where-compound-and-from-scratch-parens {
+    CREATE TABLE p (id INTEGER PRIMARY KEY, a TEXT, b TEXT);
+    INSERT INTO p (a, b) VALUES ('x', NULL);
+    INSERT INTO p (a, b) VALUES (NULL, 'y');
+    INSERT INTO p (a, b) VALUES ('x', 'y');
+    INSERT INTO p (a, b) VALUES (NULL, NULL);
+
+    CREATE MATERIALIZED VIEW mv_p AS
+    SELECT a, b FROM p WHERE (a IS NOT NULL) AND (b IS NOT NULL);
+
+    SELECT a, b FROM mv_p ORDER BY a, b;
+}
+expect {
+    x|y
+}

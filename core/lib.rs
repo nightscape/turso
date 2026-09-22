@@ -19,10 +19,14 @@ pub mod cdc;
 pub mod dbpage;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod functions;
+#[cfg(not(any(feature = "fuzz", feature = "bench")))]
+mod functions;
 pub mod index_method;
 pub mod io;
 #[cfg(all(feature = "json", any(feature = "fuzz", feature = "bench")))]
 pub mod json;
+#[cfg(all(feature = "json", not(any(feature = "fuzz", feature = "bench"))))]
+mod json;
 #[cfg(all(
     test,
     feature = "fs",
@@ -33,6 +37,8 @@ mod multiprocess_tests;
 pub mod mvcc;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
+#[cfg(not(any(feature = "fuzz", feature = "bench")))]
+mod numeric;
 pub mod schema;
 pub mod skiplist;
 pub mod state_machine;
@@ -40,6 +46,8 @@ pub mod storage;
 pub mod types;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod vdbe;
+#[cfg(not(any(feature = "fuzz", feature = "bench")))]
+mod vdbe;
 pub mod vector;
 
 #[cfg(feature = "cli_only")]
@@ -55,16 +63,11 @@ mod error;
 mod ext;
 mod fast_lock;
 mod function;
-#[cfg(not(any(feature = "fuzz", feature = "bench")))]
-mod functions;
 mod incremental;
 mod incremental_blob;
+pub use incremental::recursive_operator::take_recursive_restore_fallback_count;
 pub use incremental_blob::Blob;
 mod info;
-#[cfg(all(feature = "json", not(any(feature = "fuzz", feature = "bench"))))]
-mod json;
-#[cfg(not(any(feature = "fuzz", feature = "bench")))]
-mod numeric;
 mod parameters;
 #[cfg(feature = "percentile")]
 mod percentile;
@@ -84,11 +87,13 @@ mod translate;
 mod util;
 #[cfg(feature = "uuid")]
 mod uuid;
-#[cfg(not(any(feature = "fuzz", feature = "bench")))]
-mod vdbe;
 mod vtab;
 
 pub use function::Func;
+pub mod csv_fdw;
+
+pub mod foreign;
+
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
 /// The printf engine backing the SQL printf()/format() functions, also used
@@ -175,7 +180,9 @@ pub use turso_macros::{
     turso_assert_unreachable, turso_debug_assert, turso_soft_unreachable,
 };
 pub use turso_parser::ast::EqpFormat;
-pub use types::{IOResult, Value, ValueBlob, ValueRef};
+pub use types::{
+    CallbackId, DatabaseChange, DatabaseChangeType, IOResult, Value, ValueBlob, ValueRef,
+};
 pub use util::IOExt;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,

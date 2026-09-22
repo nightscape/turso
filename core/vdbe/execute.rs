@@ -1407,23 +1407,48 @@ pub fn op_open_read(
 
     match cursor_type {
         CursorType::MaterializedView(_, view_mutex) => {
-            // This is a materialized view with storage
-            // Create btree cursor for reading the persistent data
+            // This is a materialized view with storage.
+            // ORDER BY views are stored in an index btree (composite key
+            // [sort_v..., rowid, non_sort_data..., weight]); plain matviews
+            // are stored in a table btree keyed by rowid.
+            let (btree_cursor, mvcc_cursor_type): (Box<BTreeCursor>, MvccCursorType) = {
+                let view_guard = view_mutex.lock();
+                if !view_guard.order_by.is_empty() {
+                    let index_info = view_guard.order_by.to_index_info();
+                    (
+                        Box::new(BTreeCursor::new_index_with_index_info(
+                            pager.clone(),
+                            maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
+                            index_info,
+                            num_columns,
+                        )),
+                        MvccCursorType::Table,
+                    )
+                } else {
+                    (
+                        Box::new(BTreeCursor::new_table(
+                            pager.clone(),
+                            maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
+                            num_columns,
+                        )),
+                        MvccCursorType::Table,
+                    )
+                }
+            };
+            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, mvcc_cursor_type)?;
 
-            let btree_cursor = BTreeCursor::new_table(
-                pager.clone(),
-                maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
-                num_columns,
-            )
-            .into_boxed();
-            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
-
-            // Get the view name and look up or create its transaction state
+            // Look up the view's transaction state if it exists.
+            // Don't create one here — creating a spurious entry would cause
+            // apply_view_deltas to process this view with empty deltas during
+            // commit, overwriting any correct output_delta from a prior write.
             let view_name = view_mutex.lock().name().to_string();
             let tx_state = program
                 .connection
                 .view_transaction_states
-                .get_or_create(&view_name);
+                .get(&view_name)
+                .unwrap_or_else(|| {
+                    std::sync::Arc::new(crate::incremental::view::ViewTransactionState::new())
+                });
 
             // Create materialized view cursor with this view's transaction state
             let mv_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
@@ -1431,6 +1456,7 @@ pub fn op_open_read(
                 view_mutex.clone(),
                 pager,
                 tx_state,
+                program.connection.clone(),
             )?;
 
             cursors
@@ -2650,14 +2676,31 @@ pub fn op_type_check(
                 let _applied = apply_affinity_char(reg, col.affinity());
                 let value_type = reg.get_value().value_type();
                 if value_type != expected_type {
-                    bail_constraint_error!(
-                        "cannot store {} value in {} column {}.{} ({})",
-                        value_type,
-                        col.ty_str,
-                        &table_reference.name,
-                        col.name.as_deref().unwrap_or(""),
-                        SQLITE_CONSTRAINT
-                    );
+                    // SQLite stores a float in a STRICT INTEGER column when the
+                    // value is exactly representable as an integer, and rejects
+                    // it otherwise.
+                    let mut coerced = false;
+                    if expected_type == ValueType::Integer && value_type == ValueType::Float {
+                        if let Register::Value(value) = reg {
+                            if let Value::Numeric(Numeric::Float(f)) = *value {
+                                let i = f64::from(f) as i64;
+                                if (i as f64) == f64::from(f) {
+                                    *value = Value::from_i64(i);
+                                    coerced = true;
+                                }
+                            }
+                        }
+                    }
+                    if !coerced {
+                        bail_constraint_error!(
+                            "cannot store {} value in {} column {}.{} ({})",
+                            value_type,
+                            col.ty_str,
+                            &table_reference.name,
+                            col.name.as_deref().unwrap_or(""),
+                            SQLITE_CONSTRAINT
+                        );
+                    }
                 }
             }
             Ok(())
@@ -3878,6 +3921,7 @@ pub fn halt(
                 .swap(0, Ordering::AcqRel);
             if deferred_violations > 0 {
                 vtab_rollback_all(&program.connection)?;
+                program.connection.auto_commit.store(true, Ordering::SeqCst);
                 if let Some(mv_store) = mv_store.as_ref() {
                     if let Some(tx_id) = program.connection.get_mv_tx_id() {
                         mv_store.rollback_tx(tx_id, pager.clone(), &program.connection, MAIN_DB_ID);
@@ -5232,9 +5276,10 @@ pub fn op_auto_commit(
 
     // Drive any multi-step commit/rollback that's already in progress.
     // This handles main DB commits (Committing), attached DB commits
-    // (CommittingAttached), MVCC commits (CommittingMvcc), and attached
-    // MVCC commits (CommittingAttachedMvcc) that yielded on IO and need re-entry.
-    if !matches!(state.commit_state, CommitState::Ready) {
+    // (CommittingAttached), MVCC commits (CommittingMvcc), attached
+    // MVCC commits (CommittingAttachedMvcc), and the view-delta merge that
+    // precedes all of them, any of which may have yielded on IO.
+    if state.commit_in_flight() {
         let res = program.commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback);
         let res = state.done_or_suspend(res);
         // Only clear after a final, successful non-rollback COMMIT.
@@ -5317,6 +5362,10 @@ pub fn op_auto_commit(
                 conn.rollback_attached_wal_txns();
                 conn.rollback_temp_schema();
                 conn.index_methods_on_transaction_rolled_back();
+                // Drop any uncommitted IVM deltas. They reference table state that
+                // is now rolled back; merging them at the next commit would corrupt
+                // the matview btree.
+                conn.view_transaction_states.clear();
                 conn.set_tx_state(TransactionState::None);
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 conn.set_cdc_transaction_id(-1);
@@ -5349,20 +5398,34 @@ pub fn op_auto_commit(
             }
         }
     } else {
-        return match &tx_op {
-            TxOp::Begin => Err(LimboError::TxError(
+        // Non-MVCC commit continuation: tx_state may still be Write even though
+        // auto_commit was already flipped to true by an earlier async-IO yield.
+        let mvcc_tx_active = conn.get_mv_tx().is_some();
+        let non_mvcc_tx_active = !matches!(conn.get_tx_state(), TransactionState::None);
+        if !mvcc_tx_active {
+            let is_commit_continuation = matches!(tx_op, TxOp::Commit) && non_mvcc_tx_active;
+            if !is_commit_continuation {
+                return match &tx_op {
+                    TxOp::Begin => Err(LimboError::TxError(
+                        "cannot start a transaction within a transaction".to_string(),
+                    )
+                    .into()),
+                    TxOp::Commit => Err(LimboError::TxError(
+                        "cannot commit - no transaction is active".to_string(),
+                    )
+                    .into()),
+                    TxOp::Rollback => Err(LimboError::TxError(
+                        "cannot rollback - no transaction is active".to_string(),
+                    )
+                    .into()),
+                };
+            }
+        } else if matches!(tx_op, TxOp::Begin) {
+            return Err(LimboError::TxError(
                 "cannot start a transaction within a transaction".to_string(),
             )
-            .into()),
-            TxOp::Commit => Err(LimboError::TxError(
-                "cannot commit - no transaction is active".to_string(),
-            )
-            .into()),
-            TxOp::Rollback => Err(LimboError::TxError(
-                "cannot rollback - no transaction is active".to_string(),
-            )
-            .into()),
-        };
+            .into());
+        }
     }
 
     turso_debug_assert!(
@@ -5530,6 +5593,7 @@ pub fn op_savepoint(
                         main_schema_snapshot,
                         temp_schema_snapshot,
                         staged_schema_snapshot,
+                        view_tx_state_snapshot: conn.view_transaction_states.snapshot_lengths(),
                     };
                     // Mirror onto attached/temp pagers. If any pager fails
                     // mid-flight, earlier ones already opened a savepoint
@@ -5654,6 +5718,12 @@ pub fn op_savepoint(
             // consistent across tables / indexes / sequences without any
             // I/O.
             if let Some(info) = frame_info {
+                // Staged incremental-view deltas belong to the pages that were
+                // just rolled back: a matview read in an open transaction is
+                // its btree merged with them, so deltas surviving the rollback
+                // would report rows the rollback removed.
+                conn.view_transaction_states
+                    .rollback_to(&info.view_tx_state_snapshot);
                 *conn.schema.write() = info.main_schema_snapshot;
                 if let Some(temp_db) = conn.temp.database.read().as_ref() {
                     match info.temp_schema_snapshot {
@@ -12511,11 +12581,12 @@ pub fn op_insert(
                 };
                 state.active_op_state.insert().has_dependent_views = has_dependent_views;
                 // If there are no dependent views, we don't need to capture the old record.
-                // We also don't need to do it if the rowid of the UPDATEd row was changed, because
-                // op_delete already captured the deletion for IVM, and this insert only needs to
-                // record the new row (which ApplyViewChange handles without old_record).
-                let needs_capture =
-                    has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                // We also don't need to do it when a preceding op_delete already captured the
+                // old row for IVM (UPDATE that moves a rowid, REPLACE that overwrites one);
+                // this insert only needs to record the new row.
+                let needs_capture = has_dependent_views
+                    && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE)
+                    && !flag.has(InsertFlags::OLD_ROW_ALREADY_DELETED);
 
                 if flag.has(InsertFlags::REQUIRE_SEEK) {
                     state.active_op_state.insert().sub_state = OpInsertSubState::Seek;
@@ -12552,8 +12623,9 @@ pub fn op_insert(
                     return Ok(state.suspend_on_io(io));
                 }
                 let has_dependent_views = state.active_op_state.insert().has_dependent_views;
-                let needs_capture =
-                    has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                let needs_capture = has_dependent_views
+                    && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE)
+                    && !flag.has(InsertFlags::OLD_ROW_ALREADY_DELETED);
                 if needs_capture {
                     state.active_op_state.insert().sub_state = OpInsertSubState::CaptureRecord;
                 } else {
@@ -12789,13 +12861,15 @@ pub fn op_insert(
                     (key, new_values)
                 };
 
-                if let Some((key, values)) = state.active_op_state.insert().old_record.take() {
+                if let Some((old_key, old_values)) =
+                    state.active_op_state.insert().old_record.take()
+                {
                     for view_name in dependent_views.iter() {
                         let tx_state = program
                             .connection
                             .view_transaction_states
                             .get_or_create(view_name);
-                        tx_state.delete(table_name, key, values.to_vec());
+                        tx_state.delete(table_name, old_key, old_values.clone());
                     }
                 }
                 for view_name in dependent_views.iter() {
@@ -13897,6 +13971,33 @@ pub fn op_open_write(
                         )),
                         &program.connection,
                     )
+                }
+                CursorType::MaterializedView(_, view_mutex) => {
+                    // ORDER BY views own an index btree; plain matviews own a
+                    // table btree. The cursor type must match the underlying
+                    // page format.
+                    let view_guard = view_mutex.lock();
+                    if !view_guard.order_by.is_empty() {
+                        let index_info = view_guard.order_by.to_index_info();
+                        btree_cursor_with_yield_context(
+                            Box::new(BTreeCursor::new_index_with_index_info(
+                                pager,
+                                maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
+                                index_info,
+                                num_columns,
+                            )),
+                            &program.connection,
+                        )
+                    } else {
+                        btree_cursor_with_yield_context(
+                            Box::new(BTreeCursor::new_table(
+                                pager,
+                                maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
+                                num_columns,
+                            )),
+                            &program.connection,
+                        )
+                    }
                 }
                 _ => btree_cursor_with_yield_context(
                     Box::new(BTreeCursor::new_table(
@@ -15170,6 +15271,7 @@ pub struct OpParseSchemaInner {
     dbsp_state_index_roots: crate::HashMap<String, i64>,
     materialized_view_info: crate::HashMap<String, (String, i64)>,
     trigger_target_database_id: Option<usize>,
+    deferred_foreign_tables: Vec<(String, String)>,
     db: usize,
     previous_auto_commit: bool,
 }
@@ -15283,6 +15385,7 @@ pub fn op_parse_schema(
         dbsp_state_index_roots: Default::default(),
         materialized_view_info: Default::default(),
         trigger_target_database_id: *trigger_target_database_id,
+        deferred_foreign_tables: Vec::new(),
         db: *db,
         previous_auto_commit,
     }));
@@ -15339,6 +15442,7 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                     &mut inner.materialized_view_info,
                     &attached_resolver,
                     conn.dialect().as_ref(),
+                    &mut inner.deferred_foreign_tables,
                 )?;
                 if ty == "trigger" {
                     if let Some(target_database_id) = inner.trigger_target_database_id {
@@ -15358,6 +15462,7 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                     dbsp_state_index_roots,
                     materialized_view_info,
                     trigger_target_database_id: _,
+                    deferred_foreign_tables,
                     db,
                     previous_auto_commit,
                 } = *state
@@ -15369,12 +15474,20 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 let mv_store = stmt.mv_store();
                 let syms = conn.syms.read();
 
+                let known_matview_names: rustc_hash::FxHashSet<String> = materialized_view_info
+                    .keys()
+                    .map(|n| crate::util::normalize_ident(n))
+                    .collect();
                 let res1 = schema.populate_indices(
                     &syms,
                     from_sql_indexes,
                     automatic_indices,
                     mv_store.is_some(),
+                    &known_matview_names,
                 );
+                for (name, sql) in deferred_foreign_tables {
+                    schema.populate_foreign_table(&name, &sql, &syms)?;
+                }
                 let res2 = schema.populate_materialized_views(
                     materialized_view_info,
                     dbsp_state_roots,
@@ -15657,6 +15770,178 @@ fn drive_init_cdc_version(
     }
 }
 
+/// How a view's mirrors are being brought in line with their foreign sources.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MirrorSyncMode {
+    /// Discard and refill. The view is rebuilt from scratch alongside, so the
+    /// DML's deltas are redundant and are dropped.
+    Rebuild,
+    /// Touch only what differs. The DML's deltas ARE the maintenance — nothing
+    /// else updates the view — so they must survive to commit.
+    Sweep,
+}
+
+/// Bring every not-yet-synced FDW mirror of `view_name` in line with its
+/// foreign source.
+///
+/// The inner statements run nested for the same reason
+/// `IncrementalView::populate_from_table` does: they must join the enclosing
+/// statement's transaction rather than commit its dirty pages. Running nested
+/// is also what permits DML on an internal table at all (`allow_user_dml`).
+/// The counter is balanced on every exit, I/O yields included.
+fn sync_fdw_mirrors(
+    conn: &Arc<Connection>,
+    state: &mut ProgramState,
+    view_name: &str,
+    mode: MirrorSyncMode,
+) -> Result<IOResult<()>> {
+    conn.start_nested();
+    let result = sync_fdw_mirrors_inner(conn, state, view_name, mode);
+    conn.end_nested();
+    result
+}
+
+/// Prepare one statement of a mirror sync.
+///
+/// The statement subtransaction is suppressed because the enclosing statement
+/// already owns one, and the subjournal that backs it admits a single owner —
+/// a nested writer asking for its own gets `Busy`. Inside an explicit
+/// transaction the parent is always a writer, so this is the only case that
+/// reaches the contention. The parent's savepoint covers these writes, which
+/// is what makes suppressing it correct rather than merely quiet.
+fn prepare_mirror_stmt(conn: &Arc<Connection>, sql: &str) -> Result<Box<Statement>> {
+    let stmt = conn.prepare(sql)?;
+    stmt.program
+        .prepared
+        .needs_stmt_subtransactions
+        .store(false, Ordering::Relaxed);
+    Ok(Box::new(stmt))
+}
+
+fn sync_fdw_mirrors_inner(
+    conn: &Arc<Connection>,
+    state: &mut ProgramState,
+    view_name: &str,
+    mode: MirrorSyncMode,
+) -> Result<IOResult<()>> {
+    // (mirror, the statements that sync it, how to read its constraint
+    // failures), in the view's own fixed order so re-entry after a yield walks
+    // the same sequence.
+    let mirror_work: Vec<(
+        String,
+        Vec<String>,
+        crate::incremental::fdw_mirror::MirrorSync,
+    )> = {
+        let schema = conn.schema.read();
+        match schema.get_materialized_view(view_name) {
+            None => Vec::new(),
+            Some(view) => view
+                .lock()
+                .mirror_syncs()
+                .iter()
+                .map(|sync| {
+                    let sql = match mode {
+                        MirrorSyncMode::Rebuild => sync.rebuild_sql(),
+                        MirrorSyncMode::Sweep => sync.sweep_sql(),
+                    };
+                    (sync.mirror_table.clone(), sql, sync.clone())
+                })
+                .collect(),
+        }
+    };
+    if mirror_work.is_empty() {
+        return Ok(IOResult::Done(()));
+    }
+
+    for (mirror, sql, sync) in mirror_work {
+        if state.fdw_mirror_sync.done.contains(&mirror) {
+            continue;
+        }
+        // The opcode restarts at its first mirror after every yield, so the
+        // first unsynced mirror it reaches is always the one it left in flight.
+        let (mut phase, mut stmt) = match state.fdw_mirror_sync.in_flight.take() {
+            Some((in_flight_mirror, phase, stmt)) => {
+                turso_assert!(
+                    in_flight_mirror == mirror,
+                    "in-flight mirror {in_flight_mirror} is not the first unsynced one ({mirror})"
+                );
+                (phase, stmt)
+            }
+            None => (0, prepare_mirror_stmt(conn, &sql[0])?),
+        };
+        loop {
+            // Every constraint on a mirror is on its identity, so a violation
+            // here is always the source's fault. Reporting the internal table's
+            // name instead would name something the user never wrote.
+            let step = stmt.step().map_err(|err| sync.identity_violation(err))?;
+            match step {
+                // Only the sweep's guard emits a row, and only to refuse the
+                // scan; every other sync statement is DML.
+                StepResult::Row => {
+                    let row = stmt.row().expect("a Row step carries a row");
+                    return Err(sync.guard_refusal(row.get::<&str>(0)?));
+                }
+                StepResult::Done => {
+                    phase += 1;
+                    match sql.get(phase) {
+                        Some(next) => stmt = prepare_mirror_stmt(conn, next)?,
+                        None => {
+                            state.fdw_mirror_sync.done.insert(mirror);
+                            break;
+                        }
+                    }
+                }
+                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                    state.fdw_mirror_sync.in_flight = Some((mirror, phase, stmt));
+                    return Ok(IOResult::IO(crate::types::IOCompletions(
+                        crate::io::Completion::new_yield(),
+                    )));
+                }
+                StepResult::Interrupt | StepResult::Busy => {
+                    state.fdw_mirror_sync.in_flight = Some((mirror, phase, stmt));
+                    return Err(LimboError::Busy);
+                }
+            }
+        }
+    }
+
+    // The divergence between the two modes, and the only place it exists.
+    if mode == MirrorSyncMode::Rebuild {
+        // A rebuild is initial state, not a change: `populate_from_table` is
+        // about to read these same rows and build the view from scratch.
+        // Applying the rebuild's deltas at commit as well would count every row
+        // twice. A sweep must never reach here — its deltas are the whole
+        // mechanism, and dropping them would leave the view frozen.
+        //
+        // Marking rather than dropping keeps `ROLLBACK TO` able to undo it.
+        // Reaching this with anything staged needs a view that already existed
+        // when the staging DML ran, which a rebuild — only ever emitted by
+        // CREATE — cannot have; the mark is shared with the REFRESH rebuild in
+        // `op_populate_materialized_views`, where that is reachable.
+        conn.view_transaction_states.mark_absorbed(view_name);
+    }
+    Ok(IOResult::Done(()))
+}
+
+/// Sync a view's mirrors incrementally, leaving the resulting deltas to update
+/// the view at commit. This is `REFRESH MATERIALIZED VIEW` for a view whose
+/// sources are all mirrored.
+pub fn op_sync_fdw_mirrors(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(SyncFdwMirrors { view_name }, insn);
+    let conn = program.connection.clone();
+    return_if_io!(
+        state,
+        sync_fdw_mirrors(&conn, state, view_name, MirrorSyncMode::Sweep)
+    );
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_populate_materialized_views(
     program: &Program,
     state: &mut ProgramState,
@@ -15697,6 +15982,14 @@ pub fn op_populate_materialized_views(
 
     // Now populate the views (after releasing the schema borrow)
     for (view_name, _root_page, cursor_id) in view_info {
+        // A view's mirrors are filled before the view reads its sources, so a
+        // mirror is a faithful record of the foreign rows the view was built
+        // from and later syncs have something to diff against.
+        return_if_io!(
+            state,
+            sync_fdw_mirrors(&conn, state, &view_name, MirrorSyncMode::Rebuild)
+        );
+
         let schema = conn.schema.read();
         if let Some(view) = schema.get_materialized_view(&view_name) {
             let mut view = view.lock();
@@ -15728,6 +16021,19 @@ pub fn op_populate_materialized_views(
                 }
             };
 
+            // Reset only for REFRESH (where state is Done from prior population).
+            // On initial CREATE it's already Start, and during I/O re-entry it's mid-population
+            // — resetting would discard progress and force redundant table re-reads.
+            if view.populate_state_is_done() {
+                view.reset_for_repopulate();
+                // The rebuild reads its sources on this connection, so inside a
+                // transaction it already sees every row this view has staged.
+                // Leaving those deltas queued would apply them a second time at
+                // commit and count each row twice. Only this view's are marked;
+                // a sibling view over the same tables still needs its own.
+                // (`sync_fdw_mirrors` marks the same for a mirror-fed rebuild.)
+                conn.view_transaction_states.mark_absorbed(&view_name);
+            }
             // Now populate it with the cursor for writing
             return_if_io!(state, view.populate_from_table(&conn, pager, btree_cursor));
         }
@@ -16563,10 +16869,31 @@ pub fn op_count(
         insn
     );
 
-    let count = {
-        let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Count");
-        let cursor = cursor.as_btree_mut();
-        return_if_io!(state, cursor.count())
+    // Materialized-view cursors must NOT use the underlying btree's
+    // fast-count: that bypasses both LIMIT enforcement and the in-tx
+    // uncommitted-overlay merge. Walk the cursor instead so COUNT(*)
+    // matches what `SELECT *` would emit.
+    let count: usize = {
+        let cursor = state.get_cursor(*cursor_id);
+        if let Cursor::MaterializedView(mv_cursor) = cursor {
+            return_if_io!(state, mv_cursor.rewind());
+            let mut n: usize = 0;
+            if mv_cursor.is_valid()? {
+                n += 1;
+                loop {
+                    let advanced = return_if_io!(state, mv_cursor.next());
+                    if !advanced {
+                        break;
+                    }
+                    n += 1;
+                }
+            }
+            n
+        } else {
+            let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Count");
+            let cursor = cursor.as_btree_mut();
+            return_if_io!(state, cursor.count())
+        }
     };
 
     state.registers[*target_reg].set_int(count as i64);
@@ -19774,6 +20101,176 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
         }
     } else {
         root_page
+    }
+}
+
+/// Notify registered change callbacks about a CDC change.
+/// This fires callbacks for table changes when CDC is enabled.
+///
+/// NOTE: Callbacks fire BEFORE the transaction commits. Changes may still be rolled back.
+/// If your use case requires guaranteed committed data, consider using a post-commit hook
+/// or polling the CDC table directly.
+pub fn op_notify_cdc_change(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    let Insn::NotifyCdcChange {
+        table_name_reg,
+        change_type,
+        rowid_reg,
+        before_record_reg,
+        after_record_reg,
+    } = insn
+    else {
+        unreachable!()
+    };
+
+    notify_change_callbacks(
+        program,
+        state,
+        *table_name_reg,
+        *change_type,
+        *rowid_reg,
+        *before_record_reg,
+        *after_record_reg,
+    );
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+fn notify_change_callbacks(
+    program: &Program,
+    state: &ProgramState,
+    table_name_reg: usize,
+    change_type: i8,
+    rowid_reg: usize,
+    before_record_reg: usize,
+    after_record_reg: usize,
+) {
+    // Extract table name from register - translator guarantees this is Text
+    let table_name = match &state.registers[table_name_reg].get_value() {
+        Value::Text(t) => t.as_str().to_string(),
+        other => unreachable!(
+            "NotifyCdcChange: table_name_reg must contain Text, got {:?}",
+            other
+        ),
+    };
+
+    // Extract rowid - translator guarantees this is Integer
+    let rowid = match &state.registers[rowid_reg].get_value() {
+        Value::Numeric(Numeric::Integer(i)) => *i,
+        other => unreachable!(
+            "NotifyCdcChange: rowid_reg must contain Integer, got {:?}",
+            other
+        ),
+    };
+
+    // Get column names from schema BEFORE acquiring callback lock (avoid lock ordering issues)
+    let column_names = program
+        .connection
+        .schema
+        .read()
+        .get_table(&table_name)
+        .map(|table| {
+            table
+                .columns()
+                .iter()
+                .filter_map(|col| col.name.clone())
+                .collect::<Vec<String>>()
+        });
+
+    // If we can't get schema, skip the callback entirely rather than using fake column names
+    let Some(column_names) = column_names else {
+        tracing::warn!(
+            "NotifyCdcChange: Could not find schema for table '{}', skipping callback",
+            table_name
+        );
+        return;
+    };
+
+    // Extract before record if present
+    let before_record = if before_record_reg > 0 {
+        match &state.registers[before_record_reg].get_value() {
+            Value::Blob(b) => Some(b.clone()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // Extract after record if present
+    let after_record = if after_record_reg > 0 {
+        match &state.registers[after_record_reg].get_value() {
+            Value::Blob(b) => Some(b.clone()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // Build the DatabaseChange
+    let bin_record = after_record
+        .clone()
+        .or_else(|| before_record.clone())
+        .unwrap_or_default();
+
+    // Translator guarantees change_type is one of -1, 0, 1
+    let change = match change_type {
+        1 => crate::types::DatabaseChangeType::Insert { bin_record },
+        0 => crate::types::DatabaseChangeType::Update { bin_record },
+        -1 => crate::types::DatabaseChangeType::Delete { bin_record },
+        other => unreachable!("NotifyCdcChange: invalid change_type {}", other),
+    };
+
+    let database_change = crate::types::DatabaseChange {
+        change_id: 0, // CDC table assigns the actual ID
+        change_time: 0,
+        change,
+        table_name: table_name.clone(),
+        id: rowid,
+    };
+
+    // Build the event
+    let event = crate::types::RelationChangeEvent {
+        relation_name: table_name.clone(),
+        columns: column_names,
+        changes: vec![database_change],
+    };
+
+    // Clone callbacks to avoid holding the lock during callback execution (race condition fix)
+    let callbacks_to_invoke: Vec<_> = {
+        let callbacks = program.connection.db.change_callbacks.read();
+        if callbacks.is_empty() {
+            return;
+        }
+        callbacks
+            .iter()
+            .filter(|(_id, filter, _callback)| {
+                filter
+                    .as_ref()
+                    .map(|f| f.contains(&table_name))
+                    .unwrap_or(true)
+            })
+            .map(|(_id, _filter, callback)| Arc::clone(callback))
+            .collect()
+    };
+    // Lock is now dropped
+
+    // Fire callbacks with panic protection to prevent unwinding through VDBE
+    for callback in callbacks_to_invoke {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            callback(&event);
+        }));
+        if let Err(panic_info) = result {
+            tracing::error!(
+                "CDC change callback panicked for table '{}': {:?}",
+                table_name,
+                panic_info
+            );
+        }
     }
 }
 

@@ -29,12 +29,23 @@ pub struct VirtualTable {
     // Whether this virtual table is safe to use from within triggers and views.
     // Corresponds to SQLite's SQLITE_VTAB_INNOCUOUS flag.
     pub(crate) innocuous: bool,
+    /// The wrapper behind a foreign table, kept alongside the erased
+    /// `vtab_type` so callers can consult the FDW contract (identity columns,
+    /// streaming capability) without downcasting through
+    /// `dyn InternalVirtualTable`.
+    pub(crate) foreign: Option<Arc<dyn crate::foreign::ForeignDataWrapper>>,
 }
 
 impl VirtualTable {
     pub(crate) fn id(&self) -> u64 {
         self.vtab_id
     }
+
+    /// The foreign data wrapper this table reads from, if it is a foreign table.
+    pub(crate) fn foreign_wrapper(&self) -> Option<&Arc<dyn crate::foreign::ForeignDataWrapper>> {
+        self.foreign.as_ref()
+    }
+
     pub(crate) fn readonly(&self) -> bool {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => true,
@@ -81,7 +92,32 @@ impl VirtualTable {
             vtab_id: 0,
             is_droppable: false,
             innocuous: true,
+            foreign: None,
         })
+    }
+
+    /// Create a VirtualTable wrapping a [`ForeignDataWrapper`] implementation.
+    ///
+    /// The table is registered as a read-only `VirtualTable` (not a
+    /// table-valued function) and participates in the query planner via
+    /// `best_index`/`filter` like any other virtual table.
+    pub fn new_foreign(
+        name: &str,
+        fdw: Arc<dyn crate::foreign::ForeignDataWrapper>,
+    ) -> crate::Result<Arc<VirtualTable>> {
+        let adapter = crate::foreign::ForeignTableAdapter::new(fdw.clone());
+        let schema = adapter.sql();
+        let vtab = VirtualTable {
+            name: name.to_owned(),
+            columns: Self::resolve_columns(schema)?,
+            kind: VTabKind::VirtualTable,
+            vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(adapter))),
+            vtab_id: VTAB_ID_COUNTER.fetch_add(1, Ordering::Acquire),
+            is_droppable: true,
+            innocuous: false,
+            foreign: Some(fdw),
+        };
+        Ok(Arc::new(vtab))
     }
 
     pub(crate) fn function(name: &str, syms: &SymbolTable) -> crate::Result<Arc<VirtualTable>> {
@@ -103,6 +139,7 @@ impl VirtualTable {
             vtab_id: 0,
             is_droppable: false,
             innocuous: false,
+            foreign: None,
         };
         Ok(Arc::new(vtab))
     }
@@ -124,6 +161,7 @@ impl VirtualTable {
             vtab_id: VTAB_ID_COUNTER.fetch_add(1, Ordering::Acquire),
             is_droppable: true,
             innocuous: false,
+            foreign: None,
         };
         Ok(Arc::new(vtab))
     }

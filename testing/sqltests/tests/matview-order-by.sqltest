@@ -1,0 +1,89 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@skip-file-if sqlite "materialized views are a turso-specific feature"
+@requires materialized_views "requires materialized view support"
+
+test matview-order-by-single-col-asc {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (10, 3), (20, 1), (30, 2);
+
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t ORDER BY 1;
+
+    SELECT x FROM mv;
+}
+expect {
+    1
+    2
+    3
+}
+
+test matview-order-by-single-col-desc {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (10, 3), (20, 1), (30, 2);
+
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t ORDER BY 1 DESC;
+
+    SELECT x FROM mv;
+}
+expect {
+    3
+    2
+    1
+}
+
+test matview-order-by-projection-permutation {
+    -- Projects two columns but sorts by the SECOND one. This catches the
+    -- storage to logical permutation bug — without correct permutation,
+    -- column(0) would return the sort column instead of the first logical
+    -- output column.
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score INTEGER);
+    INSERT INTO t VALUES (1, 'alice', 30), (2, 'bob', 10), (3, 'carol', 20);
+
+    CREATE MATERIALIZED VIEW mv AS SELECT name, score FROM t ORDER BY 2;
+
+    SELECT name, score FROM mv;
+}
+expect {
+    bob|10
+    carol|20
+    alice|30
+}
+
+test matview-order-by-after-inserts {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t ORDER BY 1;
+
+    INSERT INTO t VALUES (1, 5);
+    INSERT INTO t VALUES (2, 1);
+    INSERT INTO t VALUES (3, 3);
+
+    SELECT x FROM mv;
+}
+expect {
+    1
+    3
+    5
+}
+
+test matview-order-by-refresh {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 5), (2, 1), (3, 3);
+
+    CREATE MATERIALIZED VIEW mv AS SELECT x FROM t ORDER BY 1;
+
+    SELECT x FROM mv;
+
+    INSERT INTO t VALUES (4, 0);
+    REFRESH MATERIALIZED VIEW mv;
+
+    SELECT x FROM mv;
+}
+expect {
+    1
+    3
+    5
+    0
+    1
+    3
+    5
+}
