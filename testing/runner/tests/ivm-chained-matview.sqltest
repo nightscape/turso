@@ -1,0 +1,328 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@requires materialized_views "requires materialized view support"
+
+test ivm-chained-matview-create {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t1 VALUES (1, 'a'), (2, 'b');
+
+    CREATE MATERIALIZED VIEW mv1 AS SELECT id, val FROM t1;
+    SELECT * FROM mv1 ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+}
+
+test ivm-chained-matview-on-matview {
+    CREATE TABLE base (id INTEGER PRIMARY KEY, cat TEXT);
+    CREATE TABLE detail (id INTEGER PRIMARY KEY, base_id INTEGER, info TEXT);
+
+    INSERT INTO base VALUES (1, 'x'), (2, 'y');
+    INSERT INTO detail VALUES (10, 1, 'hello'), (20, 2, 'world');
+
+    CREATE MATERIALIZED VIEW mv_base AS
+        SELECT id, cat FROM base WHERE cat = 'x';
+
+    CREATE MATERIALIZED VIEW mv_chained AS
+        SELECT d.id, d.info
+        FROM detail d
+        JOIN mv_base mb ON d.base_id = mb.id;
+
+    SELECT * FROM mv_chained ORDER BY id;
+}
+expect {
+    10|hello
+}
+
+test ivm-chained-matview-cdc-propagation {
+    CREATE TABLE items (id INTEGER PRIMARY KEY, group_id INTEGER, name TEXT);
+    CREATE TABLE groups (id INTEGER PRIMARY KEY, active INTEGER);
+
+    INSERT INTO groups VALUES (1, 1), (2, 0);
+    INSERT INTO items VALUES (100, 1, 'item-a'), (200, 2, 'item-b');
+
+    CREATE MATERIALIZED VIEW active_groups AS
+        SELECT id FROM groups WHERE active = 1;
+
+    CREATE MATERIALIZED VIEW active_items AS
+        SELECT i.id, i.name
+        FROM items i
+        JOIN active_groups ag ON i.group_id = ag.id;
+
+    SELECT * FROM active_items ORDER BY id;
+}
+expect {
+    100|item-a
+}
+
+test ivm-chained-union-all-matview {
+    CREATE TABLE nodes (id TEXT PRIMARY KEY, name TEXT, parent_id TEXT);
+    CREATE TABLE focus (region TEXT PRIMARY KEY, target_id TEXT);
+
+    INSERT INTO nodes VALUES ('a', 'Alpha', 'doc:1'), ('b', 'Beta', 'doc:1');
+    INSERT INTO nodes VALUES ('a1', 'Child-A1', 'a'), ('a2', 'Child-A2', 'a');
+    INSERT INTO nodes VALUES ('b1', 'Child-B1', 'b');
+    INSERT INTO focus VALUES ('main', 'doc:1');
+
+    CREATE MATERIALIZED VIEW roots AS
+    SELECT f.region, f.target_id, i.id AS root_id
+    FROM focus AS f JOIN nodes AS i ON i.parent_id = f.target_id
+    UNION ALL
+    SELECT f.region, f.target_id, i.id AS root_id
+    FROM focus AS f JOIN nodes AS i ON i.id = f.target_id;
+
+    SELECT root_id FROM roots WHERE region = 'main' ORDER BY root_id;
+}
+expect {
+    a
+    b
+}
+
+test ivm-chained-recursive-cte-over-union-matview {
+    CREATE TABLE items3 (id TEXT PRIMARY KEY, name TEXT, parent_id TEXT);
+    CREATE TABLE focus3 (region TEXT PRIMARY KEY, target_id TEXT);
+
+    INSERT INTO items3 VALUES ('a', 'Alpha', 'doc:1'), ('b', 'Beta', 'doc:1');
+    INSERT INTO items3 VALUES ('a1', 'Child-A1', 'a'), ('b1', 'Child-B1', 'b');
+    INSERT INTO focus3 VALUES ('main', 'doc:1');
+
+    CREATE MATERIALIZED VIEW roots3 AS
+    SELECT f.region, i.id AS root_id
+    FROM focus3 AS f JOIN items3 AS i ON i.parent_id = f.target_id
+    UNION ALL
+    SELECT f.region, i.id AS root_id
+    FROM focus3 AS f JOIN items3 AS i ON i.id = f.target_id;
+
+    CREATE MATERIALIZED VIEW descendants3 AS
+    WITH RECURSIVE tree AS (
+      SELECT i.id AS node_id, i.id AS source_id, 0 AS depth
+      FROM items3 AS i
+      UNION ALL
+      SELECT child.id, tree.source_id, tree.depth + 1
+      FROM tree JOIN items3 child ON child.parent_id = tree.node_id
+      WHERE tree.depth < 10
+    )
+    SELECT d.id, d.name
+    FROM roots3 AS r
+    JOIN tree ON tree.source_id = r.root_id
+    JOIN items3 AS d ON d.id = tree.node_id
+    WHERE r.region = 'main';
+
+    SELECT d.id, d.name FROM descendants3 AS d ORDER BY d.id;
+}
+expect {
+    a|Alpha
+    a1|Child-A1
+    b|Beta
+    b1|Child-B1
+}
+
+test ivm-chained-recursive-cte-over-union-matview-star {
+    CREATE TABLE items4 (id TEXT PRIMARY KEY, name TEXT, parent_id TEXT);
+    CREATE TABLE focus4 (region TEXT PRIMARY KEY, target_id TEXT);
+
+    INSERT INTO items4 VALUES ('a', 'Alpha', 'doc:1'), ('b', 'Beta', 'doc:1');
+    INSERT INTO items4 VALUES ('a1', 'Child-A1', 'a'), ('b1', 'Child-B1', 'b');
+    INSERT INTO focus4 VALUES ('main', 'doc:1');
+
+    CREATE MATERIALIZED VIEW roots4 AS
+    SELECT f.region, f.target_id, i.id AS root_id
+    FROM focus4 AS f JOIN items4 AS i ON i.parent_id = f.target_id
+    UNION ALL
+    SELECT f.region, f.target_id, i.id AS root_id
+    FROM focus4 AS f JOIN items4 AS i ON i.id = f.target_id;
+
+    CREATE MATERIALIZED VIEW descendants4 AS
+    WITH RECURSIVE tree AS (
+      SELECT i.id AS node_id, i.id AS source_id, 0 AS depth
+      FROM items4 AS i
+      UNION ALL
+      SELECT child.id, tree.source_id, tree.depth + 1
+      FROM tree JOIN items4 child ON child.parent_id = tree.node_id
+      WHERE tree.depth < 10
+    )
+    SELECT d.*
+    FROM roots4 AS r
+    JOIN items4 AS root ON root.id = r.root_id
+    JOIN tree ON tree.source_id = root.id
+    JOIN items4 AS d ON d.id = tree.node_id
+    WHERE r.region = 'main';
+
+    SELECT * FROM descendants4 ORDER BY id;
+}
+expect {
+    a|Alpha|doc:1
+    a1|Child-A1|a
+    b|Beta|doc:1
+    b1|Child-B1|b
+}
+
+test ivm-recursive-counter-union-all {
+    CREATE MATERIALIZED VIEW gen5 AS
+    WITH RECURSIVE gen(n) AS (
+      SELECT 1 UNION ALL SELECT n+1 FROM gen WHERE n < 5
+    )
+    SELECT n FROM gen;
+
+    SELECT COUNT(*) FROM gen5;
+    SELECT * FROM gen5 ORDER BY n;
+}
+expect {
+    5
+    1
+    2
+    3
+    4
+    5
+}
+
+test ivm-recursive-counter-union-all-large {
+    CREATE MATERIALIZED VIEW gen50 AS
+    WITH RECURSIVE gen(n) AS (
+      SELECT 1 UNION ALL SELECT n+1 FROM gen WHERE n < 50
+    )
+    SELECT n FROM gen;
+
+    SELECT COUNT(*) FROM gen50;
+    SELECT MIN(n) FROM gen50;
+    SELECT MAX(n) FROM gen50;
+}
+expect {
+    50
+    1
+    50
+}
+
+test ivm-recursive-counter-union-distinct {
+    CREATE MATERIALIZED VIEW gen_union AS
+    WITH RECURSIVE gen(n) AS (
+      SELECT 1 UNION SELECT n+1 FROM gen WHERE n < 5
+    )
+    SELECT n FROM gen;
+
+    SELECT COUNT(*) FROM gen_union;
+}
+expect {
+    5
+}
+
+test ivm-chained-matview-cdc-update {
+    CREATE TABLE items2 (id INTEGER PRIMARY KEY, group_id INTEGER, name TEXT);
+    CREATE TABLE groups2 (id INTEGER PRIMARY KEY, active INTEGER);
+
+    INSERT INTO groups2 VALUES (1, 1), (2, 0);
+    INSERT INTO items2 VALUES (100, 1, 'item-a'), (200, 2, 'item-b');
+
+    CREATE MATERIALIZED VIEW active_groups2 AS
+        SELECT id FROM groups2 WHERE active = 1;
+
+    CREATE MATERIALIZED VIEW active_items2 AS
+        SELECT i.id, i.name
+        FROM items2 i
+        JOIN active_groups2 ag ON i.group_id = ag.id;
+
+    UPDATE groups2 SET active = 0 WHERE id = 1;
+    UPDATE groups2 SET active = 1 WHERE id = 2;
+
+    SELECT * FROM active_items2 ORDER BY id;
+}
+expect {
+    200|item-b
+}
+
+test ivm-chained-union-all-cdc-cascade {
+    CREATE TABLE block6 (id TEXT PRIMARY KEY, parent_id TEXT, content TEXT);
+    CREATE TABLE nav_history6 (id INTEGER PRIMARY KEY, region TEXT NOT NULL, block_id TEXT);
+    CREATE TABLE nav_cursor6 (region TEXT PRIMARY KEY, history_id INTEGER);
+
+    CREATE MATERIALIZED VIEW current_focus6 AS
+    SELECT nc.region, nh.block_id
+    FROM nav_cursor6 nc
+    JOIN nav_history6 nh ON nc.history_id = nh.id;
+
+    CREATE MATERIALIZED VIEW focus_roots6 AS
+    SELECT cf.region, cf.block_id, b.id AS root_id
+    FROM current_focus6 AS cf
+    JOIN block6 AS b ON b.parent_id = cf.block_id
+    UNION ALL
+    SELECT cf.region, cf.block_id, b.id AS root_id
+    FROM current_focus6 AS cf
+    JOIN block6 AS b ON b.id = cf.block_id;
+
+    INSERT INTO nav_history6 VALUES (1, 'main', 'doc:init');
+    INSERT INTO nav_cursor6 VALUES ('main', 1);
+    INSERT INTO block6 VALUES ('doc:init', NULL, 'Init');
+    INSERT INTO block6 VALUES ('ic1', 'doc:init', 'c1');
+
+    INSERT INTO block6 VALUES ('doc:target', NULL, 'Target');
+    INSERT INTO block6 VALUES ('tc1', 'doc:target', 'c1');
+    INSERT INTO block6 VALUES ('tc2', 'doc:target', 'c2');
+    INSERT INTO block6 VALUES ('tc3', 'doc:target', 'c3');
+    INSERT INTO block6 VALUES ('tc4', 'doc:target', 'c4');
+    INSERT INTO block6 VALUES ('tc5', 'doc:target', 'c5');
+    INSERT INTO block6 VALUES ('tc6', 'doc:target', 'c6');
+    INSERT INTO block6 VALUES ('tc7', 'doc:target', 'c7');
+    INSERT INTO block6 VALUES ('tc8', 'doc:target', 'c8');
+
+    INSERT INTO nav_history6 VALUES (2, 'main', 'doc:target');
+    UPDATE nav_cursor6 SET history_id = 2 WHERE region = 'main';
+
+    SELECT root_id FROM focus_roots6 WHERE region = 'main' ORDER BY root_id;
+}
+expect {
+    doc:target
+    tc1
+    tc2
+    tc3
+    tc4
+    tc5
+    tc6
+    tc7
+    tc8
+}
+
+test ivm-chained-union-all-cdc-multiple-navigations {
+    CREATE TABLE block7 (id TEXT PRIMARY KEY, parent_id TEXT);
+    CREATE TABLE nav_history7 (id INTEGER PRIMARY KEY, region TEXT NOT NULL, block_id TEXT);
+    CREATE TABLE nav_cursor7 (region TEXT PRIMARY KEY, history_id INTEGER);
+
+    CREATE MATERIALIZED VIEW current_focus7 AS
+    SELECT nc.region, nh.block_id
+    FROM nav_cursor7 nc
+    JOIN nav_history7 nh ON nc.history_id = nh.id;
+
+    CREATE MATERIALIZED VIEW focus_roots7 AS
+    SELECT cf.region, cf.block_id, b.id AS root_id
+    FROM current_focus7 AS cf
+    JOIN block7 AS b ON b.parent_id = cf.block_id
+    UNION ALL
+    SELECT cf.region, cf.block_id, b.id AS root_id
+    FROM current_focus7 AS cf
+    JOIN block7 AS b ON b.id = cf.block_id;
+
+    INSERT INTO block7 VALUES ('d1', NULL), ('d1c1', 'd1'), ('d1c2', 'd1');
+    INSERT INTO block7 VALUES ('d2', NULL), ('d2c1', 'd2'), ('d2c2', 'd2'), ('d2c3', 'd2');
+
+    INSERT INTO nav_history7 VALUES (1, 'main', 'd1');
+    INSERT INTO nav_cursor7 VALUES ('main', 1);
+
+    SELECT COUNT(*) FROM focus_roots7;
+
+    INSERT INTO nav_history7 VALUES (2, 'main', 'd2');
+    UPDATE nav_cursor7 SET history_id = 2 WHERE region = 'main';
+
+    SELECT COUNT(*) FROM focus_roots7;
+
+    INSERT INTO nav_history7 VALUES (3, 'main', 'd1');
+    UPDATE nav_cursor7 SET history_id = 3 WHERE region = 'main';
+
+    SELECT root_id FROM focus_roots7 ORDER BY root_id;
+}
+expect {
+    3
+    4
+    d1
+    d1c1
+    d1c2
+}

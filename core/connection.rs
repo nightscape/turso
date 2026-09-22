@@ -144,6 +144,11 @@ pub(crate) struct NamedSavepointFrame {
     /// SAVEPOINT begin. Cheap — values are `Arc`. Used by ROLLBACK TO
     /// to restore staged DDL on attached databases.
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
+    /// Per-view, per-table lengths of the staged incremental-view deltas at
+    /// SAVEPOINT begin. A materialized view's rows for the open transaction are
+    /// these deltas merged over its btree, so rolling the btree back without
+    /// them would leave the view reporting writes whose pages are gone.
+    pub(crate) view_tx_state_snapshot: HashMap<String, crate::incremental::view::ViewTxSnapshot>,
 }
 
 /// Info returned by `rollback_named_savepoint_frame` so callers can
@@ -152,6 +157,7 @@ pub(crate) struct RollbackFrameInfo {
     pub(crate) main_schema_snapshot: Arc<Schema>,
     pub(crate) temp_schema_snapshot: Option<Arc<Schema>>,
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
+    pub(crate) view_tx_state_snapshot: HashMap<String, crate::incremental::view::ViewTxSnapshot>,
 }
 
 struct SchemaReparseGuard {
@@ -377,6 +383,10 @@ impl Drop for ExplicitCheckpointGuard {
     }
 }
 
+/// The savepoint [`Connection::inject_fdw_changes`] wraps a batch in when it is
+/// joining a transaction the caller owns.
+const FDW_PUSH_SAVEPOINT: &str = "__turso_internal_fdw_push";
+
 /// Database connection handle.
 ///
 /// If you add a setting that affects SQL compilation or execution, call
@@ -482,6 +492,10 @@ pub struct Connection {
     /// Per-connection view transaction states for uncommitted changes. This represents
     /// one entry per view that was touched in the transaction.
     pub(crate) view_transaction_states: AllViewsTxState,
+    /// Change events built during this transaction but not yet announced. They
+    /// are dispatched only once the transaction is committed and durable, and
+    /// dropped if it rolls back, so a consumer never sees a phantom delta.
+    pub(crate) staged_change_events: RwLock<Vec<crate::types::RelationChangeEvent>>,
     /// Connection-level metrics aggregation
     pub metrics: RwLock<ConnectionMetrics>,
     /// Greater than zero if connection executes a program within a program
@@ -491,6 +505,10 @@ pub struct Connection {
     /// The state is integer as we may want to spawn deep nested programs (e.g. Root -[run]-> S1 -[run]-> S2 -[run]-> ...)
     /// and we need to track current nestedness depth in order to properly understand when we will reach the root back again
     pub(super) nestedness: AtomicI32,
+    /// Greater than zero while a materialized view is being rebuilt on this
+    /// connection. See [`Connection::matview_rebuild_in_progress`]. Nested like
+    /// `nestedness` because a rebuild's scan can itself trigger one.
+    pub(super) matview_rebuild_depth: AtomicI32,
     /// Stack of currently compiling triggers to prevent recursive trigger subprogram compilation
     pub(super) compiling_triggers: RwLock<Vec<Arc<Trigger>>>,
     /// Stack of currently executing triggers to prevent recursive trigger execution
@@ -908,6 +926,22 @@ impl Connection {
     /// ends nested program execution
     pub fn end_nested(&self) {
         self.nestedness.fetch_add(-1, Ordering::SeqCst);
+    }
+
+    /// True while this connection is rebuilding a materialized view from its
+    /// sources. A rebuild reads upstream matviews at their *committed* state:
+    /// the rows it writes must not already contain an upstream delta that the
+    /// COMMIT-time cascade will deliver to the rebuilt view afterwards.
+    pub(crate) fn matview_rebuild_in_progress(&self) -> bool {
+        self.matview_rebuild_depth.load(Ordering::SeqCst) > 0
+    }
+
+    pub(crate) fn start_matview_rebuild(&self) {
+        self.matview_rebuild_depth.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn end_matview_rebuild(&self) {
+        self.matview_rebuild_depth.fetch_add(-1, Ordering::SeqCst);
     }
 
     /// Check if a specific trigger is currently compiling (for recursive trigger prevention)
@@ -2020,6 +2054,189 @@ impl Connection {
         Ok(type_rows)
     }
 
+    /// Register a foreign data wrapper as a virtual table in this connection's schema.
+    ///
+    /// The table becomes queryable immediately via standard SQL, including
+    /// JOINs with local tables. The virtual table is read-only.
+    ///
+    /// # Example
+    /// ```ignore
+    /// conn.register_foreign_table("gmail_email", my_fdw)?;
+    /// // Now: SELECT * FROM gmail_email WHERE from_address = 'alice@example.com'
+    /// ```
+    pub fn register_foreign_table(
+        &self,
+        name: &str,
+        fdw: std::sync::Arc<dyn crate::foreign::ForeignDataWrapper>,
+    ) -> crate::Result<()> {
+        let vtab = crate::VirtualTable::new_foreign(name, fdw)?;
+        // Add to the database-level shared schema so all connections see it.
+        let mut db_schema = self.db.schema.lock();
+        // Schema cloning is fallible, so it cannot go through Arc::make_mut
+        // (which requires Clone); clone explicitly via TryClone instead.
+        let mut schema = db_schema.as_ref().try_clone()?;
+        schema.add_virtual_table(vtab)?;
+        *db_schema = std::sync::Arc::new(schema);
+        // Update this connection's schema snapshot.
+        *self.schema.write() = db_schema.clone();
+        Ok(())
+    }
+
+    /// Refresh a materialized view by re-running its source query.
+    ///
+    /// This is the programmatic equivalent of `REFRESH MATERIALIZED VIEW <name>`.
+    /// A driver that can only signal "something changed" calls this; one that
+    /// knows *what* changed calls [`Self::inject_fdw_changes`] instead and
+    /// skips the rescan.
+    ///
+    /// Must be called on the same thread that owns the connection.
+    pub fn refresh_materialized_view(self: &Arc<Connection>, view_name: &str) -> crate::Result<()> {
+        let escaped = view_name.replace('\'', "''");
+        self.execute(format!("REFRESH MATERIALIZED VIEW {escaped}"))
+    }
+
+    /// Apply row-level changes a foreign source has pushed, to every mirror
+    /// shadowing that source.
+    ///
+    /// This is `REFRESH` without the rescan: the mirror DML emits the same
+    /// deltas the sweep would have derived, so the views update through the
+    /// ordinary commit path. It is the entry point behind
+    /// [`crate::foreign::StreamingForeignData`] — see [`Self::drain_fdw_stream`].
+    ///
+    /// The whole batch lands or none of it does. When there is no transaction
+    /// to join the batch gets its own; inside one the caller opened it takes a
+    /// savepoint, so a failure retracts the batch without disturbing the
+    /// caller's own writes or ending its transaction. Either way a reader never
+    /// sees part of a push.
+    ///
+    /// Every change is checked against the mirror's declared width first, so a
+    /// malformed batch is refused before any of it is applied.
+    ///
+    /// Must be called on the same thread that owns the connection, and never
+    /// from inside a running statement.
+    pub fn inject_fdw_changes(
+        self: &Arc<Connection>,
+        foreign_table: &str,
+        changes: &[crate::foreign::FdwChange],
+    ) -> crate::Result<()> {
+        turso_assert!(
+            !self.is_nested_stmt(),
+            "inject_fdw_changes drives its own transaction and cannot run inside a statement"
+        );
+        let syncs: Vec<crate::incremental::fdw_mirror::MirrorSync> = self
+            .schema
+            .read()
+            .incremental_views
+            .values()
+            .flat_map(|view| {
+                view.lock()
+                    .mirror_syncs()
+                    .iter()
+                    .filter(|sync| sync.source_table.eq_ignore_ascii_case(foreign_table))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        if syncs.is_empty() || changes.is_empty() {
+            return Ok(());
+        }
+
+        // A payload of the wrong width names no row, so reject the batch before
+        // any of it reaches a mirror rather than discovering it partway through.
+        for sync in &syncs {
+            for change in changes {
+                if change.values.len() != sync.columns.len() {
+                    return Err(sync.width_violation(change.values.len()));
+                }
+            }
+        }
+
+        // Own the transaction only when there is none to join, so a caller
+        // batching pushes with its own writes keeps one commit boundary. Inside
+        // the caller's transaction a savepoint gives the batch its own
+        // all-or-nothing boundary without claiming the caller's.
+        let owns_txn = self.get_auto_commit();
+        if owns_txn {
+            self.execute("BEGIN IMMEDIATE")?;
+        } else {
+            self.execute(format!("SAVEPOINT {FDW_PUSH_SAVEPOINT}"))?;
+        }
+        let result = (|| -> crate::Result<()> {
+            for sync in &syncs {
+                for change in changes {
+                    self.apply_fdw_change(sync, change)?;
+                }
+            }
+            Ok(())
+        })();
+        // A half-applied mirror would outlive the failed push and be read as
+        // the source's real contents.
+        match (owns_txn, result) {
+            (true, Ok(())) => self.execute("COMMIT"),
+            (true, Err(err)) => {
+                self.execute("ROLLBACK")?;
+                Err(err)
+            }
+            (false, Ok(())) => self.execute(format!("RELEASE {FDW_PUSH_SAVEPOINT}")),
+            (false, Err(err)) => {
+                // `ROLLBACK TO` keeps the savepoint open, so release it too and
+                // leave the caller's transaction exactly as the push found it.
+                self.execute(format!("ROLLBACK TO {FDW_PUSH_SAVEPOINT}"))?;
+                self.execute(format!("RELEASE {FDW_PUSH_SAVEPOINT}"))?;
+                Err(err)
+            }
+        }
+    }
+
+    /// Apply one change to one mirror.
+    ///
+    /// The statement is *prepared* nested so the reserved-prefix guard admits
+    /// DML on an internal table, but *stepped* top-level: the guard is a
+    /// translation-time check, while nesting at step time would hand the commit
+    /// to an enclosing statement that does not exist here.
+    fn apply_fdw_change(
+        self: &Arc<Connection>,
+        sync: &crate::incremental::fdw_mirror::MirrorSync,
+        change: &crate::foreign::FdwChange,
+    ) -> crate::Result<()> {
+        let (sql, params): (String, Vec<Value>) = if change.weight >= 0 {
+            (sync.push_upsert_sql(), change.values.clone())
+        } else {
+            (
+                sync.push_delete_sql(),
+                sync.identity
+                    .iter()
+                    .map(|column| change.values[*column].clone())
+                    .collect(),
+            )
+        };
+
+        self.start_nested();
+        let prepared = self.prepare(&sql);
+        self.end_nested();
+        let mut stmt = prepared?;
+        for (position, value) in params.into_iter().enumerate() {
+            stmt.bind_at(std::num::NonZero::new(position + 1).unwrap(), value)?;
+        }
+        stmt.run_ignore_rows()
+            .map_err(|err| sync.identity_violation(err))
+    }
+
+    /// Drain everything a [`crate::foreign::StreamingForeignData`] subscription
+    /// has produced so far and apply it as one batch.
+    ///
+    /// Draining is the caller's cue to act, not a schedule: nothing in the
+    /// engine polls. What the engine owns is that whatever arrives is applied
+    /// atomically and incrementally.
+    pub fn drain_fdw_stream(
+        self: &Arc<Connection>,
+        foreign_table: &str,
+        changes: &std::sync::mpsc::Receiver<crate::foreign::FdwChange>,
+    ) -> crate::Result<()> {
+        let batch: Vec<_> = changes.try_iter().collect();
+        self.inject_fdw_changes(foreign_table, &batch)
+    }
+
     pub fn maybe_update_schema(&self) {
         if self.schema_reparse_in_progress() {
             return;
@@ -2899,6 +3116,7 @@ impl Connection {
             let mut dbsp_state_roots = HashMap::default();
             let mut dbsp_state_index_roots = HashMap::default();
             let mut materialized_view_info = HashMap::default();
+            let mut deferred_foreign_tables = Vec::new();
 
             let attached_resolver = |name: &str| -> Option<usize> {
                 self.attached_databases
@@ -2921,6 +3139,7 @@ impl Connection {
                     &mut materialized_view_info,
                     &attached_resolver,
                     self.db.dialect().as_ref(),
+                    &mut deferred_foreign_tables,
                 ) {
                     Ok(()) => {}
                     Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
@@ -2931,11 +3150,30 @@ impl Connection {
                 }
             }
 
-            match schema.populate_indices(&syms, from_sql_indexes, automatic_indices, false) {
+            let known_matview_names: rustc_hash::FxHashSet<String> = materialized_view_info
+                .keys()
+                .map(|n| crate::util::normalize_ident(n))
+                .collect();
+            match schema.populate_indices(
+                &syms,
+                from_sql_indexes,
+                automatic_indices,
+                false,
+                &known_matview_names,
+            ) {
                 Ok(()) => {}
                 Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
                 Err(LimboError::ExtensionError(msg)) => eprintln!("Warning: {msg}"),
                 Err(e) => return Err(e),
+            }
+            // Foreign tables before matviews — matviews may reference foreign tables
+            for (name, sql) in deferred_foreign_tables {
+                match schema.populate_foreign_table(&name, &sql, &syms) {
+                    Ok(()) => {}
+                    Err(LimboError::ParseError(msg)) if msg.contains("already exists") => {}
+                    Err(LimboError::ExtensionError(msg)) => eprintln!("Warning: {msg}"),
+                    Err(e) => return Err(e),
+                }
             }
             match schema.populate_materialized_views(
                 materialized_view_info,
@@ -3458,6 +3696,17 @@ impl Connection {
         ))
     }
 
+    /// Attach a database file with the given alias name
+    #[cfg(feature = "fs")]
+    pub(crate) fn attach_database(
+        &self,
+        path: &str,
+        alias: &str,
+        state: &mut AttachDatabaseState,
+    ) -> IOResultOr<()> {
+        self.attach_database_with_config(path, alias, None, state)
+    }
+
     #[cfg(not(feature = "fs"))]
     pub(crate) fn attach_database_with_config(
         &self,
@@ -3469,17 +3718,6 @@ impl Connection {
         // File-backed ATTACH is unavailable without `fs`, so pre-initialization
         // page-layout overrides are also unsupported in this build.
         self.attach_database(_path, _alias, _state)
-    }
-
-    /// Attach a database file with the given alias name
-    #[cfg(feature = "fs")]
-    pub(crate) fn attach_database(
-        &self,
-        path: &str,
-        alias: &str,
-        state: &mut AttachDatabaseState,
-    ) -> IOResultOr<()> {
-        self.attach_database_with_config(path, alias, None, state)
     }
 
     /// Attach a database file with an optional pre-initialization reserved-space override.
@@ -4857,6 +5095,8 @@ impl Connection {
 
     /// Request interruption of currently running root statements on this connection.
     /// If no root statement is active, the request is ignored to match SQLite semantics.
+    /// A request that races with the last statement finishing is cleared when the next
+    /// statement starts.
     pub fn interrupt(&self) {
         if self.n_active_root_statements.load(Ordering::SeqCst) > 0 {
             self.interrupt_requested.store(true, Ordering::SeqCst);
@@ -4882,7 +5122,10 @@ impl Connection {
                 "cannot start a statement while a checkpoint is active",
             ));
         }
-        self.n_active_root_statements.fetch_add(1, Ordering::SeqCst);
+        let previous = self.n_active_root_statements.fetch_add(1, Ordering::SeqCst);
+        if previous == 0 {
+            self.interrupt_requested.store(false, Ordering::SeqCst);
+        }
         Ok(())
     }
 
@@ -5109,6 +5352,7 @@ impl Connection {
             main_schema_snapshot: frame.main_schema_snapshot.clone(),
             temp_schema_snapshot: frame.temp_schema_snapshot.clone(),
             staged_schema_snapshot: frame.staged_schema_snapshot.clone(),
+            view_tx_state_snapshot: frame.view_tx_state_snapshot.clone(),
         };
         // ROLLBACK TO keeps the target savepoint itself on the stack;
         // only nested savepoints above it are discarded.
@@ -5246,6 +5490,82 @@ impl Connection {
         self.index_methods_on_transaction_rolled_back();
         self.set_tx_state(TransactionState::None);
         self.clear_tx_poison();
+        // Staged IVM deltas describe writes this rollback just undid. A
+        // statement savepoint only covers the deltas of the statement that owns
+        // it, and deltas staged by nested statements have already outlived
+        // theirs, so undoing the transaction is the only point that can undo all
+        // of them. Keeping any would merge phantom rows into the matview.
+        self.view_transaction_states.clear();
+        self.clear_staged_change_events();
+    }
+
+    /// Queue a change event for announcement at the next successful commit.
+    pub(crate) fn stage_change_event(&self, event: crate::types::RelationChangeEvent) {
+        self.staged_change_events.write().push(event);
+    }
+
+    /// Drop every event staged by the current transaction.
+    pub(crate) fn clear_staged_change_events(&self) {
+        self.staged_change_events.write().clear();
+    }
+
+    /// Stamp the commit envelope onto every event this transaction staged and
+    /// hand them to the registered callbacks. Callers must only reach this once
+    /// the transaction is committed and durable.
+    pub(crate) fn dispatch_staged_change_events(&self) {
+        let mut events = std::mem::take(&mut *self.staged_change_events.write());
+        if events.is_empty() {
+            return;
+        }
+
+        // Clone the callbacks out of the registry: a callback must never run
+        // with the registry lock held, because it may register or drop one.
+        let callbacks: Vec<(crate::types::RelationFilter, crate::types::ChangeCallbackFn)> = {
+            let registry = self.db.change_callbacks.read();
+            registry
+                .iter()
+                .map(|(_id, filter, callback)| (filter.clone(), Arc::clone(callback)))
+                .collect()
+        };
+        if callbacks.is_empty() {
+            return;
+        }
+
+        let commit_id = crate::types::next_commit_id();
+        let commit_len = events.len() as u32;
+        for (index, event) in events.iter_mut().enumerate() {
+            event.commit_id = commit_id;
+            event.commit_index = index as u32;
+            event.commit_len = commit_len;
+        }
+
+        for event in &events {
+            for (filter, callback) in &callbacks {
+                let should_fire = filter
+                    .as_ref()
+                    .map(|f| f.contains(&event.relation_name))
+                    .unwrap_or(true);
+                if !should_fire {
+                    continue;
+                }
+                // A panicking consumer must not unwind through the VDBE.
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(event)));
+                if let Err(panic_info) = result {
+                    tracing::error!(
+                        "Change callback panicked for relation '{}': {:?}",
+                        event.relation_name,
+                        panic_info
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whether anything is listening for change events. The emission sites use
+    /// this to skip building events nobody will receive.
+    pub(crate) fn has_change_callbacks(&self) -> bool {
+        !self.db.change_callbacks.read().is_empty()
     }
 
     /// Roll back transaction state for helpers that start a manual `BEGIN`
@@ -5380,6 +5700,59 @@ impl Connection {
             _ => false,
         }
     }
+
+    /// Register a callback for changes to any relation (tables or materialized views).
+    /// The callback fires when changes are committed or when CDC records are written.
+    /// Returns a callback ID that can be used to unregister.
+    ///
+    /// The callback receives a RelationChangeEvent containing:
+    /// - relation_name: The name of the table or view
+    /// - columns: Column names in order, matching the values in DatabaseChange records
+    /// - changes: The actual row changes (inserts, updates, deletes)
+    pub fn set_change_callback<F>(&self, callback: F) -> crate::types::CallbackId
+    where
+        F: Fn(&crate::types::RelationChangeEvent) + Send + Sync + 'static,
+    {
+        let id = crate::types::CallbackId::new();
+        self.db
+            .change_callbacks
+            .write()
+            .push((id, None, Arc::new(callback)));
+        id
+    }
+
+    /// Register a callback filtered to specific relations.
+    /// The callback only fires for changes to the specified tables/views.
+    pub fn set_change_callback_for<F>(
+        &self,
+        relations: &[&str],
+        callback: F,
+    ) -> crate::types::CallbackId
+    where
+        F: Fn(&crate::types::RelationChangeEvent) + Send + Sync + 'static,
+    {
+        let id = crate::types::CallbackId::new();
+        let filter: std::collections::HashSet<String> =
+            relations.iter().map(|s| s.to_string()).collect();
+        self.db
+            .change_callbacks
+            .write()
+            .push((id, Some(filter), Arc::new(callback)));
+        id
+    }
+
+    /// Remove a specific callback by ID
+    pub fn clear_change_callback(&self, id: crate::types::CallbackId) {
+        self.db
+            .change_callbacks
+            .write()
+            .retain(|(callback_id, _, _)| *callback_id != id);
+    }
+
+    /// Clear all change callbacks (for cleanup/testing)
+    pub fn clear_all_change_callbacks(&self) {
+        self.db.change_callbacks.write().clear();
+    }
 }
 
 pub type Row = vdbe::Row;
@@ -5393,6 +5766,7 @@ pub struct SymbolTable {
     pub vtabs: HashMap<String, Arc<VirtualTable>>,
     pub vtab_modules: HashMap<String, Arc<crate::ext::VTabImpl>>,
     pub index_methods: HashMap<String, Arc<dyn IndexMethod>>,
+    pub foreign_drivers: HashMap<String, Arc<dyn crate::foreign::ForeignDriverFactory>>,
 }
 
 impl std::fmt::Debug for SymbolTable {
@@ -5434,6 +5808,15 @@ impl SymbolTable {
             vtabs: HashMap::default(),
             vtab_modules: HashMap::default(),
             index_methods: HashMap::default(),
+            foreign_drivers: {
+                let mut drivers: HashMap<String, Arc<dyn crate::foreign::ForeignDriverFactory>> =
+                    HashMap::default();
+                drivers.insert(
+                    "csv".to_string(),
+                    Arc::new(crate::csv_fdw::CsvDriverFactory),
+                );
+                drivers
+            },
         }
     }
     pub fn resolve_function(

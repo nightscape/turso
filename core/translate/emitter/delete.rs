@@ -277,8 +277,10 @@ fn emit_row_loop_delete(
         )?;
     }
     program.preassign_label_to_next_insn(after_main_loop_label);
-    if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
-        emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
+    if !plan.contains_constant_false_condition {
+        if let Some(cdc_cursor_id) = t_ctx.cdc_cursor_id {
+            emit_cdc_autocommit_commit(program, resolver, cdc_cursor_id)?;
+        }
     }
     // Emit scan-back loop for buffered RETURNING results.
     // All DML is complete at this point; now yield the buffered rows to the caller.
@@ -839,6 +841,7 @@ fn emit_delete_row_common(
                 None,
                 None,
                 table_name,
+                unsafe { (*table_reference).database_id },
             )?;
         }
 

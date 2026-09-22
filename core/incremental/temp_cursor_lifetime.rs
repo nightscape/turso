@@ -93,9 +93,15 @@ fn fixture() -> Fixture {
     let logical_plan = LogicalPlanBuilder::new(&schema)
         .build_statement(&stmt)
         .unwrap();
-    let circuit = DbspCompiler::new(main_data_root, state_root, state_index_root)
-        .compile(&logical_plan)
-        .unwrap();
+    let circuit = DbspCompiler::new(
+        main_data_root,
+        state_root,
+        state_index_root,
+        Default::default(),
+        None,
+    )
+    .compile(&logical_plan)
+    .unwrap();
 
     Fixture {
         conn,

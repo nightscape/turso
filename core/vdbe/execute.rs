@@ -163,7 +163,7 @@ use super::{
     CommitState,
 };
 use crate::sync::RwLock;
-use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType};
+use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, RefreshScope, ResolveType};
 use turso_parser::parser::Parser;
 
 use super::sorter::Sorter;
@@ -1416,23 +1416,48 @@ pub fn op_open_read(
 
     match cursor_type {
         CursorType::MaterializedView(_, view_mutex) => {
-            // This is a materialized view with storage
-            // Create btree cursor for reading the persistent data
+            // This is a materialized view with storage.
+            // ORDER BY views are stored in an index btree (composite key
+            // [sort_v..., rowid, non_sort_data..., weight]); plain matviews
+            // are stored in a table btree keyed by rowid.
+            let (btree_cursor, mvcc_cursor_type): (Box<BTreeCursor>, MvccCursorType) = {
+                let view_guard = view_mutex.lock();
+                if !view_guard.order_by.is_empty() {
+                    let index_info = view_guard.order_by.to_index_info();
+                    (
+                        Box::new(BTreeCursor::new_index_with_index_info(
+                            pager.clone(),
+                            maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
+                            index_info,
+                            num_columns,
+                        )),
+                        MvccCursorType::Table,
+                    )
+                } else {
+                    (
+                        Box::new(BTreeCursor::new_table(
+                            pager.clone(),
+                            maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
+                            num_columns,
+                        )),
+                        MvccCursorType::Table,
+                    )
+                }
+            };
+            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, mvcc_cursor_type)?;
 
-            let btree_cursor = BTreeCursor::new_table(
-                pager.clone(),
-                maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
-                num_columns,
-            )
-            .into_boxed();
-            let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
-
-            // Get the view name and look up or create its transaction state
+            // Look up the view's transaction state if it exists.
+            // Don't create one here — creating a spurious entry would cause
+            // apply_view_deltas to process this view with empty deltas during
+            // commit, overwriting any correct output_delta from a prior write.
             let view_name = view_mutex.lock().name().to_string();
             let tx_state = program
                 .connection
                 .view_transaction_states
-                .get_or_create(&view_name);
+                .get(&view_name)
+                .unwrap_or_else(|| {
+                    std::sync::Arc::new(crate::incremental::view::ViewTransactionState::new())
+                });
 
             // Create materialized view cursor with this view's transaction state
             let mv_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
@@ -1440,6 +1465,7 @@ pub fn op_open_read(
                 view_mutex.clone(),
                 pager,
                 tx_state,
+                program.connection.clone(),
             )?;
 
             cursors
@@ -1939,9 +1965,14 @@ pub fn op_last(
     assert!(pc_if_empty.is_offset());
     let is_empty = {
         let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Last");
-        let cursor = cursor.as_btree_mut();
-        return_if_io!(state, cursor.last());
-        cursor.is_empty()
+        if let Cursor::MaterializedView(mv_cursor) = cursor {
+            return_if_io!(state, mv_cursor.last());
+            !mv_cursor.is_valid()?
+        } else {
+            let cursor = cursor.as_btree_mut();
+            return_if_io!(state, cursor.last());
+            cursor.is_empty()
+        }
     };
     if is_empty {
         state.pc = pc_if_empty.as_offset_int();
@@ -2665,14 +2696,31 @@ pub fn op_type_check(
                 let _applied = apply_affinity_char(reg, col.affinity());
                 let value_type = reg.get_value().value_type();
                 if value_type != expected_type {
-                    bail_constraint_error!(
-                        "cannot store {} value in {} column {}.{} ({})",
-                        value_type,
-                        col.ty_str,
-                        &table_reference.name,
-                        col.name.as_deref().unwrap_or(""),
-                        SQLITE_CONSTRAINT
-                    );
+                    // SQLite stores a float in a STRICT INTEGER column when the
+                    // value is exactly representable as an integer, and rejects
+                    // it otherwise.
+                    let mut coerced = false;
+                    if expected_type == ValueType::Integer && value_type == ValueType::Float {
+                        if let Register::Value(value) = reg {
+                            if let Value::Numeric(Numeric::Float(f)) = *value {
+                                let i = f64::from(f) as i64;
+                                if (i as f64) == f64::from(f) {
+                                    *value = Value::from_i64(i);
+                                    coerced = true;
+                                }
+                            }
+                        }
+                    }
+                    if !coerced {
+                        bail_constraint_error!(
+                            "cannot store {} value in {} column {}.{} ({})",
+                            value_type,
+                            col.ty_str,
+                            &table_reference.name,
+                            col.name.as_deref().unwrap_or(""),
+                            SQLITE_CONSTRAINT
+                        );
+                    }
                 }
             }
             Ok(())
@@ -3675,13 +3723,16 @@ pub fn op_prev(
     );
     let is_empty = {
         let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Prev");
-        let cursor = cursor.as_btree_mut();
-        match cursor.prev_row() {
-            CursorStep::Row => false,
-            CursorStep::Empty => true,
-            CursorStep::Error(err) => return Err(err),
-            CursorStep::IO(io) => {
-                return Ok(state.suspend_on_io(io));
+        if let Cursor::MaterializedView(mv_cursor) = cursor {
+            !return_if_io!(state, mv_cursor.prev())
+        } else {
+            match cursor.as_btree_mut().prev_row() {
+                CursorStep::Row => false,
+                CursorStep::Empty => true,
+                CursorStep::Error(err) => return Err(err),
+                CursorStep::IO(io) => {
+                    return Ok(state.suspend_on_io(io));
+                }
             }
         }
     };
@@ -3893,6 +3944,7 @@ pub fn halt(
                 .swap(0, Ordering::AcqRel);
             if deferred_violations > 0 {
                 vtab_rollback_all(&program.connection)?;
+                program.connection.auto_commit.store(true, Ordering::SeqCst);
                 if let Some(mv_store) = mv_store.as_ref() {
                     if let Some(tx_id) = program.connection.get_mv_tx_id() {
                         mv_store.rollback_tx(tx_id, pager.clone(), &program.connection, MAIN_DB_ID);
@@ -4030,6 +4082,7 @@ pub(crate) fn index_method_stage_statement_all(state: &mut ProgramState) -> IORe
     return stage_statement_all_cold(state);
 
     #[inline(never)]
+    #[recursive::recursive]
     fn stage_statement_all_cold(state: &mut ProgramState) -> IOResultOr<()> {
         while state.index_method_finalize_cursor < state.cursors.len() {
             let cursor_id = state.index_method_finalize_cursor;
@@ -4095,6 +4148,7 @@ pub(crate) fn index_method_stage_statement_all(state: &mut ProgramState) -> IORe
 /// Discard statement-owned index-method work before a statement savepoint or
 /// transaction is rolled back. Hooks are deliberately infallible and may not
 /// perform I/O.
+#[recursive::recursive]
 pub(crate) fn index_method_abort_statement_all(state: &mut ProgramState) {
     for (cursor_id, cursor_opt) in state.cursors.iter_mut().enumerate() {
         let Some(Cursor::IndexMethod(cursor)) = cursor_opt else {
@@ -4138,10 +4192,14 @@ pub(crate) fn index_method_on_transaction_committed_all(
         subprograms = state.subprogram_stmt_cache.len(),
         "publishing committed index-method state"
     );
-    if !has_index_method_work(state) {
-        connection.index_methods_on_transaction_committed();
-        return;
+    if has_index_method_work(state) {
+        publish_committed_index_method_state(state);
     }
+    connection.index_methods_on_transaction_committed();
+}
+
+#[recursive::recursive]
+fn publish_committed_index_method_state(state: &mut ProgramState) {
     for (cursor_id, cursor_opt) in state.cursors.iter_mut().enumerate() {
         let Some(Cursor::IndexMethod(cursor)) = cursor_opt else {
             continue;
@@ -4163,7 +4221,6 @@ pub(crate) fn index_method_on_transaction_committed_all(
     for statement in state.subprogram_stmt_cache.values_mut() {
         statement.commit_index_methods();
     }
-    connection.index_methods_on_transaction_committed();
 }
 
 /// Transfer the final prepared cursor for every attachment touched by this
@@ -4182,6 +4239,7 @@ pub(crate) fn index_method_register_transaction_all(
 }
 
 #[inline(never)]
+#[recursive::recursive]
 fn register_index_method_transactions(
     state: &mut ProgramState,
     connection: &Connection,
@@ -5247,9 +5305,10 @@ pub fn op_auto_commit(
 
     // Drive any multi-step commit/rollback that's already in progress.
     // This handles main DB commits (Committing), attached DB commits
-    // (CommittingAttached), MVCC commits (CommittingMvcc), and attached
-    // MVCC commits (CommittingAttachedMvcc) that yielded on IO and need re-entry.
-    if !matches!(state.commit_state, CommitState::Ready) {
+    // (CommittingAttached), MVCC commits (CommittingMvcc), attached
+    // MVCC commits (CommittingAttachedMvcc), and the view-delta merge that
+    // precedes all of them, any of which may have yielded on IO.
+    if state.commit_in_flight() {
         let res = program.commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback);
         let res = state.done_or_suspend(res);
         // Only clear after a final, successful non-rollback COMMIT.
@@ -5332,6 +5391,12 @@ pub fn op_auto_commit(
                 conn.rollback_attached_wal_txns();
                 conn.rollback_temp_schema();
                 conn.index_methods_on_transaction_rolled_back();
+                // Drop any uncommitted IVM deltas. They reference table state that
+                // is now rolled back; merging them at the next commit would corrupt
+                // the matview btree.
+                conn.view_transaction_states.clear();
+                // Same reason: these events describe writes this rollback undid.
+                conn.clear_staged_change_events();
                 conn.set_tx_state(TransactionState::None);
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 conn.set_cdc_transaction_id(-1);
@@ -5364,20 +5429,34 @@ pub fn op_auto_commit(
             }
         }
     } else {
-        return match &tx_op {
-            TxOp::Begin => Err(LimboError::TxError(
+        // Non-MVCC commit continuation: tx_state may still be Write even though
+        // auto_commit was already flipped to true by an earlier async-IO yield.
+        let mvcc_tx_active = conn.get_mv_tx().is_some();
+        let non_mvcc_tx_active = !matches!(conn.get_tx_state(), TransactionState::None);
+        if !mvcc_tx_active {
+            let is_commit_continuation = matches!(tx_op, TxOp::Commit) && non_mvcc_tx_active;
+            if !is_commit_continuation {
+                return match &tx_op {
+                    TxOp::Begin => Err(LimboError::TxError(
+                        "cannot start a transaction within a transaction".to_string(),
+                    )
+                    .into()),
+                    TxOp::Commit => Err(LimboError::TxError(
+                        "cannot commit - no transaction is active".to_string(),
+                    )
+                    .into()),
+                    TxOp::Rollback => Err(LimboError::TxError(
+                        "cannot rollback - no transaction is active".to_string(),
+                    )
+                    .into()),
+                };
+            }
+        } else if matches!(tx_op, TxOp::Begin) {
+            return Err(LimboError::TxError(
                 "cannot start a transaction within a transaction".to_string(),
             )
-            .into()),
-            TxOp::Commit => Err(LimboError::TxError(
-                "cannot commit - no transaction is active".to_string(),
-            )
-            .into()),
-            TxOp::Rollback => Err(LimboError::TxError(
-                "cannot rollback - no transaction is active".to_string(),
-            )
-            .into()),
-        };
+            .into());
+        }
     }
 
     turso_debug_assert!(
@@ -5545,6 +5624,7 @@ pub fn op_savepoint(
                         main_schema_snapshot,
                         temp_schema_snapshot,
                         staged_schema_snapshot,
+                        view_tx_state_snapshot: conn.view_transaction_states.snapshot_lengths(),
                     };
                     // Mirror onto attached/temp pagers. If any pager fails
                     // mid-flight, earlier ones already opened a savepoint
@@ -5669,6 +5749,12 @@ pub fn op_savepoint(
             // consistent across tables / indexes / sequences without any
             // I/O.
             if let Some(info) = frame_info {
+                // Staged incremental-view deltas belong to the pages that were
+                // just rolled back: a matview read in an open transaction is
+                // its btree merged with them, so deltas surviving the rollback
+                // would report rows the rollback removed.
+                conn.view_transaction_states
+                    .rollback_to(&info.view_tx_state_snapshot);
                 *conn.schema.write() = info.main_schema_snapshot;
                 if let Some(temp_db) = conn.temp.database.read().as_ref() {
                     match info.temp_schema_snapshot {
@@ -5883,6 +5969,7 @@ pub fn op_change_count(
 
 /// Execute a subprogram (Program opcode).
 /// Used for both triggers and FK actions (CASCADE, SET NULL, etc.)
+#[recursive::recursive]
 pub fn op_program(
     program: &Program,
     state: &mut ProgramState,
@@ -6346,13 +6433,7 @@ pub fn op_seek_rowid(
         // Handle MaterializedView cursor
         let (pc, did_seek) = match cursor {
             Cursor::MaterializedView(mv_cursor) => {
-                let rowid = match state.registers[*src_reg].get_value() {
-                    Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
-                    Value::Null => None,
-                    _ => None,
-                };
-
-                match rowid {
+                match seek_rowid_key(state.registers[*src_reg].get_value()) {
                     Some(rowid) => {
                         let seek_result = return_if_io!(
                             state,
@@ -6371,26 +6452,7 @@ pub fn op_seek_rowid(
             }
             Cursor::BTree(..) | Cursor::Dyn(..) => {
                 let btree_cursor = cursor.as_btree_mut();
-                let rowid = match state.registers[*src_reg].get_value() {
-                    Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
-                    Value::Null => None,
-                    // For non-integer values try to apply affinity and convert them to integer.
-                    other => {
-                        let mut temp_reg = Register::Value(other.clone());
-                        let converted = apply_affinity_char(&mut temp_reg, Affinity::Numeric);
-                        if converted {
-                            match temp_reg.get_value() {
-                                Value::Numeric(Numeric::Integer(i)) => Some(*i),
-                                Value::Numeric(Numeric::Float(f)) => Some(f64::from(*f) as i64),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        }
-                    }
-                };
-
-                match rowid {
+                match seek_rowid_key(state.registers[*src_reg].get_value()) {
                     Some(rowid) => {
                         let seek_result = return_if_io!(
                             state,
@@ -6418,6 +6480,24 @@ pub fn op_seek_rowid(
     }
     state.pc = pc;
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn seek_rowid_key(key: &Value) -> Option<i64> {
+    match key {
+        Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
+        Value::Null => None,
+        other => {
+            let mut temp_reg = Register::Value(other.clone());
+            if !apply_affinity_char(&mut temp_reg, Affinity::Numeric) {
+                return None;
+            }
+            match temp_reg.get_value() {
+                Value::Numeric(Numeric::Integer(i)) => Some(*i),
+                Value::Numeric(Numeric::Float(f)) => Some(f64::from(*f) as i64),
+                _ => None,
+            }
+        }
+    }
 }
 
 pub fn op_deferred_seek(
@@ -6763,8 +6843,12 @@ pub fn seek_internal(
                 OpSeekState::Seek { key, op } => {
                     let seek_result = match key {
                         OpSeekKey::TableRowId(rowid) => {
-                            let cursor = get_cursor!(state, cursor_id).as_btree_mut();
-                            match cursor.seek(SeekKey::TableRowId(*rowid), *op)? {
+                            let key = SeekKey::TableRowId(*rowid);
+                            let seek_result = match get_cursor!(state, cursor_id) {
+                                Cursor::MaterializedView(mv_cursor) => mv_cursor.seek(key, *op)?,
+                                cursor => cursor.as_btree_mut().seek(key, *op)?,
+                            };
+                            match seek_result {
                                 IOResult::Done(seek_result) => seek_result,
                                 IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
                             }
@@ -6872,6 +6956,17 @@ pub fn seek_internal(
                 }
                 OpSeekState::MoveLast => {
                     let cursor = state.get_cursor(cursor_id);
+                    if let Cursor::MaterializedView(mv_cursor) = cursor {
+                        match mv_cursor.last()? {
+                            IOResult::Done(()) => {}
+                            IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
+                        }
+                        return Ok(if mv_cursor.is_valid()? {
+                            SeekInternalResult::Found
+                        } else {
+                            SeekInternalResult::NotFound
+                        });
+                    }
                     let cursor = cursor.as_btree_mut();
                     match cursor.last()? {
                         IOResult::Done(()) => {}
@@ -12491,11 +12586,12 @@ pub fn op_insert(
                 };
                 state.active_op_state.insert().has_dependent_views = has_dependent_views;
                 // If there are no dependent views, we don't need to capture the old record.
-                // We also don't need to do it if the rowid of the UPDATEd row was changed, because
-                // op_delete already captured the deletion for IVM, and this insert only needs to
-                // record the new row (which ApplyViewChange handles without old_record).
-                let needs_capture =
-                    has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                // We also don't need to do it when a preceding op_delete already captured the
+                // old row for IVM (UPDATE that moves a rowid, REPLACE that overwrites one);
+                // this insert only needs to record the new row.
+                let needs_capture = has_dependent_views
+                    && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE)
+                    && !flag.has(InsertFlags::OLD_ROW_ALREADY_DELETED);
 
                 if flag.has(InsertFlags::REQUIRE_SEEK) {
                     state.active_op_state.insert().sub_state = OpInsertSubState::Seek;
@@ -12532,8 +12628,9 @@ pub fn op_insert(
                     return Ok(state.suspend_on_io(io));
                 }
                 let has_dependent_views = state.active_op_state.insert().has_dependent_views;
-                let needs_capture =
-                    has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                let needs_capture = has_dependent_views
+                    && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE)
+                    && !flag.has(InsertFlags::OLD_ROW_ALREADY_DELETED);
                 if needs_capture {
                     state.active_op_state.insert().sub_state = OpInsertSubState::CaptureRecord;
                 } else {
@@ -12769,13 +12866,15 @@ pub fn op_insert(
                     (key, new_values)
                 };
 
-                if let Some((key, values)) = state.active_op_state.insert().old_record.take() {
+                if let Some((old_key, old_values)) =
+                    state.active_op_state.insert().old_record.take()
+                {
                     for view_name in dependent_views.iter() {
                         let tx_state = program
                             .connection
                             .view_transaction_states
                             .get_or_create(view_name);
-                        tx_state.delete(table_name, key, values.to_vec());
+                        tx_state.delete(table_name, old_key, old_values.clone());
                     }
                 }
                 for view_name in dependent_views.iter() {
@@ -12870,8 +12969,23 @@ pub fn op_delete(
                     if let Some(record) = maybe_record {
                         let mut values = record.get_values_owned()?;
 
-                        // Fix rowid alias columns: replace Null with actual rowid value
-                        if let Some(table) = schema.get_table(table_name) {
+                        // A materialized view's btree row is its output row plus
+                        // a trailing multiset weight (see `Circuit::commit`'s
+                        // UpdateView state). Dependents consume this view's rows
+                        // in output shape — that is what the commit-time cascade
+                        // hands them — so the weight must not travel with the
+                        // retraction, or the retraction keys on a row no
+                        // insertion will ever match.
+                        if let Some(view) = schema.get_materialized_view(table_name) {
+                            let num_columns = view.lock().column_schema.flat_columns()?.len();
+                            turso_assert!(
+                                values.len() == num_columns + 1,
+                                "matview btree row is its columns plus a weight",
+                                { "table_name": table_name, "len": values.len(), "num_columns": num_columns }
+                            );
+                            values.truncate(num_columns);
+                        } else if let Some(table) = schema.get_table(table_name) {
+                            // Fix rowid alias columns: replace Null with actual rowid value
                             for (i, col) in table.columns().iter().enumerate() {
                                 if col.is_rowid_alias() && i < values.len() {
                                     values[i] = Value::from_i64(key);
@@ -13887,6 +14001,33 @@ pub fn op_open_write(
                         )),
                         &program.connection,
                     )
+                }
+                CursorType::MaterializedView(_, view_mutex) => {
+                    // ORDER BY views own an index btree; plain matviews own a
+                    // table btree. The cursor type must match the underlying
+                    // page format.
+                    let view_guard = view_mutex.lock();
+                    if !view_guard.order_by.is_empty() {
+                        let index_info = view_guard.order_by.to_index_info();
+                        btree_cursor_with_yield_context(
+                            Box::new(BTreeCursor::new_index_with_index_info(
+                                pager,
+                                maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
+                                index_info,
+                                num_columns,
+                            )),
+                            &program.connection,
+                        )
+                    } else {
+                        btree_cursor_with_yield_context(
+                            Box::new(BTreeCursor::new_table(
+                                pager,
+                                maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
+                                num_columns,
+                            )),
+                            &program.connection,
+                        )
+                    }
                 }
                 _ => btree_cursor_with_yield_context(
                     Box::new(BTreeCursor::new_table(
@@ -15183,6 +15324,7 @@ pub struct OpParseSchemaInner {
     dbsp_state_index_roots: crate::HashMap<String, i64>,
     materialized_view_info: crate::HashMap<String, (String, i64)>,
     trigger_target_database_id: Option<usize>,
+    deferred_foreign_tables: Vec<(String, String)>,
     db: usize,
     previous_auto_commit: bool,
 }
@@ -15296,6 +15438,7 @@ pub fn op_parse_schema(
         dbsp_state_index_roots: Default::default(),
         materialized_view_info: Default::default(),
         trigger_target_database_id: *trigger_target_database_id,
+        deferred_foreign_tables: Vec::new(),
         db: *db,
         previous_auto_commit,
     }));
@@ -15352,6 +15495,7 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                     &mut inner.materialized_view_info,
                     &attached_resolver,
                     conn.dialect().as_ref(),
+                    &mut inner.deferred_foreign_tables,
                 )?;
                 if ty == "trigger" {
                     if let Some(target_database_id) = inner.trigger_target_database_id {
@@ -15371,6 +15515,7 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                     dbsp_state_index_roots,
                     materialized_view_info,
                     trigger_target_database_id: _,
+                    deferred_foreign_tables,
                     db,
                     previous_auto_commit,
                 } = *state
@@ -15382,12 +15527,20 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                 let mv_store = stmt.mv_store();
                 let syms = conn.syms.read();
 
+                let known_matview_names: rustc_hash::FxHashSet<String> = materialized_view_info
+                    .keys()
+                    .map(|n| crate::util::normalize_ident(n))
+                    .collect();
                 let res1 = schema.populate_indices(
                     &syms,
                     from_sql_indexes,
                     automatic_indices,
                     mv_store.is_some(),
+                    &known_matview_names,
                 );
+                for (name, sql) in deferred_foreign_tables {
+                    schema.populate_foreign_table(&name, &sql, &syms)?;
+                }
                 let res2 = schema.populate_materialized_views(
                     materialized_view_info,
                     dbsp_state_roots,
@@ -15670,13 +15823,187 @@ fn drive_init_cdc_version(
     }
 }
 
+/// How a view's mirrors are being brought in line with their foreign sources.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MirrorSyncMode<'a> {
+    /// Discard and refill. The view is rebuilt from scratch alongside, so the
+    /// DML's deltas are redundant and are dropped.
+    Rebuild,
+    /// Touch only what differs. The DML's deltas ARE the maintenance — nothing
+    /// else updates the view — so they must survive to commit. The scope rides
+    /// along here rather than beside the mode because a rebuild has none: it
+    /// reads the source whole by construction.
+    Sweep(&'a RefreshScope),
+}
+
+/// Bring every not-yet-synced FDW mirror of `view_name` in line with its
+/// foreign source.
+///
+/// The inner statements run nested for the same reason
+/// `IncrementalView::populate_from_table` does: they must join the enclosing
+/// statement's transaction rather than commit its dirty pages. Running nested
+/// is also what permits DML on an internal table at all (`allow_user_dml`).
+/// The counter is balanced on every exit, I/O yields included.
+fn sync_fdw_mirrors(
+    conn: &Arc<Connection>,
+    state: &mut ProgramState,
+    view_name: &str,
+    mode: MirrorSyncMode<'_>,
+) -> Result<IOResult<()>> {
+    conn.start_nested();
+    let result = sync_fdw_mirrors_inner(conn, state, view_name, mode);
+    conn.end_nested();
+    result
+}
+
+/// Prepare one statement of a mirror sync.
+///
+/// The statement subtransaction is suppressed because the enclosing statement
+/// already owns one, and the subjournal that backs it admits a single owner —
+/// a nested writer asking for its own gets `Busy`. Inside an explicit
+/// transaction the parent is always a writer, so this is the only case that
+/// reaches the contention. The parent's savepoint covers these writes, which
+/// is what makes suppressing it correct rather than merely quiet.
+fn prepare_mirror_stmt(conn: &Arc<Connection>, sql: &str) -> Result<Box<Statement>> {
+    let stmt = conn.prepare(sql)?;
+    stmt.program
+        .prepared
+        .needs_stmt_subtransactions
+        .store(false, Ordering::Relaxed);
+    Ok(Box::new(stmt))
+}
+
+fn sync_fdw_mirrors_inner(
+    conn: &Arc<Connection>,
+    state: &mut ProgramState,
+    view_name: &str,
+    mode: MirrorSyncMode<'_>,
+) -> Result<IOResult<()>> {
+    // (mirror, the statements that sync it, how to read its constraint
+    // failures), in the view's own fixed order so re-entry after a yield walks
+    // the same sequence.
+    let mirror_work: Vec<(
+        String,
+        Vec<String>,
+        crate::incremental::fdw_mirror::MirrorSync,
+    )> = {
+        let schema = conn.schema.read();
+        match schema.get_materialized_view(view_name) {
+            None => Vec::new(),
+            Some(view) => view
+                .lock()
+                .mirror_syncs()
+                .iter()
+                .map(|sync| {
+                    let sql = match mode {
+                        MirrorSyncMode::Rebuild => sync.rebuild_sql(),
+                        MirrorSyncMode::Sweep(scope) => sync.sweep_sql(scope),
+                    };
+                    (sync.mirror_table.clone(), sql, sync.clone())
+                })
+                .collect(),
+        }
+    };
+    if mirror_work.is_empty() {
+        return Ok(IOResult::Done(()));
+    }
+
+    for (mirror, sql, sync) in mirror_work {
+        if state.fdw_mirror_sync.done.contains(&mirror) {
+            continue;
+        }
+        // The opcode restarts at its first mirror after every yield, so the
+        // first unsynced mirror it reaches is always the one it left in flight.
+        let (mut phase, mut stmt) = match state.fdw_mirror_sync.in_flight.take() {
+            Some((in_flight_mirror, phase, stmt)) => {
+                turso_assert!(
+                    in_flight_mirror == mirror,
+                    "in-flight mirror {in_flight_mirror} is not the first unsynced one ({mirror})"
+                );
+                (phase, stmt)
+            }
+            None => (0, prepare_mirror_stmt(conn, &sql[0])?),
+        };
+        loop {
+            // Every constraint on a mirror is on its identity, so a violation
+            // here is always the source's fault. Reporting the internal table's
+            // name instead would name something the user never wrote.
+            let step = stmt.step().map_err(|err| sync.identity_violation(err))?;
+            match step {
+                // Only the sweep's guard emits a row, and only to refuse the
+                // scan; every other sync statement is DML.
+                StepResult::Row => {
+                    let row = stmt.row().expect("a Row step carries a row");
+                    return Err(sync.guard_refusal(row.get::<&str>(0)?));
+                }
+                StepResult::Done => {
+                    phase += 1;
+                    match sql.get(phase) {
+                        Some(next) => stmt = prepare_mirror_stmt(conn, next)?,
+                        None => {
+                            state.fdw_mirror_sync.done.insert(mirror);
+                            break;
+                        }
+                    }
+                }
+                StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                    state.fdw_mirror_sync.in_flight = Some((mirror, phase, stmt));
+                    return Ok(IOResult::IO(crate::types::IOCompletions(
+                        crate::io::Completion::new_yield(),
+                    )));
+                }
+                StepResult::Interrupt | StepResult::Busy => {
+                    state.fdw_mirror_sync.in_flight = Some((mirror, phase, stmt));
+                    return Err(LimboError::Busy);
+                }
+            }
+        }
+    }
+
+    // The divergence between the two modes, and the only place it exists.
+    if matches!(mode, MirrorSyncMode::Rebuild) {
+        // A rebuild is initial state, not a change: `populate_from_table` is
+        // about to read these same rows and build the view from scratch.
+        // Applying the rebuild's deltas at commit as well would count every row
+        // twice. A sweep must never reach here — its deltas are the whole
+        // mechanism, and dropping them would leave the view frozen.
+        //
+        // Marking rather than dropping keeps `ROLLBACK TO` able to undo it.
+        // Reaching this with anything staged needs a view that already existed
+        // when the staging DML ran, which a rebuild — only ever emitted by
+        // CREATE — cannot have; the mark is shared with the REFRESH rebuild in
+        // `op_populate_materialized_views`, where that is reachable.
+        conn.view_transaction_states.mark_absorbed(view_name);
+    }
+    Ok(IOResult::Done(()))
+}
+
+/// Sync a view's mirrors incrementally, leaving the resulting deltas to update
+/// the view at commit. This is `REFRESH MATERIALIZED VIEW` for a view whose
+/// sources are all mirrored.
+pub fn op_sync_fdw_mirrors(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(SyncFdwMirrors { view_name, scope }, insn);
+    let conn = program.connection.clone();
+    return_if_io!(
+        state,
+        sync_fdw_mirrors(&conn, state, view_name, MirrorSyncMode::Sweep(scope))
+    );
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_populate_materialized_views(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(PopulateMaterializedViews { cursors }, insn);
+    load_insn!(PopulateMaterializedViews { cursors, cascade }, insn);
 
     let conn = program.connection.clone();
 
@@ -15710,6 +16037,14 @@ pub fn op_populate_materialized_views(
 
     // Now populate the views (after releasing the schema borrow)
     for (view_name, _root_page, cursor_id) in view_info {
+        // A view's mirrors are filled before the view reads its sources, so a
+        // mirror is a faithful record of the foreign rows the view was built
+        // from and later syncs have something to diff against.
+        return_if_io!(
+            state,
+            sync_fdw_mirrors(&conn, state, &view_name, MirrorSyncMode::Rebuild)
+        );
+
         let schema = conn.schema.read();
         if let Some(view) = schema.get_materialized_view(&view_name) {
             let mut view = view.lock();
@@ -15741,8 +16076,54 @@ pub fn op_populate_materialized_views(
                 }
             };
 
+            // Start a population, unless one is already in flight — an I/O
+            // re-entry lands mid-state and resetting would discard its progress.
+            if !view.population_in_flight() {
+                view.reset_for_repopulate();
+                // A population reads its sources on this connection, so inside a
+                // transaction it folds every row staged for this view into the
+                // rows it writes. Leaving those deltas queued would apply them a
+                // second time at commit and count each row twice. Only this
+                // view's are marked; a sibling view over the same tables still
+                // needs its own. (`sync_fdw_mirrors` marks the same for a
+                // mirror-fed rebuild.)
+                conn.view_transaction_states.mark_absorbed(&view_name);
+            }
             // Now populate it with the cursor for writing
-            return_if_io!(state, view.populate_from_table(&conn, pager, btree_cursor));
+            return_if_io!(
+                state,
+                view.populate_from_table(&conn, pager, btree_cursor, *cascade)
+            );
+
+            // Hand the rebuild to the views defined over this one. Their input
+            // for this statement is now the clear loop's retraction of every row
+            // this view held, followed by these insertions — the two halves of
+            // one delta, staged into the same per-table delta under the same
+            // view name and keyed the same way, so an unchanged row cancels.
+            if *cascade == crate::incremental::view::PopulateCascade::ToDependents {
+                let rebuilt = view.take_populate_output();
+                drop(view);
+                let dependents = conn
+                    .schema
+                    .read()
+                    .get_dependent_materialized_views(&view_name);
+                for dep_view_name in dependents {
+                    let dep_tx_state = conn.view_transaction_states.get_or_create(&dep_view_name);
+                    for (row, weight) in rebuilt.changes.iter() {
+                        // One insertion per row, matching the clear loop's one
+                        // retraction per btree row: the stored multiset weight
+                        // is a property of the row, not a repeat count, on
+                        // either side. A negative net would mean the rebuild
+                        // retracted something the clear did not.
+                        turso_assert!(
+                            *weight > 0,
+                            "a rebuild from cleared state can only insert",
+                            { "view_name": view_name, "weight": *weight }
+                        );
+                        dep_tx_state.insert(&view_name, row.rowid, row.values.clone());
+                    }
+                }
+            }
         }
     }
 
@@ -16577,10 +16958,31 @@ pub fn op_count(
         insn
     );
 
-    let count = {
-        let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Count");
-        let cursor = cursor.as_btree_mut();
-        return_if_io!(state, cursor.count())
+    // Materialized-view cursors must NOT use the underlying btree's
+    // fast-count: that bypasses both LIMIT enforcement and the in-tx
+    // uncommitted-overlay merge. Walk the cursor instead so COUNT(*)
+    // matches what `SELECT *` would emit.
+    let count: usize = {
+        let cursor = state.get_cursor(*cursor_id);
+        if let Cursor::MaterializedView(mv_cursor) = cursor {
+            return_if_io!(state, mv_cursor.rewind());
+            let mut n: usize = 0;
+            if mv_cursor.is_valid()? {
+                n += 1;
+                loop {
+                    let advanced = return_if_io!(state, mv_cursor.next());
+                    if !advanced {
+                        break;
+                    }
+                    n += 1;
+                }
+            }
+            n
+        } else {
+            let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Count");
+            let cursor = cursor.as_btree_mut();
+            return_if_io!(state, cursor.count())
+        }
     };
 
     state.registers[*target_reg].set_int(count as i64);
@@ -17880,24 +18282,9 @@ pub fn op_hash_build(
     // Get the rowid from the cursor
     if op_state.rowid.is_none() {
         let cursor = state.get_cursor(data.cursor_id);
-        let rowid_val = match cursor {
-            Cursor::BTree(..) | Cursor::Dyn(..) => {
-                let btree_cursor = cursor.as_btree_mut();
-                let rowid_opt = match btree_cursor.rowid() {
-                    Ok(IOResult::Done(v)) => v,
-                    Ok(IOResult::IO(io)) => {
-                        *state.active_op_state.hash_build() = Some(op_state);
-                        return Ok(state.suspend_on_io(io));
-                    }
-                    Err(e) => {
-                        *state.active_op_state.hash_build() = Some(op_state);
-                        return Err(e);
-                    }
-                };
-                rowid_opt.ok_or_else(|| {
-                    LimboError::InternalError("HashBuild: cursor has no rowid".to_string())
-                })?
-            }
+        let rowid_result = match cursor {
+            Cursor::BTree(..) | Cursor::Dyn(..) => cursor.as_btree_mut().rowid(),
+            Cursor::MaterializedView(mv_cursor) => mv_cursor.rowid(),
             _ => {
                 return Err(LimboError::InternalError(
                     "HashBuild: unsupported cursor type".to_string(),
@@ -17905,6 +18292,20 @@ pub fn op_hash_build(
                 .into());
             }
         };
+        let rowid_opt = match rowid_result {
+            Ok(IOResult::Done(v)) => v,
+            Ok(IOResult::IO(io)) => {
+                *state.active_op_state.hash_build() = Some(op_state);
+                return Ok(state.suspend_on_io(io));
+            }
+            Err(e) => {
+                *state.active_op_state.hash_build() = Some(op_state);
+                return Err(e);
+            }
+        };
+        let rowid_val = rowid_opt.ok_or_else(|| {
+            LimboError::InternalError("HashBuild: cursor has no rowid".to_string())
+        })?;
         op_state.rowid = Some(rowid_val);
     }
 
@@ -19789,6 +20190,111 @@ fn maybe_transform_root_page_to_positive(mvcc_store: Option<&Arc<MvStore>>, root
     } else {
         root_page
     }
+}
+
+/// Notify registered change callbacks about a CDC change.
+/// This fires callbacks for table changes when CDC is enabled.
+///
+/// NOTE: Callbacks fire BEFORE the transaction commits. Changes may still be rolled back.
+/// If your use case requires guaranteed committed data, consider using a post-commit hook
+/// or polling the CDC table directly.
+pub fn op_notify_cdc_change(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    if program.connection.has_change_callbacks() {
+        stage_cdc_change_event(program, state, insn);
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+fn stage_cdc_change_event(program: &Program, state: &ProgramState, insn: &Insn) {
+    let Insn::NotifyCdcChange {
+        database_id,
+        table_name_reg,
+        change_type,
+        rowid_reg,
+        before_record_reg,
+        after_record_reg,
+    } = insn
+    else {
+        unreachable!()
+    };
+
+    let table_name = match &state.registers[*table_name_reg].get_value() {
+        Value::Text(t) => t.as_str().to_string(),
+        other => unreachable!(
+            "NotifyCdcChange: table_name_reg must contain Text, got {:?}",
+            other
+        ),
+    };
+
+    let rowid = match &state.registers[*rowid_reg].get_value() {
+        Value::Numeric(Numeric::Integer(i)) => *i,
+        other => unreachable!(
+            "NotifyCdcChange: rowid_reg must contain Integer, got {:?}",
+            other
+        ),
+    };
+
+    let column_names = program.connection.with_schema(*database_id, |schema| {
+        let table = schema.get_table(&table_name).unwrap_or_else(|| {
+            panic!("NotifyCdcChange: table '{table_name}' is not in database {database_id}")
+        });
+        table
+            .columns()
+            .iter()
+            .filter_map(|col| col.name.clone())
+            .collect::<Vec<String>>()
+    });
+    let relation_name = if *database_id == MAIN_DB_ID {
+        table_name
+    } else {
+        let database_name = program
+            .connection
+            .get_database_name_by_index(*database_id)
+            .unwrap_or_else(|| panic!("NotifyCdcChange: no database with id {database_id}"));
+        format!("{database_name}.{table_name}")
+    };
+
+    let record_in = |reg: usize| {
+        if reg == 0 {
+            return None;
+        }
+        match state.registers[reg].get_value() {
+            Value::Blob(b) => Some(b.clone()),
+            _ => None,
+        }
+    };
+    let bin_record = record_in(*after_record_reg)
+        .or_else(|| record_in(*before_record_reg))
+        .unwrap_or_default();
+
+    let change = match change_type {
+        1 => crate::types::DatabaseChangeType::Insert { bin_record },
+        0 => crate::types::DatabaseChangeType::Update { bin_record },
+        -1 => crate::types::DatabaseChangeType::Delete { bin_record },
+        other => unreachable!("NotifyCdcChange: invalid change_type {}", other),
+    };
+
+    // Stage rather than fire: the row is not committed yet, and its event has to
+    // join the rest of this commit's fan-out. `commit_txn` announces the batch.
+    program
+        .connection
+        .stage_change_event(crate::types::RelationChangeEvent::staged(
+            relation_name.clone(),
+            column_names,
+            vec![crate::types::DatabaseChange {
+                change_id: 0,
+                change_time: 0,
+                change,
+                table_name: relation_name,
+                id: rowid,
+            }],
+        ));
 }
 
 #[cfg(test)]

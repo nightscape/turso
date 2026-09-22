@@ -137,13 +137,13 @@ pub fn translate_create_index(
         }
         crate::bail_parse_error!("index {} already exists", original_idx_name.name.as_str());
     }
+    if resolver.with_schema(database_id, |s| {
+        s.get_view(&tbl_name).is_some() || s.is_materialized_view(&tbl_name)
+    }) {
+        crate::bail_parse_error!("views may not be indexed");
+    }
     let table = resolver.with_schema(database_id, |s| s.get_table(&tbl_name));
     let Some(table) = table else {
-        if resolver.with_schema(database_id, |s| {
-            s.get_view(&tbl_name).is_some() || s.is_materialized_view(&tbl_name)
-        }) {
-            crate::bail_parse_error!("views may not be indexed");
-        }
         // The index's target table always lives in the index's own database,
         // so SQLite qualifies the missing table with that database name.
         let db_name = resolver
@@ -276,6 +276,7 @@ pub fn translate_create_index(
         &tbl_name,
         root_page_reg,
         Some(sql),
+        database_id,
     )?;
 
     emit_refill_index(
@@ -1345,6 +1346,7 @@ pub fn translate_drop_index(
             None,
             None,
             SQLITE_TABLEID,
+            database_id,
         )?;
     }
 

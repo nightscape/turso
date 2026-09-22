@@ -542,6 +542,7 @@ impl Plan {
 
     /// Returns true if this plan or any of its subplans read from the given table.
     /// (Not for Delete/Update plans)
+    #[recursive::recursive]
     fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
         match self {
             Plan::Select(select_plan) => select_plan.reads_table(database_id, table_name),
@@ -634,6 +635,18 @@ pub enum QueryDestination {
     RowSet {
         /// The register that holds the RowSet object.
         rowset_reg: usize,
+    },
+    /// The results of a recursive CTE are stored in both a result table and a queue table.
+    /// Used during recursive CTE execution for both base case and recursive step.
+    RecursiveCte {
+        /// The cursor ID of the result table (stores all results for final output and deduplication).
+        result_cursor: CursorID,
+        /// The cursor ID of the queue table (stores rows to be processed in the next iteration).
+        queue_cursor: CursorID,
+        /// The number of columns in the CTE.
+        num_cols: usize,
+        /// Whether this is UNION ALL (no deduplication) or UNION (with deduplication).
+        is_union_all: bool,
     },
     /// Decision made at some point after query plan construction.
     Unset,
@@ -2816,16 +2829,9 @@ impl JoinedTable {
                         },
                     ))
                 } else {
-                    // Check if this is a materialized view
-                    let cursor_type =
-                        if let Some(view_mutex) = schema.get_materialized_view(&btree.name) {
-                            CursorType::MaterializedView(btree.clone(), view_mutex)
-                        } else {
-                            CursorType::BTreeTable(btree.clone())
-                        };
                     Some(program.alloc_cursor_id_keyed_if_not_exists(
                         CursorKey::table(self.internal_id),
-                        cursor_type,
+                        read_cursor_type(btree, schema),
                     ))
                 };
 
@@ -2982,6 +2988,13 @@ impl JoinedTable {
 
     pub fn column_is_used(&self, index: usize) -> bool {
         self.col_used_mask.get(index)
+    }
+}
+
+pub(crate) fn read_cursor_type(btree: &Arc<BTreeTable>, schema: &Schema) -> CursorType {
+    match schema.get_materialized_view(&btree.name) {
+        Some(view_mutex) => CursorType::MaterializedView(btree.clone(), view_mutex),
+        None => CursorType::BTreeTable(btree.clone()),
     }
 }
 
@@ -3184,13 +3197,13 @@ pub enum Scan {
         /// The index that we are using to scan the table, if any.
         index: Option<Arc<Index>>,
     },
-    /// A scan of a virtual table, delegated to the table’s `filter` and related methods.
+    /// A scan of a virtual table, delegated to the table's `filter` and related methods.
     VirtualTable {
         /// Index identifier returned by the table's `best_index` method.
         idx_num: i32,
-        /// Optional index name returned by the table’s `best_index` method.
+        /// Optional index name returned by the table's `best_index` method.
         idx_str: Option<String>,
-        /// Constraining expressions to be passed to the table’s `filter` method.
+        /// Constraining expressions to be passed to the table's `filter` method.
         /// The order of expressions matches the argument order expected by the virtual table.
         constraints: Vec<Expr>,
     },
@@ -3761,6 +3774,7 @@ impl NonFromClauseSubquery {
 }
 
 /// Determine the earliest evaluation point for a nested plan by walking all SELECT components.
+#[recursive::recursive]
 fn eval_at_for_plan(
     plan: &Plan,
     join_order: &[JoinOrderMember],
@@ -3800,6 +3814,7 @@ fn eval_at_for_plan(
 }
 
 /// Returns true if a plan (including compound SELECTs) references outer-scope tables.
+#[recursive::recursive]
 pub fn plan_is_correlated(plan: &Plan) -> bool {
     match plan {
         Plan::Select(select_plan) => select_plan.is_correlated(),
@@ -3866,6 +3881,7 @@ fn select_plan_has_outer_scope_dependency_with_tables(
     has_outer_scope_dependency
 }
 
+#[recursive::recursive]
 fn plan_has_outer_scope_dependency_with_tables(
     plan: &Plan,
     accessible_table_ids: &mut Vec<TableInternalId>,

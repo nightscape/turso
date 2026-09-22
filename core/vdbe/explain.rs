@@ -2044,14 +2044,28 @@ pub fn insn_to_row(
                 0,
                 where_clause.clone().unwrap_or_else(|| "NULL".to_string()),
             ),
-            Insn::PopulateMaterializedViews { cursors } => (
+            Insn::PopulateMaterializedViews { cursors, cascade } => (
                 "PopulateMaterializedViews",
                 0,
                 0,
                 0,
                 Value::Null,
                 cursors.len() as i64,
-                "".to_string(),
+                format!("{cascade:?}"),
+            ),
+            Insn::SyncFdwMirrors { view_name, scope } => (
+                "SyncFdwMirrors",
+                0,
+                0,
+                0,
+                Value::build_text(view_name.clone()),
+                0,
+                match scope {
+                    turso_parser::ast::RefreshScope::Full => view_name.clone(),
+                    turso_parser::ast::RefreshScope::Scoped(predicate) => {
+                        format!("{view_name} WHERE {predicate}")
+                    }
+                },
             ),
             Insn::Prev {
                 cursor_id,
@@ -2738,15 +2752,31 @@ pub fn insn_to_row(
             0,
             format!("db={db}"),
         ),
-        Insn::InitCdcVersion { cdc_table_name, version, cdc_mode } => (
-            "InitCdcVersion",
+        Insn::NotifyCdcChange {
+            database_id,
+            table_name_reg,
+            change_type,
+            rowid_reg,
+            before_record_reg,
+            after_record_reg,
+        } => (
+            "NotifyCdcChange",
+            *table_name_reg as i64,
+            *change_type as i64,
+            *rowid_reg as i64,
+            Value::build_text(format!("before={before_record_reg} after={after_record_reg}")),
             0,
-            0,
-            0,
-            Value::build_text(format!("{cdc_table_name}={version}")),
-            0,
-            format!("ensure turso_cdc_version({cdc_table_name}, {version}); set cdc={cdc_mode}"),
+            format!("db={database_id}"),
         ),
+        Insn::InitCdcVersion { cdc_table_name, version, cdc_mode } => (
+    "InitCdcVersion",
+    0,
+    0,
+    0,
+    Value::build_text(format!("{cdc_table_name}={version}")),
+    0,
+    format!("ensure turso_cdc_version({cdc_table_name}, {version}); set cdc={cdc_mode}"),
+    ),
     }
 }
 

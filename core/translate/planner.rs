@@ -62,11 +62,14 @@ struct CteDefinition {
     references_itself: bool,
 }
 
-fn collect_cte_definitions(with: With, program: &mut ProgramBuilder) -> Result<Vec<CteDefinition>> {
+fn collect_cte_definitions(
+    mut with: With,
+    program: &mut ProgramBuilder,
+) -> Result<Vec<CteDefinition>> {
     let mut definitions = Vec::with_capacity(with.ctes.len());
     let mut referenced_table_names_by_cte = Vec::with_capacity(with.ctes.len());
 
-    for cte in with.ctes {
+    for cte in std::mem::take(&mut with.ctes) {
         let name = normalize_ident(cte.tbl_name.as_str());
         if definitions
             .iter()
@@ -111,6 +114,7 @@ fn collect_cte_definitions(with: With, program: &mut ProgramBuilder) -> Result<V
 
 /// Collect all table names referenced in a SELECT's FROM clause.
 /// Used to determine which earlier CTEs a CTE directly depends on.
+#[recursive::recursive]
 fn collect_from_clause_table_refs(select: &Select, out: &mut Vec<String>) {
     collect_from_select_body(&select.body, out);
     collect_subquery_table_refs_in_select_exprs(select, out);
@@ -181,6 +185,7 @@ impl RecursiveRefCounter<'_> {
         }
     }
 
+    #[recursive::recursive]
     fn count_select(&self, select: &Select, scope: &mut RecursiveRefScope) -> usize {
         let scope_base = scope.len();
         self.push_nested_ctes(select.with.as_ref(), scope);
@@ -250,6 +255,7 @@ impl RecursiveRefCounter<'_> {
         }
     }
 
+    #[recursive::recursive]
     fn count_from_table(&self, table: &ast::SelectTable, scope: &mut RecursiveRefScope) -> usize {
         match table {
             ast::SelectTable::Table(name, _, _) => {
@@ -326,6 +332,7 @@ impl RecursiveRefCounter<'_> {
     /// recursive CTE body: direct references to the recursive table in the
     /// arm's FROM clause, and all references reachable from the arm.
     fn count_arm(&self, one: &ast::OneSelect, scope: &mut RecursiveRefScope) -> (usize, usize) {
+        #[recursive::recursive]
         fn count_direct_in_from_table(
             counter: &RecursiveRefCounter,
             table: &ast::SelectTable,
@@ -374,6 +381,7 @@ impl RecursiveRefCounter<'_> {
     }
 }
 
+#[recursive::recursive]
 fn collect_from_select_table(table: &ast::SelectTable, out: &mut Vec<String>) {
     match table {
         ast::SelectTable::Table(qualified_name, _, _) => {
@@ -1986,10 +1994,11 @@ fn parse_table(
             table_references.find_cte_outer_query_ref_by_identifier(&normalized_qualified_name)
         {
             if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
+                let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
                 table_references.add_joined_table(JoinedTable {
                     op: Operation::default_scan_for(&outer_ref.table),
                     table: outer_ref.table.clone(),
-                    identifier: outer_ref.identifier.clone(),
+                    identifier: alias.unwrap_or_else(|| outer_ref.identifier.clone()),
                     internal_id: program.table_reference_counter.next(),
                     join_info: None,
                     col_used_mask: ColumnUsedMask::default(),
@@ -2004,22 +2013,35 @@ fn parse_table(
         }
     }
 
-    // Check if this is an incompatible view
-    let is_incompatible = resolver.with_schema(database_id, |schema| {
+    // Check if this view failed to load
+    let load_failure = resolver.with_schema(database_id, |schema| {
         schema
             .incompatible_views
-            .contains(&normalized_qualified_name)
+            .get(&normalized_qualified_name)
+            .cloned()
     });
 
-    if is_incompatible {
-        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
-        crate::bail_parse_error!(
-            "Materialized view '{}' has an incompatible version. \n\
-             The view was created with a different DBSP version than the current version ({}). \n\
-             Please DROP and recreate the view to use it.",
-            normalized_qualified_name,
-            DBSP_CIRCUIT_VERSION
-        );
+    match load_failure {
+        Some(crate::schema::IncompatibleViewReason::VersionMismatch) => {
+            use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
+            crate::bail_parse_error!(
+                "Materialized view '{}' has an incompatible version. \n\
+                 The view was created with a different DBSP version than the current version ({}). \n\
+                 Please DROP and recreate the view to use it.",
+                normalized_qualified_name,
+                DBSP_CIRCUIT_VERSION
+            );
+        }
+        Some(crate::schema::IncompatibleViewReason::CompileFailure(cause)) => {
+            crate::bail_parse_error!(
+                "Materialized view '{}' could not be loaded: {} \n\
+                 Its definition no longer matches the schema. \
+                 Use DROP VIEW to remove it, then recreate it.",
+                normalized_qualified_name,
+                cause
+            );
+        }
+        None => {}
     }
 
     // A view row whose stored SQL failed to parse at schema load

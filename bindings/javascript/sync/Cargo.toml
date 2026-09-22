@@ -19,8 +19,7 @@ turso_sync_engine = { workspace = true }
 turso_core = { workspace = true, features = ["fts"] }
 turso_node = { workspace = true }
 genawaiter = { version = "0.99.1", default-features = false }
-tracing-subscriber = { workspace = true }
-tracing.workspace = true
+workspace-hack = { version = "0.1", path = "../../../workspace-hack" }
 
 [build-dependencies]
 napi-build = "2.3.1"

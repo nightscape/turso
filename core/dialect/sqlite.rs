@@ -183,6 +183,7 @@ fn pragma_vtabs() -> Vec<Arc<VirtualTable>> {
                 vtab_id: 0,
                 is_droppable: false,
                 innocuous: true,
+                foreign: None,
             })
         })
         .collect()

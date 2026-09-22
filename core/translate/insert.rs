@@ -241,12 +241,12 @@ pub fn translate_insert(
     // path which goes through translate_select and handles CTEs properly.
     // We also keep a copy for RETURNING clause subqueries.
     let with_for_returning = with.clone();
-    if let Some(insert_with) = with {
+    if let Some(mut insert_with) = with {
         if let InsertBody::Select(select, _) = &mut body {
             match &mut select.with {
                 Some(select_with) => {
                     // Prepend INSERT's CTEs to SELECT's CTEs
-                    let mut merged = insert_with.ctes;
+                    let mut merged = std::mem::take(&mut insert_with.ctes);
                     merged.append(&mut select_with.ctes);
                     select_with.ctes = merged;
                     select_with.recursive |= insert_with.recursive;
@@ -969,16 +969,17 @@ pub fn translate_insert(
 
     // For REPLACE (statement-level or constraint-level), we need to force a seek on the
     // insert, as we may have already deleted the conflicting row and the cursor is not
-    // guaranteed to be positioned.
+    // guaranteed to be positioned. That delete already recorded the old row for
+    // materialized view maintenance, so this insert must not record it a second time.
     if matches!(ctx.on_conflict, ResolveType::Replace) || has_ddl_replace {
-        insert_flags = insert_flags.require_seek();
+        insert_flags = insert_flags.require_seek().old_row_already_deleted();
     }
     program.emit_insn(Insn::Insert {
         cursor: ctx.cursor_id,
         key_reg: insertion.key_register(),
         record_reg: insertion.record_register(),
         flag: insert_flags,
-        table_name: table_name.to_string(),
+        table_name: normalize_ident(table_name.as_str()),
     });
 
     // Fire AFTER INSERT triggers
@@ -1133,6 +1134,7 @@ pub fn translate_insert(
             after_record_reg,
             None,
             table_name.as_str(),
+            database_id,
         )?;
     }
 
@@ -3934,6 +3936,7 @@ fn emit_replace_delete_conflicting_row(
             None,
             None,
             table_name,
+            ctx.database_id,
         )?;
     }
     program.emit_insn(Insn::Delete {

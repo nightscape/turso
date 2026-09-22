@@ -19,9 +19,9 @@ use tracing_subscriber::{
 };
 use turso_core::{
     storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
-    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, OpenOptions,
-    PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation, QueryMode,
-    SqliteDialect, Statement, StepResult, IO,
+    DatabaseStorage, DeterministicScalarFn, EncryptionKey, IOResult, LimboError, OpenDbAsyncState,
+    OpenFlags, OpenOptions, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId,
+    PageLocation, QueryMode, SqliteDialect, Statement, StepResult, IO,
 };
 
 use crate::{
@@ -66,6 +66,8 @@ impl Drop for SyncBusyGuard {
 }
 
 pub use turso_core::types::FromValue;
+pub use turso_core::types::{DatabaseChange, DatabaseChangeType, RelationChangeEvent};
+pub use turso_core::CallbackId;
 pub use turso_ext::{
     AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarFunction,
     StepFunction, Value as ExtensionValue, ValueDestructor,
@@ -150,6 +152,13 @@ impl TursoSetupConfig {
 }
 
 #[derive(Clone)]
+pub struct DeterministicScalarFunction {
+    pub name: String,
+    pub arg_count: usize,
+    pub func: DeterministicScalarFn,
+}
+
+#[derive(Clone)]
 pub struct TursoDatabaseConfig {
     /// path to the database file or ":memory:" for in-memory connection
     pub path: String,
@@ -185,6 +194,9 @@ pub struct TursoDatabaseConfig {
 
     /// database open flags
     pub open_flags: OpenFlags,
+
+    /// deterministic Rust scalar functions registered on the database before its schema loads
+    pub scalar_functions: Vec<DeterministicScalarFunction>,
 }
 
 #[derive(Clone)]
@@ -561,6 +573,7 @@ impl TursoDatabaseConfig {
                 None
             },
             open_flags,
+            scalar_functions: Vec::new(),
         })
     }
 }
@@ -1036,6 +1049,13 @@ impl TursoDatabase {
                         .db_opts(opts)
                         .encryption(self.config.encryption.clone())
                         .page_codec(self.config.page_codec.clone());
+                    let options =
+                        self.config
+                            .scalar_functions
+                            .iter()
+                            .fold(options, |options, f| {
+                                options.deterministic_scalar_function(&f.name, f.arg_count, f.func)
+                            });
                     match Database::open_async(
                         &mut state.open_db_state,
                         io.clone(),
@@ -1300,9 +1320,36 @@ impl TursoConnection {
 
     #[cfg(not(target_family = "wasm"))]
     pub fn load_extension(&self, path: &str) -> Result<(), TursoError> {
-        turso_core::resolve_ext_path(path)
-            .and_then(|path| self.connection.load_extension(path))
-            .map_err(TursoError::from)
+        // `Connection::load_extension` (and the underlying dynamic-loading
+        // machinery) is `cfg(not(target_family = "wasm"))` in turso_core —
+        // wasm has no dlopen. Mirror that gate here so sdk-kit compiles on
+        // wasm32 and fails loudly at runtime instead of failing to build.
+        #[cfg(not(target_family = "wasm"))]
+        {
+            turso_core::resolve_ext_path(path)
+                .and_then(|path| self.connection.load_extension(path))
+                .map_err(TursoError::from)
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            let _ = path;
+            Err(TursoError::Misuse(
+                "load_extension is not supported on wasm targets".to_string(),
+            ))
+        }
+    }
+
+    /// Register a foreign data wrapper as a virtual table in this connection's schema.
+    ///
+    /// See [`turso_core::Connection::register_foreign_table`] for details.
+    pub fn register_foreign_table(
+        &self,
+        name: &str,
+        fdw: std::sync::Arc<dyn turso_core::foreign::ForeignDataWrapper>,
+    ) -> Result<(), TursoError> {
+        self.connection
+            .register_foreign_table(name, fdw)
+            .map_err(|e| TursoError::Error(e.to_string()))
     }
 
     /// prepares single SQL statement
@@ -1446,6 +1493,44 @@ impl TursoConnection {
             pager.io.wait_for_completion(c)?;
         }
         Ok(())
+    }
+
+    /// Register a callback for changes to any relation (tables or materialized views).
+    /// The callback fires when changes are committed or when CDC records are written.
+    /// Returns a callback ID that can be used to unregister.
+    ///
+    /// The callback receives a RelationChangeEvent containing:
+    /// - relation_name: The name of the table or view
+    /// - columns: Column names in order
+    /// - changes: The actual row changes (inserts, updates, deletes)
+    pub fn set_change_callback<F>(&self, callback: F) -> turso_core::CallbackId
+    where
+        F: Fn(&turso_core::types::RelationChangeEvent) + Send + Sync + 'static,
+    {
+        self.connection.set_change_callback(callback)
+    }
+
+    /// Register a callback filtered to specific relations.
+    /// The callback only fires for changes to the specified tables/views.
+    pub fn set_change_callback_for<F>(
+        &self,
+        relations: &[&str],
+        callback: F,
+    ) -> turso_core::CallbackId
+    where
+        F: Fn(&turso_core::types::RelationChangeEvent) + Send + Sync + 'static,
+    {
+        self.connection.set_change_callback_for(relations, callback)
+    }
+
+    /// Remove a specific change callback by ID
+    pub fn clear_change_callback(&self, id: turso_core::CallbackId) {
+        self.connection.clear_change_callback(id);
+    }
+
+    /// Clear all change callbacks
+    pub fn clear_all_change_callbacks(&self) {
+        self.connection.clear_all_change_callbacks();
     }
 
     /// helper method to get C raw container to the TursoConnection instance
@@ -1866,6 +1951,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         }
     }
 
@@ -2036,6 +2122,7 @@ mod tests {
             db_file: None,
             page_codec: Some(codec),
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2134,6 +2221,7 @@ mod tests {
                 reserved_bytes: 1,
             })),
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
 
         let error = db.open().unwrap_err();
@@ -2162,6 +2250,7 @@ mod tests {
                 db_file: None,
                 page_codec: None,
                 open_flags: OpenFlags::default(),
+                scalar_functions: Vec::new(),
             });
             let result = db.open().unwrap();
             assert!(!result.is_io());
@@ -2225,6 +2314,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2247,6 +2337,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2279,6 +2370,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2304,6 +2396,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2356,6 +2449,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2417,6 +2511,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2451,6 +2546,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2482,6 +2578,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2509,6 +2606,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2537,6 +2635,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2589,6 +2688,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2679,6 +2779,7 @@ mod tests {
                     db_file: None,
                     page_codec: None,
                     open_flags: OpenFlags::default(),
+                    scalar_functions: Vec::new(),
                 });
                 let result = db.open().unwrap();
                 assert!(!result.is_io());
@@ -2721,6 +2822,7 @@ mod tests {
                     db_file: None,
                     page_codec: None,
                     open_flags: OpenFlags::default(),
+                    scalar_functions: Vec::new(),
                 });
                 let result = db.open().unwrap();
                 assert!(!result.is_io());
@@ -2749,6 +2851,7 @@ mod tests {
                     db_file: None,
                     page_codec: None,
                     open_flags: OpenFlags::default(),
+                    scalar_functions: Vec::new(),
                 });
                 assert!(db.open().is_err(), "Opening with wrong key should fail");
             }
@@ -2765,6 +2868,7 @@ mod tests {
                     db_file: None,
                     page_codec: None,
                     open_flags: OpenFlags::default(),
+                    scalar_functions: Vec::new(),
                 });
                 let result = db.open();
                 println!("result: {result:?}");
@@ -2802,6 +2906,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let _ = db_a.open().unwrap();
         let conn_a = db_a.connect().unwrap();
@@ -2841,6 +2946,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let _ = db_a2.open().unwrap();
         let conn_a2 = db_a2.connect().unwrap();
@@ -2877,6 +2983,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2913,6 +3020,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());

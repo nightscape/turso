@@ -1045,14 +1045,141 @@ expect error {
     duplicate WITH table name
 }
 
-# @skip-if sqlite "sqlite supports recursive CTEs"
-# test cte-recursive-unsupported {
-#     WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x<5) SELECT * FROM cnt;
-# }
-# expect error {
-#     Recursive CTEs are not yet supported
-# }
-#
+# =============================================================================
+# Recursive CTE: the query wrapping the CTE
+# =============================================================================
+
+test cte-recursive-star {
+    WITH RECURSIVE s(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM s WHERE a<5) SELECT * FROM s;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
+test cte-recursive-projection-alias {
+    WITH RECURSIVE s(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM s WHERE a<5) SELECT a*10 AS ten FROM s;
+}
+expect {
+    10
+    20
+    30
+    40
+    50
+}
+
+test cte-recursive-where {
+    WITH RECURSIVE s(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM s WHERE a<5) SELECT a FROM s WHERE a>3;
+}
+expect {
+    4
+    5
+}
+
+test cte-recursive-limit {
+    WITH RECURSIVE s(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM s WHERE a<5) SELECT a FROM s LIMIT 2;
+}
+expect {
+    1
+    2
+}
+
+test cte-recursive-order-desc {
+    WITH RECURSIVE s(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM s WHERE a<5) SELECT a FROM s ORDER BY a DESC;
+}
+expect {
+    5
+    4
+    3
+    2
+    1
+}
+
+test cte-recursive-count {
+    WITH RECURSIVE s(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM s WHERE a<5) SELECT COUNT(*) FROM s;
+}
+expect {
+    5
+}
+
+test cte-recursive-aggregates {
+    WITH RECURSIVE s(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM s WHERE a<5) SELECT sum(a), max(a) FROM s;
+}
+expect {
+    15|5
+}
+
+test cte-recursive-group-by {
+    WITH RECURSIVE s(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM s WHERE a<5) SELECT a%2 AS p, COUNT(*) FROM s GROUP BY p ORDER BY p;
+}
+expect {
+    0|2
+    1|3
+}
+
+test cte-recursive-group-by-having {
+    WITH RECURSIVE s(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM s WHERE a<5) SELECT a%2 AS p, COUNT(*) AS c FROM s GROUP BY p HAVING c>2 ORDER BY p;
+}
+expect {
+    1|3
+}
+
+test cte-recursive-alias-qualified {
+    WITH RECURSIVE s(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM s WHERE a<5) SELECT a FROM s AS t WHERE t.a>3;
+}
+expect {
+    4
+    5
+}
+
+test cte-recursive-column-swap {
+    WITH RECURSIVE s(a,b) AS (SELECT 1,2 UNION ALL SELECT a+1,b+1 FROM s WHERE a<3) SELECT b,a FROM s ORDER BY a DESC;
+}
+expect {
+    4|3
+    3|2
+    2|1
+}
+
+test cte-recursive-in-subquery {
+    WITH RECURSIVE s(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM s WHERE a<5) SELECT * FROM (SELECT a FROM s) WHERE a>3;
+}
+expect {
+    4
+    5
+}
+
+setup cte_recursive_join_table {
+    CREATE TABLE t(a INT);
+    INSERT INTO t VALUES(2),(4);
+}
+
+@setup cte_recursive_join_table
+test cte-recursive-join-table {
+    WITH RECURSIVE s(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM s WHERE a<5) SELECT s.a, t.a FROM s JOIN t ON s.a = t.a;
+}
+expect {
+    2|2
+    4|4
+}
+
+test cte-recursive-unreferenced {
+    WITH RECURSIVE s(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM s WHERE a<5) SELECT 1;
+}
+expect {
+    1
+}
+
+test cte-recursive-unknown-column {
+    WITH RECURSIVE s(a) AS (SELECT 1 UNION ALL SELECT a+1 FROM s WHERE a<5) SELECT b FROM s;
+}
+expect error {
+    no such column: b
+}
+
 # @skip-if sqlite "sqlite supports materialized CTEs"
 # test cte-materialized-unsupported {
 #     WITH t AS MATERIALIZED (SELECT 1) SELECT * FROM t;

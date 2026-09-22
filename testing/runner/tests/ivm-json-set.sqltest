@@ -1,0 +1,132 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@requires materialized_views "requires materialized view support"
+
+# IVM matview propagation for json_set() in UPDATE
+#
+# When UPDATE uses json_set() to modify a JSON column, IVM should deliver the
+# NEW (post-json_set) value, not the OLD value. This tests the DBSP delta
+# capture path for SQL function expressions in SET clauses.
+#
+# Reported by holon PKMS: state toggle clicks had no effect because IVM
+# delivered stale properties JSON to CDC subscribers.
+
+test json-set-update-propagates-to-matview {
+    CREATE TABLE t (id TEXT PRIMARY KEY, props TEXT NOT NULL DEFAULT '{}');
+    INSERT INTO t VALUES ('a', '{"state":"TODO","seq":1}');
+    CREATE MATERIALIZED VIEW mv AS SELECT id, props FROM t;
+    UPDATE t SET props = json_set(props, '$.state', 'DOING') WHERE id = 'a';
+    SELECT json_extract(props, '$.state') FROM mv WHERE id = 'a';
+}
+expect {
+    DOING
+}
+
+test json-set-preserves-other-fields {
+    CREATE TABLE t2 (id TEXT PRIMARY KEY, props TEXT NOT NULL DEFAULT '{}');
+    INSERT INTO t2 VALUES ('x', '{"state":"TODO","priority":3,"tags":"work"}');
+    CREATE MATERIALIZED VIEW mv2 AS SELECT id, props FROM t2;
+    UPDATE t2 SET props = json_set(props, '$.state', 'DONE') WHERE id = 'x';
+    SELECT json_extract(props, '$.state'), json_extract(props, '$.priority') FROM mv2 WHERE id = 'x';
+}
+expect {
+    DONE|3
+}
+
+test json-set-select-star-matview {
+    CREATE TABLE t3 (id TEXT PRIMARY KEY, content TEXT, props TEXT NOT NULL DEFAULT '{}');
+    INSERT INTO t3 VALUES ('b1', 'hello', '{"task_state":"TODO"}');
+    INSERT INTO t3 VALUES ('b2', 'world', '{"task_state":""}');
+    CREATE MATERIALIZED VIEW mv3 AS SELECT * FROM t3;
+    UPDATE t3 SET props = json_set(props, '$.task_state', 'DOING') WHERE id = 'b1';
+    SELECT json_extract(props, '$.task_state') FROM mv3 WHERE id = 'b1';
+}
+expect {
+    DOING
+}
+
+test json-set-multiple-sequential-updates {
+    CREATE TABLE t4 (id TEXT PRIMARY KEY, props TEXT NOT NULL DEFAULT '{}');
+    INSERT INTO t4 VALUES ('c', '{"state":""}');
+    CREATE MATERIALIZED VIEW mv4 AS SELECT id, props FROM t4;
+    UPDATE t4 SET props = json_set(props, '$.state', 'TODO') WHERE id = 'c';
+    SELECT json_extract(props, '$.state') FROM mv4 WHERE id = 'c';
+    UPDATE t4 SET props = json_set(props, '$.state', 'DOING') WHERE id = 'c';
+    SELECT json_extract(props, '$.state') FROM mv4 WHERE id = 'c';
+    UPDATE t4 SET props = json_set(props, '$.state', 'DONE') WHERE id = 'c';
+    SELECT json_extract(props, '$.state') FROM mv4 WHERE id = 'c';
+}
+expect {
+    TODO
+    DOING
+    DONE
+}
+
+test json-remove-propagates {
+    CREATE TABLE t5 (id TEXT PRIMARY KEY, props TEXT NOT NULL DEFAULT '{}');
+    INSERT INTO t5 VALUES ('d', '{"state":"TODO","extra":"val"}');
+    CREATE MATERIALIZED VIEW mv5 AS SELECT id, props FROM t5;
+    UPDATE t5 SET props = json_remove(props, '$.extra') WHERE id = 'd';
+    SELECT COALESCE(json_extract(props, '$.extra'), 'REMOVED') FROM mv5 WHERE id = 'd';
+}
+expect {
+    REMOVED
+}
+
+test json-set-recursive-cte-matview {
+    CREATE TABLE block (id TEXT PRIMARY KEY, parent_id TEXT, props TEXT NOT NULL DEFAULT '{}');
+    INSERT INTO block VALUES ('root', NULL, '{}');
+    INSERT INTO block VALUES ('child1', 'root', '{"task_state":"TODO"}');
+    INSERT INTO block VALUES ('child2', 'root', '{"task_state":""}');
+    INSERT INTO block VALUES ('grandchild1', 'child1', '{"task_state":"DOING"}');
+    CREATE MATERIALIZED VIEW mv_tree AS
+        WITH RECURSIVE tree AS (
+            SELECT id, parent_id, props, 0 AS depth
+            FROM block WHERE id = 'root'
+            UNION ALL
+            SELECT b.id, b.parent_id, b.props, tree.depth + 1
+            FROM tree JOIN block b ON b.parent_id = tree.id
+            WHERE tree.depth < 10
+        )
+        SELECT id, parent_id, props FROM tree;
+    UPDATE block SET props = json_set(props, '$.task_state', 'DOING') WHERE id = 'child1';
+    SELECT json_extract(props, '$.task_state') FROM mv_tree WHERE id = 'child1';
+}
+expect {
+    DOING
+}
+
+test json-set-recursive-cte-sequential {
+    CREATE TABLE blk (id TEXT PRIMARY KEY, parent_id TEXT, props TEXT NOT NULL DEFAULT '{}');
+    INSERT INTO blk VALUES ('root', NULL, '{}');
+    INSERT INTO blk VALUES ('c1', 'root', '{"task_state":"TODO"}');
+    CREATE MATERIALIZED VIEW mv_seq AS
+        WITH RECURSIVE tree AS (
+            SELECT id, parent_id, props, 0 AS depth
+            FROM blk WHERE id = 'root'
+            UNION ALL
+            SELECT b.id, b.parent_id, b.props, tree.depth + 1
+            FROM tree JOIN blk b ON b.parent_id = tree.id
+            WHERE tree.depth < 10
+        )
+        SELECT id, parent_id, props FROM tree;
+    UPDATE blk SET props = json_set(props, '$.task_state', 'DOING') WHERE id = 'c1';
+    SELECT json_extract(props, '$.task_state') FROM mv_seq WHERE id = 'c1';
+    UPDATE blk SET props = json_set(props, '$.task_state', 'DONE') WHERE id = 'c1';
+    SELECT json_extract(props, '$.task_state') FROM mv_seq WHERE id = 'c1';
+}
+expect {
+    DOING
+    DONE
+}
+
+test full-json-replacement-works {
+    CREATE TABLE t6 (id TEXT PRIMARY KEY, props TEXT NOT NULL DEFAULT '{}');
+    INSERT INTO t6 VALUES ('e', '{"state":"TODO","seq":1}');
+    CREATE MATERIALIZED VIEW mv6 AS SELECT id, props FROM t6;
+    UPDATE t6 SET props = '{"state":"DOING","seq":1}' WHERE id = 'e';
+    SELECT json_extract(props, '$.state') FROM mv6 WHERE id = 'e';
+}
+expect {
+    DOING
+}

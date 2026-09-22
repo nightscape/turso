@@ -1,0 +1,50 @@
+@database :memory:
+
+# integrity_check falsely reports CHECK failure for NULL values
+# NULL BETWEEN x AND y evaluates to NULL (not false) per SQL semantics
+# Found by differential fuzzer: seed 42 with --file-io --large-batch-probability 0.3
+
+test integrity-check-null-in-check-column {
+    CREATE TABLE t (
+        pk TEXT PRIMARY KEY,
+        a TEXT,
+        b REAL NOT NULL,
+        c REAL UNIQUE CHECK (c BETWEEN 0.0 AND 1000.0)
+    );
+    INSERT OR REPLACE INTO t VALUES (NULL, NULL, 9.5e17, NULL);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test integrity-check-null-in-check-column-expr {
+    CREATE TABLE t2 (
+        id INTEGER PRIMARY KEY,
+        val REAL CHECK (val > 0)
+    );
+    INSERT INTO t2 VALUES (1, NULL);
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test integrity-check-null-in-check-column-complex {
+    CREATE TABLE t3 (
+        pk TEXT PRIMARY KEY,
+        a TEXT,
+        b REAL NOT NULL,
+        c REAL UNIQUE CHECK (c BETWEEN 0.0 AND 1000.0)
+    );
+    INSERT OR REPLACE INTO t3 VALUES (
+        CAST(NULL AS TEXT) || NULLIF(NULL, NULL),
+        TIME('invalid'),
+        CAST(957874433681340459 AS REAL),
+        NULLIF(NULL, -5261596182813960028)
+    );
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}

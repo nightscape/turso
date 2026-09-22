@@ -30,6 +30,7 @@ use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::iter::{FusedIterator, Peekable};
 use std::ops::Deref;
+use std::sync::atomic::AtomicU64;
 use std::task::{Poll, Waker};
 
 /// SQLite by default uses 2000 as maximum numbers in a row.
@@ -3629,6 +3630,7 @@ impl Cursor {
             Self::BTree(cursor, ..) => cursor.set_null_flag(flag),
             Self::Dyn(cursor, ..) => cursor.set_null_flag(flag),
             Self::Virtual(cursor) => cursor.set_null_flag(flag),
+            Self::MaterializedView(cursor) => cursor.set_null_flag(flag),
             // A pseudo cursor always decodes columns from its content
             // register. SQLite's OP_NullRow likewise leaves pseudo-cursor
             // column reads untouched: nullRow is the steady state for pseudo
@@ -3873,7 +3875,7 @@ impl<'a> SeekKey<'a> {
 
 #[derive(Debug)]
 pub enum DatabaseChangeType {
-    Delete,
+    Delete { bin_record: Vec<u8> },
     Update { bin_record: std::vec::Vec<u8> },
     Insert { bin_record: std::vec::Vec<u8> },
 }
@@ -3886,6 +3888,113 @@ pub struct DatabaseChange {
     pub table_name: String,
     pub id: i64,
 }
+
+impl DatabaseChange {
+    /// Parse the binary record data into a vector of owned values, one per column.
+    /// Insert, Update and Delete all carry a row image and parse the same way.
+    pub fn parse_record(&self) -> Result<Vec<Value>> {
+        match &self.change {
+            DatabaseChangeType::Insert { bin_record }
+            | DatabaseChangeType::Update { bin_record }
+            | DatabaseChangeType::Delete { bin_record } => {
+                let record = ImmutableRecord::from_bin_record(bin_record.clone());
+                record.get_values_owned()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CallbackId(u64);
+
+impl Default for CallbackId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CallbackId {
+    pub fn new() -> Self {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        Self(COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+/// Event data for materialized view and base table change callbacks.
+/// Provides both the changes and the schema metadata needed to interpret them.
+///
+/// # Timing Behavior
+///
+/// Callbacks fire AFTER the transaction has committed. The rows in `changes`
+/// are committed state, and a transaction that rolls back or fails to commit
+/// delivers no events at all — there is no retraction event and no "tentative"
+/// flag.
+///
+/// # Commit envelope
+///
+/// One commit can change several relations, so it delivers several events. All
+/// events of one commit share `commit_id`, and `commit_index` / `commit_len`
+/// make the group self-delimiting: a consumer knows the group is complete once
+/// it has seen `commit_len` events for that `commit_id`. A callback registered
+/// with a [`RelationFilter`] sees only the matching subset, so it may receive
+/// fewer than `commit_len` events.
+#[derive(Debug)]
+pub struct RelationChangeEvent {
+    /// Name of the materialized view or table that changed
+    pub relation_name: String,
+    /// Column names in the view/table, in the same order as values in DatabaseChange records
+    pub columns: Vec<String>,
+    /// The actual row changes (inserts, updates, deletes).
+    pub changes: Vec<DatabaseChange>,
+    /// Identity of the commit this event belongs to. All events emitted for one
+    /// commit share this value. Never 0 for a delivered event.
+    pub commit_id: u64,
+    /// This event's position in its commit's fan-out. Always `< commit_len`.
+    pub commit_index: u32,
+    /// Number of events this commit delivers in total.
+    pub commit_len: u32,
+}
+
+impl RelationChangeEvent {
+    /// Build an event that is not yet attached to a commit. The envelope is
+    /// stamped by `Connection::dispatch_staged_change_events` once the commit
+    /// is durable; `commit_id == 0` marks the event as undelivered.
+    pub(crate) fn staged(
+        relation_name: String,
+        columns: Vec<String>,
+        changes: Vec<DatabaseChange>,
+    ) -> Self {
+        Self {
+            relation_name,
+            columns,
+            changes,
+            commit_id: 0,
+            commit_index: 0,
+            commit_len: 0,
+        }
+    }
+
+    /// Identity of the commit this event belongs to.
+    pub fn commit_id(&self) -> u64 {
+        self.commit_id
+    }
+}
+
+/// Hand out the next commit identity. Process-monotonic and never 0, so that
+/// `0` stays reserved for "not attached to a commit".
+pub(crate) fn next_commit_id() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Type alias for a change callback function that receives relation change events.
+pub type ChangeCallbackFn = std::sync::Arc<dyn Fn(&RelationChangeEvent) + Send + Sync>;
+
+/// Type alias for a relation filter (set of relation names to match, or None for all).
+pub type RelationFilter = Option<std::collections::HashSet<String>>;
+
+/// Type alias for a registered change callback entry.
+pub type ChangeCallbackEntry = (CallbackId, RelationFilter, ChangeCallbackFn);
 
 #[derive(Debug)]
 pub struct WalFrameInfo {
@@ -5238,5 +5347,36 @@ mod tests {
         for value in values {
             assert_eq!(value.try_clone().unwrap(), value);
         }
+    }
+
+    fn database_change(change: DatabaseChangeType) -> DatabaseChange {
+        DatabaseChange {
+            change_id: 1,
+            change_time: 0,
+            change,
+            table_name: "t".to_string(),
+            id: 1,
+        }
+    }
+
+    #[test]
+    fn parse_record_reads_the_row_image_of_a_delete() {
+        let values = [Value::from_i64(7), Value::build_text("gone")];
+        let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+        let change = database_change(DatabaseChangeType::Delete {
+            bin_record: record.get_payload().to_vec(),
+        });
+
+        assert_eq!(change.parse_record().unwrap(), values);
+    }
+
+    #[test]
+    fn parse_record_fails_on_a_corrupt_row_image() {
+        // Header claims one 4-byte integer, data section holds nothing.
+        let change = database_change(DatabaseChangeType::Insert {
+            bin_record: vec![0x02, 0x04],
+        });
+
+        assert!(change.parse_record().is_err());
     }
 }

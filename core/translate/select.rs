@@ -3,7 +3,7 @@ use super::plan::{
     select_star, Distinctness, InSeekSource, JoinOrderMember, NamedWindowBound, NamedWindowDef,
     Operation, OuterQueryReference, QueryDestination, Search, TableReferences, Window,
 };
-use crate::schema::Table;
+use crate::schema::{Column, Table};
 use crate::stack::trace_stack;
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
@@ -26,9 +26,8 @@ use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
 use crate::{vdbe::builder::ProgramBuilder, Result};
 use std::borrow::Cow;
-use turso_parser::ast::ResultColumn;
 use turso_parser::ast::SortOrder;
-use turso_parser::ast::{self, CompoundSelect, Expr};
+use turso_parser::ast::{self, CompoundSelect, Expr, ResultColumn};
 
 #[turso_macros::trace_stack]
 pub fn translate_select(
@@ -156,6 +155,8 @@ fn select_plan_first_virtual_table_name(select_plan: &SelectPlan) -> Option<Stri
     None
 }
 
+#[recursive::recursive]
+#[turso_macros::trace_stack]
 pub fn prepare_select_plan(
     select: ast::Select,
     resolver: &Resolver,
@@ -1397,6 +1398,7 @@ fn ordinal(n: usize) -> String {
 }
 
 /// Counts cursors needed to emit a query plan.
+#[recursive::recursive]
 fn count_required_cursors_for_plan(plan: &Plan) -> usize {
     match plan {
         Plan::Select(select_plan) => count_required_cursors_for_simple_select(select_plan),
@@ -1455,6 +1457,7 @@ fn count_required_cursors_for_simple_select(plan: &SelectPlan) -> usize {
 }
 
 /// Estimates bytecode instructions needed to emit a query plan.
+#[recursive::recursive]
 fn estimate_num_instructions_for_plan(plan: &Plan) -> usize {
     match plan {
         Plan::Select(select_plan) => estimate_num_instructions_for_simple_select(select_plan),
@@ -1704,6 +1707,7 @@ fn select_has_non_from_subqueries(
 }
 
 /// Estimates jump labels needed to emit a query plan.
+#[recursive::recursive]
 fn estimate_num_labels_for_plan(plan: &Plan) -> usize {
     match plan {
         Plan::Select(select_plan) => estimate_num_labels_for_simple_select(select_plan),

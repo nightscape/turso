@@ -184,6 +184,7 @@ impl InsertFlags {
     pub const SKIP_LAST_ROWID: u8 = 0x08; // Flag indicating that last_insert_rowid() must not be updated
     pub const SKIP_STATEMENT_CHANGE_COUNT: u8 = 0x10; // Flag indicating that changes() must not count this insert
     pub const SKIP_ALL_CHANGE_COUNTS: u8 = 0x20; // Flag indicating that neither changes() nor total_changes() must count this insert
+    pub const OLD_ROW_ALREADY_DELETED: u8 = 0x40; // Flag indicating that a preceding Insn::Delete removed the row at this rowid and already recorded it for materialized view maintenance
 
     pub fn new() -> Self {
         InsertFlags(0)
@@ -220,6 +221,11 @@ impl InsertFlags {
 
     pub fn skip_all_change_counts(mut self) -> Self {
         self.0 |= InsertFlags::SKIP_ALL_CHANGE_COUNTS;
+        self
+    }
+
+    pub fn old_row_already_deleted(mut self) -> Self {
+        self.0 |= InsertFlags::OLD_ROW_ALREADY_DELETED;
         self
     }
 }
@@ -1695,6 +1701,21 @@ pub enum Insn {
     PopulateMaterializedViews {
         /// Mapping of view name to cursor_id for writing to the view's btree
         cursors: Vec<(String, usize)>,
+        /// Whether the population's output is owed to the views defined over
+        /// the populated one. `REFRESH` retracted their contents on the way in
+        /// and owes them the re-insertions; `CREATE` retracted nothing.
+        cascade: crate::incremental::view::PopulateCascade,
+    },
+
+    /// Sync a materialized view's FDW mirrors incrementally, so the resulting
+    /// deltas maintain the view at commit. Only emitted for a view whose every
+    /// source is mirrored; the view's own btree and DBSP state are left alone.
+    SyncFdwMirrors {
+        /// The view whose mirrors to sync
+        view_name: String,
+        /// How much of the source the syncing scan speaks for, and so which
+        /// mirror rows its silence may retract
+        scope: turso_parser::ast::RefreshScope,
     },
 
     /// Place the result of lhs >> rhs in dest register.
@@ -2128,6 +2149,24 @@ pub enum Insn {
         version: crate::CdcVersion,
         cdc_mode: String,
     },
+
+    /// Notify registered change callbacks about a CDC change.
+    /// This fires callbacks for table changes when CDC is enabled.
+    /// The callbacks receive a RelationChangeEvent with the change details.
+    NotifyCdcChange {
+        /// Database that holds the table.
+        database_id: usize,
+        /// Register containing the table name (as Text)
+        table_name_reg: usize,
+        /// The type of change: 1 = INSERT, 0 = UPDATE, -1 = DELETE
+        change_type: i8,
+        /// Register containing the row ID
+        rowid_reg: usize,
+        /// Register containing the before record (blob), or 0 if none
+        before_record_reg: usize,
+        /// Register containing the after record (blob), or 0 if none
+        after_record_reg: usize,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -2307,6 +2346,7 @@ impl InsnVariants {
             InsnVariants::IsNull => execute::op_is_null,
             InsnVariants::ParseSchema => execute::op_parse_schema,
             InsnVariants::PopulateMaterializedViews => execute::op_populate_materialized_views,
+            InsnVariants::SyncFdwMirrors => execute::op_sync_fdw_mirrors,
             InsnVariants::ShiftRight => execute::op_shift_right,
             InsnVariants::ShiftLeft => execute::op_shift_left,
             InsnVariants::AddImm => execute::op_add_imm,
@@ -2365,6 +2405,7 @@ impl InsnVariants {
             InsnVariants::HashGraceAdvancePartition => execute::op_hash_grace_advance_partition,
             InsnVariants::VacuumInto => execute::op_vacuum_into,
             InsnVariants::Vacuum => execute::op_vacuum,
+            InsnVariants::NotifyCdcChange => execute::op_notify_cdc_change,
             InsnVariants::InitCdcVersion => execute::op_init_cdc_version,
         }
     }
@@ -2388,8 +2429,14 @@ impl Insn {
     /// Returns true if this opcode cannot directly modify persistent database
     /// contents. This is used to compute PreparedProgram::readonly, mirroring
     /// SQLite's sqlite3_stmt_readonly() classification over compiled bytecode.
-    pub fn is_readonly(&self) -> bool {
+    /// Writes through a cursor for which `is_ephemeral` is true go to a temporary
+    /// table, which is not database contents.
+    pub fn is_readonly(&self, is_ephemeral: impl Fn(CursorID) -> bool) -> bool {
         match self {
+            Self::Insert { cursor, .. } => is_ephemeral(*cursor),
+            Self::Delete { cursor_id, .. } | Self::IdxDelete { cursor_id, .. } => {
+                is_ephemeral(*cursor_id)
+            }
             Self::Checkpoint { .. }
             | Self::VCreate { .. }
             | Self::VUpdate { .. }
@@ -2399,9 +2446,6 @@ impl Insn {
                 tx_mode: TransactionMode::Write | TransactionMode::Concurrent,
                 ..
             }
-            | Self::Insert { .. }
-            | Self::Delete { .. }
-            | Self::IdxDelete { .. }
             | Self::OpenWrite { .. }
             | Self::CreateBtree { .. }
             | Self::IndexMethodCreate { .. }
@@ -2425,6 +2469,7 @@ impl Insn {
             | Self::AddType { .. }
             | Self::ParseSchema { .. }
             | Self::PopulateMaterializedViews { .. }
+            | Self::SyncFdwMirrors { .. }
             | Self::SetCookie { .. }
             | Self::RenameTable { .. }
             | Self::DropColumn { .. }

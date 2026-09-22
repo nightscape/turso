@@ -27,6 +27,9 @@ pub struct Remaining {
     pub nextval: u32,
     pub setval: u32,
     pub sequence_info: Vec<(String, i64, i64)>,
+    pub create_matview: u32,
+    pub drop_matview: u32,
+    pub enable_cdc: u32,
 }
 
 impl Remaining {
@@ -54,6 +57,9 @@ impl Remaining {
         let total_nextval = (max_interactions * opts.nextval_weight) / total_weight;
         let total_setval = (max_interactions * opts.setval_weight) / total_weight;
         let total_drop_sequence = (max_interactions * opts.drop_sequence_weight) / total_weight;
+        let total_create_matview = (max_interactions * opts.create_matview_weight) / total_weight;
+        let total_drop_matview = (max_interactions * opts.drop_matview_weight) / total_weight;
+        let total_enable_cdc = (max_interactions * opts.enable_cdc_weight) / total_weight;
 
         let remaining_select = total_select
             .checked_sub(stats.select_count)
@@ -121,6 +127,26 @@ impl Remaining {
             remaining_drop_sequence = 0;
         }
 
+        let remaining_create_matview = total_create_matview
+            .checked_sub(stats.create_matview_count)
+            .unwrap_or_default();
+        let remaining_enable_cdc = total_enable_cdc
+            .checked_sub(stats.enable_cdc_count)
+            .unwrap_or_default();
+
+        // Calculate remaining drop matview from profile weight
+        // We can only drop matviews if more have been created than dropped in this plan
+        let net_matviews_created = stats
+            .create_matview_count
+            .saturating_sub(stats.drop_matview_count);
+        let remaining_drop_matview = if net_matviews_created > 0 {
+            total_drop_matview
+                .checked_sub(stats.drop_matview_count)
+                .unwrap_or_default()
+        } else {
+            0
+        };
+
         Remaining {
             select: remaining_select,
             insert: remaining_insert,
@@ -137,6 +163,9 @@ impl Remaining {
             nextval: remaining_nextval,
             setval: remaining_setval,
             sequence_info,
+            create_matview: remaining_create_matview,
+            drop_matview: remaining_drop_matview,
+            enable_cdc: remaining_enable_cdc,
         }
     }
 }
@@ -160,6 +189,9 @@ pub(crate) struct InteractionStats {
     pub drop_sequence_count: u32,
     pub nextval_count: u32,
     pub setval_count: u32,
+    pub create_matview_count: u32,
+    pub drop_matview_count: u32,
+    pub enable_cdc_count: u32,
 }
 
 impl InteractionStats {
@@ -178,7 +210,7 @@ impl InteractionStats {
             Query::Insert(_) => self.insert_count += 1,
             Query::Delete(_) => self.delete_count += 1,
             Query::Create(_) => self.create_count += 1,
-            Query::Drop(_) => self.drop_count += 1,
+            Query::DropTable(_) => self.drop_count += 1,
             Query::Update(_) => self.update_count += 1,
             Query::CreateIndex(_) => self.create_index_count += 1,
             Query::Begin(_) => self.begin_count += 1,
@@ -195,6 +227,10 @@ impl InteractionStats {
             Query::Setval(_) => self.setval_count += 1,
             Query::Placeholder => {}
             Query::Pragma(_) => self.pragma_count += 1,
+            Query::CreateView(_) => {}
+            Query::CreateMaterializedView(_) => self.create_matview_count += 1,
+            Query::DropView(_) => {}
+            Query::DropMaterializedView(_) => self.drop_matview_count += 1,
         }
     }
 }
@@ -203,7 +239,7 @@ impl Display for InteractionStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Read: {}, Insert: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}, Begin: {}, Commit: {}, Rollback: {}, Alter Table: {}, Drop Index: {}, CreateSeq: {}, DropSeq: {}, Nextval: {}, Setval: {}",
+            "Read: {}, Insert: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}, Begin: {}, Commit: {}, Rollback: {}, Alter Table: {}, Drop Index: {}, CreateSeq: {}, DropSeq: {}, Nextval: {}, Setval: {}, CreateMatview: {}, DropMatview: {}, EnableCDC: {}",
             self.select_count,
             self.insert_count,
             self.delete_count,
@@ -220,6 +256,9 @@ impl Display for InteractionStats {
             self.drop_sequence_count,
             self.nextval_count,
             self.setval_count,
+            self.create_matview_count,
+            self.drop_matview_count,
+            self.enable_cdc_count,
         )
     }
 }

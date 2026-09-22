@@ -49,7 +49,7 @@ use crate::{
     mvcc::{database::CommitStateMachine, MvccClock},
     numeric::Numeric,
     return_if_io,
-    schema::Trigger,
+    schema::{Schema, Trigger},
     state_machine::StateMachine,
     translate::plan::TableReferences,
     types::{IOCompletions, IOResult},
@@ -122,6 +122,20 @@ pub enum ViewDeltaCommitState {
         current_index: usize,
     },
     Done,
+}
+
+/// Progress of a view's FDW mirror sync, which spans the I/O yields of
+/// `Insn::PopulateMaterializedViews` and `Insn::SyncFdwMirrors`.
+///
+/// The opcode restarts from its first mirror on every re-entry, so `done` is
+/// what keeps an already-synced mirror from being written twice.
+#[derive(Default)]
+pub(crate) struct FdwMirrorSyncState {
+    /// Mirrors already synced during this program run.
+    pub(crate) done: std::collections::HashSet<String>,
+    /// The in-flight statement and its index in that mirror's sync sequence,
+    /// preserved across I/O yields.
+    pub(crate) in_flight: Option<(String, usize, Box<Statement>)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -951,6 +965,8 @@ pub struct ProgramState {
     op_vacuum_state: VacuumOpState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
+    /// Progress of the FDW mirror sync, across I/O yields
+    pub(crate) fdw_mirror_sync: FdwMirrorSyncState,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
     /// This is used when statement in auto-commit mode reseted after previous uncomplete execution - in which case we may need to rollback transaction started on previous attempt
     pub(crate) auto_txn_cleanup: TxnCleanup,
@@ -999,6 +1015,16 @@ pub struct ProgramState {
     /// When a statement subtransaction rolls back, the connection's deferred foreign key violations counter
     /// is reset to this value.
     fk_deferred_violations_when_stmt_started: AtomicIsize,
+    /// The connection's main-database schema when the statement started.
+    ///
+    /// DDL mutates the schema in memory (`SetCookie` bumps `schema_version`,
+    /// `ParseSchema` installs the new objects) before the statement can still
+    /// fail — a materialized view populating from a foreign source, say. Rolling
+    /// the statement's pages back to its savepoint restores the on-disk cookie,
+    /// so the in-memory schema must go back with them; otherwise the connection
+    /// carries a version no cookie will ever match and the enclosing `COMMIT`
+    /// publishes it to every other connection.
+    schema_when_stmt_started: Option<Arc<Schema>>,
     /// Number of immediate foreign key violations that occurred during the active statement. If nonzero,
     /// the statement subtransactionwill roll back.
     fk_immediate_violations_during_stmt: AtomicIsize,
@@ -1007,6 +1033,12 @@ pub struct ProgramState {
     pub(crate) is_active_write: bool,
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
     has_stmt_transaction: bool,
+    /// Snapshot of `connection.view_transaction_states` delta lengths captured
+    /// when this statement opened its subtransaction. On RollbackSavepoint, the
+    /// states are truncated back to these lengths so partial IVM deltas from a
+    /// failed UPDATE/INSERT/DELETE don't leak into the matview at commit time.
+    view_tx_state_savepoint:
+        Option<rustc_hash::FxHashMap<String, crate::incremental::view::ViewTxSnapshot>>,
     pub n_change: AtomicI64,
     pub n_total_change: AtomicI64,
     /// The connection's MvStore handle, revalidated with one pointer compare
@@ -1081,8 +1113,10 @@ impl ProgramState {
             distinct_key_values: Vec::new(),
             op_vacuum_state: VacuumOpState::None,
             view_delta_state: ViewDeltaCommitState::NotStarted,
+            fdw_mirror_sync: FdwMirrorSyncState::default(),
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
+            schema_when_stmt_started: None,
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
             rowsets: HashMap::default(),
             spare_agg_payloads: Vec::new(),
@@ -1092,6 +1126,7 @@ impl ProgramState {
             uses_subjournal: false,
             is_active_write: false,
             has_stmt_transaction: false,
+            view_tx_state_savepoint: None,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
             n_total_change: AtomicI64::new(0),
@@ -1239,9 +1274,11 @@ impl ProgramState {
         self.sequence_inner_commit = None;
         self.op_vacuum_state = VacuumOpState::None;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
+        self.fdw_mirror_sync = FdwMirrorSyncState::default();
         self.auto_txn_cleanup = TxnCleanup::None;
         *self.fk_immediate_violations_during_stmt.get_mut() = 0;
         *self.fk_deferred_violations_when_stmt_started.get_mut() = 0;
+        self.schema_when_stmt_started = None;
         if !self.rowsets.is_empty() {
             self.rowsets.clear();
         }
@@ -1282,6 +1319,19 @@ impl ProgramState {
 
     pub(crate) fn record_total_change(&self) {
         bump_change_count(&self.n_total_change);
+    }
+
+    /// Whether an explicit COMMIT/ROLLBACK that already performed its
+    /// autocommit transition is still in flight, so a fresh `op_transaction`
+    /// entry is an I/O re-entry rather than a new statement.
+    ///
+    /// `commit_state` alone does not cover this: `commit_txn` applies view
+    /// deltas first, and that phase can yield I/O while `commit_state` is
+    /// still `Ready`.
+    #[inline]
+    pub(crate) fn commit_in_flight(&self) -> bool {
+        !matches!(self.commit_state, CommitState::Ready)
+            || !matches!(self.view_delta_state, ViewDeltaCommitState::NotStarted)
     }
 
     /// Whether this statement may finish the implicit autocommit transaction
@@ -1440,6 +1490,7 @@ impl ProgramState {
         }
     }
 
+    #[recursive::recursive]
     pub(crate) fn metrics(&self) -> StatementMetrics {
         let mut metrics = self.metrics.clone();
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
@@ -1451,6 +1502,7 @@ impl ProgramState {
         metrics
     }
 
+    #[recursive::recursive]
     pub(crate) fn reset_metrics(&mut self) {
         self.metrics.reset();
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
@@ -1461,6 +1513,7 @@ impl ProgramState {
         }
     }
 
+    #[recursive::recursive]
     pub(crate) fn reset_stmt_status(&mut self, counter: crate::statement::StatementStatusCounter) {
         match counter {
             crate::statement::StatementStatusCounter::FullscanStep => {
@@ -1547,6 +1600,15 @@ impl ProgramState {
 
         self.has_stmt_transaction = true;
 
+        // Snapshot the per-view, per-table delta lengths. If this statement
+        // aborts (e.g. UNIQUE constraint), end_statement(RollbackSavepoint)
+        // truncates back to these lengths so partial IVM deltas don't leak
+        // into the matview at commit time.
+        if self.view_tx_state_savepoint.is_none() {
+            self.view_tx_state_savepoint =
+                Some(connection.view_transaction_states.snapshot_lengths());
+        }
+
         // Store the deferred foreign key violations counter at the start of the statement.
         // This is used to ensure that if an interactive transaction had deferred FK violations and a statement subtransaction rolls back,
         // the deferred FK violations are not lost.
@@ -1554,6 +1616,12 @@ impl ProgramState {
             connection.fk_deferred_violations.load(Ordering::Acquire),
             Ordering::SeqCst,
         );
+
+        // Snapshot the schema this statement starts from, so a statement
+        // rollback can put it back alongside the pages it undoes.
+        if self.schema_when_stmt_started.is_none() {
+            self.schema_when_stmt_started = Some(connection.schema.read().clone());
+        }
         // Reset the immediate foreign key violations counter to 0. If this is nonzero when the statement completes, the statement subtransaction will roll back.
         self.fk_immediate_violations_during_stmt
             .store(0, Ordering::Release);
@@ -1585,6 +1653,45 @@ impl ProgramState {
             return Ok(());
         }
         self.has_stmt_transaction = false;
+
+        // Apply or discard the IVM tx-state savepoint that was taken in
+        // begin_statement. ReleaseSavepoint commits the per-statement deltas
+        // by simply forgetting the snapshot; RollbackSavepoint truncates each
+        // delta back to its pre-statement length so partial rows from a
+        // failed UPDATE/INSERT/DELETE don't survive into the matview.
+        if let Some(view_savepoint) = self.view_tx_state_savepoint.take() {
+            if matches!(end_statement, EndStatement::RollbackSavepoint) {
+                connection
+                    .view_transaction_states
+                    .rollback_to(&view_savepoint);
+            }
+        }
+
+        // Undo any in-memory schema mutation this statement made, for the same
+        // reason its pages are undone: a DDL statement bumps `schema_version`
+        // and installs its objects before it can still fail, and a schema
+        // version no cookie matches wedges every later statement on the
+        // database once the enclosing transaction publishes it.
+        if let Some(schema) = self.schema_when_stmt_started.take() {
+            if matches!(end_statement, EndStatement::RollbackSavepoint) {
+                *connection.schema.write() = schema;
+                connection.bump_prepare_context_generation();
+            }
+        }
+
+        // Pages, in-memory schema and cached cookie are undone together: a
+        // rollback that undoes page 1 must invalidate every cached summary of
+        // page 1, or `CheckSchemaCookie` compares a cookie the pages no longer
+        // carry and every later statement reprepares forever.
+        // `None` lets the next header read repopulate from the restored pages.
+        if matches!(end_statement, EndStatement::RollbackSavepoint) {
+            connection.with_all_attached_pagers_with_index(|pagers| {
+                for (_db_id, attached_pager) in pagers {
+                    attached_pager.set_schema_cookie(None);
+                }
+            });
+            pager.set_schema_cookie(None);
+        }
 
         // Drain attached pagers upfront so we can clean them up regardless of path.
         let attached_pagers: Vec<Arc<Pager>> = self.attached_savepoint_pagers.drain(..).collect();
@@ -1863,6 +1970,13 @@ pub struct PreparedProgram {
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
     pub read_databases: BitSet,
+}
+
+impl Drop for PreparedProgram {
+    #[recursive::recursive]
+    fn drop(&mut self) {
+        drop(std::mem::take(&mut self.insns));
+    }
 }
 
 #[derive(Clone)]
@@ -2700,12 +2814,35 @@ impl Program {
                         return Ok(IOResult::Done(()));
                     }
 
+                    // View maintenance writes the view btrees through the pager, but
+                    // an MVCC commit persists only MV-store state, so the maintenance
+                    // would be served to this session and then silently dropped —
+                    // permanent divergence for every later reader. Refuse instead.
+                    // Checked here rather than at translate time because switching
+                    // journal modes does not bump the schema cookie, so a statement
+                    // prepared under WAL is never reprepared.
+                    if self.connection.mv_store_for_db(crate::MAIN_DB_ID).is_some() {
+                        return Err(LimboError::InternalError(
+                            "Materialized views are not supported in MVCC mode: cannot modify a table with dependent materialized views"
+                                .to_string(),
+                        ).into());
+                    }
+
                     // Not a rollback - proceed with processing
                     let schema = self.connection.schema.read();
+                    // Collect all affected views via BFS from direct changes,
+                    // including transitively dependent views (for cascading updates).
+                    let mut all_views = Vec::new();
+                    let mut visited = std::collections::HashSet::new();
 
-                    // Collect materialized views - they should all have storage
-                    let mut views = Vec::new();
-                    for view_name in self.connection.view_transaction_states.get_view_names() {
+                    // Start with views that have direct changes from base table modifications
+                    let direct_views = self.connection.view_transaction_states.get_view_names();
+                    let mut queue = std::collections::VecDeque::from(direct_views);
+
+                    while let Some(view_name) = queue.pop_front() {
+                        if visited.contains(&view_name) {
+                            continue;
+                        }
                         if let Some(view_mutex) = schema.get_materialized_view(&view_name) {
                             let view = view_mutex.lock();
                             let root_page = view.get_root_page();
@@ -2717,7 +2854,57 @@ impl Program {
                                 { "view_name": view_name }
                             );
 
-                            views.push(view_name);
+                            visited.insert(view_name.clone());
+                            all_views.push(view_name.clone());
+
+                            // Add views that depend on this view (for cascading updates)
+                            for dependent_view in
+                                schema.get_dependent_materialized_views(&view_name)
+                            {
+                                if !visited.contains(&dependent_view) {
+                                    // Ensure the dependent view has a transaction state
+                                    // (it may not have one yet if it only depends on other views)
+                                    self.connection
+                                        .view_transaction_states
+                                        .get_or_create(&dependent_view);
+                                    queue.push_back(dependent_view);
+                                }
+                            }
+                        }
+                    }
+
+                    // Topological sort: if view B depends on view A (A is a source
+                    // table in B's definition), A must be processed first. BFS alone
+                    // doesn't guarantee this because direct_views comes from a HashMap.
+                    let mut views = Vec::with_capacity(all_views.len());
+                    let mut remaining: std::collections::HashSet<String> =
+                        all_views.iter().cloned().collect();
+                    while !remaining.is_empty() {
+                        let mut progress = false;
+                        for view_name in all_views.iter() {
+                            if !remaining.contains(view_name) {
+                                continue;
+                            }
+                            let blocked = remaining.iter().any(|other| {
+                                other != view_name
+                                    && schema
+                                        .get_dependent_materialized_views(other)
+                                        .contains(view_name)
+                            });
+                            if !blocked {
+                                views.push(view_name.clone());
+                                remaining.remove(view_name);
+                                progress = true;
+                            }
+                        }
+                        if !progress {
+                            // Circular dependency — append remaining in original order
+                            for view_name in &all_views {
+                                if remaining.contains(view_name) {
+                                    views.push(view_name.clone());
+                                }
+                            }
+                            break;
                         }
                     }
 
@@ -2733,6 +2920,101 @@ impl Program {
                 } => {
                     // At this point we know it's not a rollback
                     if *current_index >= views.len() {
+                        // Events are built here, where the deltas still exist, but only
+                        // STAGED: `commit_txn` announces them once the commit is durable.
+
+                        // Step 1: Gather schema info BEFORE acquiring callback lock (avoid lock ordering issues)
+                        let mut view_schemas: std::collections::HashMap<String, Vec<String>> =
+                            std::collections::HashMap::new();
+                        {
+                            let schema = self.connection.schema.read();
+                            for view_name in views.iter() {
+                                if let Some(view_arc) = schema.get_materialized_view(view_name) {
+                                    let view = view_arc.lock();
+                                    let column_names: Vec<String> = view
+                                        .column_schema
+                                        .flat_columns()?
+                                        .iter()
+                                        .filter_map(|col| col.name.clone())
+                                        .collect();
+                                    view_schemas.insert(view_name.clone(), column_names);
+                                }
+                            }
+                        }
+                        // Schema lock is now dropped
+
+                        // Step 2: Build and stage one event per view whose output changed
+                        if self.connection.has_change_callbacks() {
+                            for view_name in views.iter() {
+                                // Skip views without schema - don't use fake column names
+                                let Some(column_names) = view_schemas.get(view_name) else {
+                                    tracing::warn!(
+                                        "Matview callback: Could not find schema for view '{}', skipping callback",
+                                        view_name
+                                    );
+                                    continue;
+                                };
+
+                                let Some(tx_state) =
+                                    self.connection.view_transaction_states.get(view_name)
+                                else {
+                                    continue;
+                                };
+
+                                let mut changes = Vec::new();
+
+                                // Get the output delta (changes to the view's result set)
+                                if let Some(output_delta) = tx_state.get_output_delta() {
+                                    // Convert each delta entry to DatabaseChange
+                                    for (idx, (row, weight)) in
+                                        output_delta.changes.iter().enumerate()
+                                    {
+                                        // Create ImmutableRecord from the row values
+                                        let record = crate::types::ImmutableRecord::from_values(
+                                            row.values.iter(),
+                                            row.values.len(),
+                                        )?;
+                                        let bin_record = record.get_payload().to_vec();
+
+                                        let change_type = match weight {
+                                            1 => crate::types::DatabaseChangeType::Insert {
+                                                bin_record,
+                                            },
+                                            -1 => crate::types::DatabaseChangeType::Delete {
+                                                bin_record,
+                                            },
+                                            _ => continue, // Skip if weight is 0 or unexpected
+                                        };
+
+                                        changes.push(crate::types::DatabaseChange {
+                                            change_id: (idx + 1) as i64,
+                                            change_time: 0, // We don't track time for view changes
+                                            change: change_type,
+                                            table_name: view_name.clone(), // The "table" is the view itself
+                                            id: row.rowid,
+                                        });
+                                    }
+                                }
+
+                                // Skip the callback when the matview's output didn't
+                                // actually change. Upstream base table writes whose deltas
+                                // don't intersect the view's projection (and chained
+                                // matviews whose upstream output was empty) leave changes
+                                // empty here — firing would deliver a spurious event.
+                                if changes.is_empty() {
+                                    continue;
+                                }
+
+                                self.connection.stage_change_event(
+                                    crate::types::RelationChangeEvent::staged(
+                                        view_name.clone(),
+                                        column_names.clone(),
+                                        changes,
+                                    ),
+                                );
+                            }
+                        }
+
                         // All done, clear the transaction states
                         self.connection.view_transaction_states.clear();
                         state.view_delta_state = ViewDeltaCommitState::Done;
@@ -2748,6 +3030,16 @@ impl Program {
                         .expect("view should have transaction state")
                         .get_table_deltas();
 
+                    let has_deltas = table_deltas.values().any(|d| !d.changes.is_empty());
+
+                    if !has_deltas {
+                        state.view_delta_state = ViewDeltaCommitState::Processing {
+                            views: views.clone(),
+                            current_index: current_index + 1,
+                        };
+                        continue;
+                    }
+
                     let schema = self.connection.schema.read();
                     if let Some(view_mutex) = schema.get_materialized_view(view_name) {
                         let mut view = view_mutex.lock();
@@ -2759,8 +3051,46 @@ impl Program {
                         }
 
                         // Handle I/O from merge_delta - pass pager, circuit will create its own cursor
+                        // merge_delta returns the output delta (changes to the view's result set)
                         match view.merge_delta(delta_set, pager.clone())? {
-                            IOResult::Done(_) => {
+                            IOResult::Done(output_delta) => {
+                                // Store the output delta in the transaction state for the callback
+                                if let Some(view_state) =
+                                    self.connection.view_transaction_states.get(view_name)
+                                {
+                                    view_state.set_output_delta(output_delta.clone());
+                                }
+
+                                // Propagate output delta to views that depend on this view
+                                // This enables chained materialized view updates
+                                if !output_delta.is_empty() {
+                                    let dependent_views =
+                                        schema.get_dependent_materialized_views(view_name);
+                                    for dep_view_name in dependent_views {
+                                        let dep_tx_state = self
+                                            .connection
+                                            .view_transaction_states
+                                            .get_or_create(&dep_view_name);
+                                        // The current view's name is what the dependent view references
+                                        // Pass the output delta as input to the dependent view
+                                        for (row, weight) in output_delta.changes.iter() {
+                                            if *weight > 0 {
+                                                dep_tx_state.insert(
+                                                    view_name,
+                                                    row.rowid,
+                                                    row.values.clone(),
+                                                );
+                                            } else if *weight < 0 {
+                                                dep_tx_state.delete(
+                                                    view_name,
+                                                    row.rowid,
+                                                    row.values.clone(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+
                                 // Move to next view
                                 state.view_delta_state = ViewDeltaCommitState::Processing {
                                     views: views.clone(),
@@ -2799,8 +3129,52 @@ impl Program {
             );
         }
 
-        // Apply view deltas with I/O handling
-        match self.apply_view_deltas(program_state, rollback, &pager)? {
+        // Drop virtual table cursors before the `is_nested_stmt()` check below, for the
+        // same reason as the later call: a pragma virtual table cursor owns a nested
+        // helper statement whose guard would make this top-level statement classify
+        // itself as nested and skip transaction finalization entirely.
+        program_state.close_virtual_table_cursors();
+        if self.connection.get_tx_state() == TransactionState::None
+            && matches!(program_state.commit_state, CommitState::Ready)
+        {
+            // No main transaction and no in-progress commit — an attached or temp
+            // database may still hold one, so bail out only once that is ruled out.
+            let has_attached_mv_tx = self.connection.next_attached_mv_tx().is_some();
+            let has_attached_wal_tx =
+                self.connection
+                    .with_all_attached_pagers_with_index(|pagers| {
+                        pagers.iter().any(|(_, pager)| pager.holds_read_lock())
+                    });
+            if !has_attached_mv_tx && !has_attached_wal_tx {
+                return Ok(IOResult::Done(()));
+            }
+        }
+        if self.connection.is_nested_stmt() {
+            // We don't want to commit on nested statements. Let parent handle it.
+            // This must be checked before apply_view_deltas to avoid deadlocking on
+            // view Mutex locks that the outer populate_from_table already holds.
+            return Ok(IOResult::Done(()));
+        }
+
+        // Apply view deltas with I/O handling.
+        //
+        // A failure here (e.g. a recursive view that does not converge) aborts the
+        // transaction, so the pending per-view deltas belong to work that is being thrown
+        // away. They must not outlive the failed statement: the next read of that matview
+        // runs a nested statement while holding the view's mutex, and a non-empty
+        // `view_transaction_states` sends that nested statement back into `apply_view_deltas`,
+        // which locks the same mutex and self-deadlocks. Discard them exactly as the rollback
+        // branch of `apply_view_deltas` does before propagating the error.
+        let applied = match self.apply_view_deltas(program_state, rollback, &pager) {
+            Ok(applied) => applied,
+            Err(e) => {
+                self.connection.view_transaction_states.clear();
+                self.connection.clear_staged_change_events();
+                program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
+                return Err(e);
+            }
+        };
+        match applied {
             IOResult::IO(io) => return Ok(IOResult::IO(io)),
             IOResult::Done(_) => {}
         }
@@ -2858,6 +3232,14 @@ impl Program {
                     self.connection.rollback_temp_schema();
                 } else {
                     self.connection.commit_temp_schema();
+                }
+                // Announce the transaction's change events only now: the commit
+                // has completed, so nothing staged can still be rolled back. A
+                // rollback announces nothing at all.
+                if rollback {
+                    self.connection.clear_staged_change_events();
+                } else {
+                    self.connection.dispatch_staged_change_events();
                 }
             }
         }

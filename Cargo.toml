@@ -48,6 +48,7 @@ members = [
     "perf/memory/codspeed",
     "perf/query-batch",
     "tools/dbhash",
+    "tools/sql-replay",
     "sdk-kit",
     "sdk-kit-macros",
     "testing/differential-oracle/sql_gen_prop",
@@ -150,6 +151,7 @@ bitflags = "2.9.4"
 fallible-iterator = "0.3.0"
 allocator-api2 = "0.4"
 getrandom = "0.4.2"
+recursive = "0.1.1"
 
 criterion = "0.5.0"
 codspeed-criterion-compat = "4.2.1"
