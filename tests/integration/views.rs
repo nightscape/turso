@@ -293,3 +293,51 @@ fn reverse_rowid_reads_of_an_ordered_materialized_view_are_refused() {
         );
     }
 }
+
+/// `t` holds 300 rows `k1..k300`; `probe` has one partner for each even `k`.
+fn view_and_probe_for_a_hash_join(view_sql: &str) -> (TempDatabase, Arc<turso_core::Connection>) {
+    let tmp_db = TempDatabase::builder().with_views(true).build();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT)")
+        .unwrap();
+    conn.execute(view_sql).unwrap();
+    conn.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY, kk TEXT)")
+        .unwrap();
+    for i in 1..=300 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'k{i}')"))
+            .unwrap();
+        if i % 2 == 0 {
+            conn.execute(format!("INSERT INTO probe VALUES ({i}, 'k{i}')"))
+                .unwrap();
+        }
+    }
+    (tmp_db, conn)
+}
+
+// The view is the FROM side, which the planner makes the hash-join build side.
+const VIEW_AS_HASH_BUILD_SIDE: [&str; 2] = [
+    "SELECT count(*) FROM @ X JOIN probe p ON p.kk = X.k",
+    "SELECT sum(X.id) FROM @ X JOIN probe p ON p.kk = X.k",
+];
+
+#[test]
+fn materialized_view_on_the_hash_build_side_sees_uncommitted_rows() {
+    let (_tmp_db, conn) =
+        view_and_probe_for_a_hash_join("CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t");
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (901, 'k2')").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 4").unwrap();
+    for sql in VIEW_AS_HASH_BUILD_SIDE {
+        assert_view_reads_like_its_table(&conn, sql);
+    }
+}
+
+#[test]
+fn ordered_materialized_view_on_the_hash_build_side_reads_its_rows() {
+    let (_tmp_db, conn) = view_and_probe_for_a_hash_join(
+        "CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t ORDER BY 2",
+    );
+    for sql in VIEW_AS_HASH_BUILD_SIDE {
+        assert_view_reads_like_its_table(&conn, sql);
+    }
+}

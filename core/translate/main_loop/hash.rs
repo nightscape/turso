@@ -3,7 +3,7 @@ use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
 use crate::translate::expr::comparison_affinity;
-use crate::translate::plan::ColumnUsedMask;
+use crate::translate::plan::{read_cursor_type, ColumnUsedMask};
 use crate::vdbe::builder::SelfTableContext;
 
 #[derive(Debug, Clone)]
@@ -615,7 +615,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             .expect("Hash join build table must be a BTree table");
         let hash_build_cursor_id = self.program.alloc_cursor_id_keyed_if_not_exists(
             CursorKey::hash_build(build_table.internal_id),
-            CursorType::BTreeTable(btree.clone()),
+            read_cursor_type(&btree, self.t_ctx.resolver.schema()),
         );
         let payload_info = match HashBuildPlanner::new(
             self.program,
@@ -639,7 +639,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             } else {
                 let cursor_id = self.program.alloc_cursor_id_keyed_if_not_exists(
                     CursorKey::table(build_table.internal_id),
-                    CursorType::BTreeTable(btree.clone()),
+                    read_cursor_type(&btree, self.t_ctx.resolver.schema()),
                 );
                 self.program.emit_insn(Insn::OpenRead {
                     cursor_id,
