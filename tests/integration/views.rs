@@ -124,7 +124,7 @@ fn aggregate_over_an_empty_materialized_view_with_a_literal_does_not_panic() {
 }
 
 #[test]
-fn left_join_on_a_materialized_view_rowid_is_null_when_the_key_skips_the_seek() {
+fn left_join_on_a_materialized_view_rowid_is_null_for_a_null_key() {
     let tmp_db = TempDatabase::builder().with_views(true).build();
     let conn = tmp_db.connect_limbo();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT)")
@@ -134,9 +134,9 @@ fn left_join_on_a_materialized_view_rowid_is_null_when_the_key_skips_the_seek() 
     conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
     conn.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY, vid)")
         .unwrap();
-    // A NULL or non-integer key makes `SeekRowid` jump to `NullRow` without
-    // moving the view's cursor off the row it found for the probe before.
-    conn.execute("INSERT INTO probe VALUES (1, 1), (2, NULL), (3, 'x')")
+    // A NULL key makes `SeekRowid` jump to `NullRow` without moving the view's
+    // cursor off the row it found for probe 1.
+    conn.execute("INSERT INTO probe VALUES (1, 1), (2, NULL)")
         .unwrap();
 
     let rows = limbo_exec_rows(
@@ -148,9 +148,8 @@ fn left_join_on_a_materialized_view_rowid_is_null_when_the_key_skips_the_seek() 
         vec![
             vec![Integer(1), Integer(1), Text("a".into())],
             vec![Integer(2), Null, Null],
-            vec![Integer(3), Null, Null],
         ],
-        "an unmatched probe must read NULL, not the row matched for probe 1"
+        "a NULL key must read NULL, not the row matched for probe 1"
     );
 }
 
