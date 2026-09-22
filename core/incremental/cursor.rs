@@ -736,6 +736,7 @@ impl MaterializedViewCursor {
     }
 
     pub fn seek(&mut self, key: SeekKey, op: SeekOp) -> IOResultOr<SeekResult> {
+        self.btree_cursor.set_null_flag(false);
         // Ensure transaction changes are computed
         return_if_io!(self.ensure_tx_changes_computed());
 
@@ -836,7 +837,18 @@ impl MaterializedViewCursor {
         }
     }
 
+    /// `NullRow` sets the flag on the inner btree cursor; `current_row` keeps
+    /// the last row this cursor produced, so row reads consult the flag first.
+    /// `seek` and `rewind` clear it: not every path through them repositions
+    /// the inner cursor.
+    fn is_null_row(&self) -> bool {
+        self.btree_cursor.get_null_flag()
+    }
+
     pub fn column(&mut self, col: usize) -> IOResultOr<Value> {
+        if self.is_null_row() {
+            return Ok(IOResult::Done(Value::Null));
+        }
         if let Some((_, ref values)) = self.current_row {
             Ok(IOResult::Done(
                 values.get(col).cloned().unwrap_or(Value::Null),
@@ -847,10 +859,14 @@ impl MaterializedViewCursor {
     }
 
     pub fn rowid(&self) -> IOResultOr<Option<i64>> {
+        if self.is_null_row() {
+            return Ok(IOResult::Done(None));
+        }
         Ok(IOResult::Done(self.current_row.as_ref().map(|(id, _)| *id)))
     }
 
     pub fn rewind(&mut self) -> IOResultOr<()> {
+        self.btree_cursor.set_null_flag(false);
         // Reset LIMIT counter; rewind is a fresh iteration.
         self.rows_returned = 0;
 
