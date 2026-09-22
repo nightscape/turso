@@ -186,3 +186,89 @@ fn materialized_view_cursor_reads_rows_again_after_a_null_row() {
         "probe 1's NullRow must not null out the rows later probes match"
     );
 }
+
+/// Runs `sql` with `@` bound to the base table `t` and to its identity view
+/// `v`, and asserts both read the same rows.
+fn assert_view_reads_like_its_table(conn: &Arc<turso_core::Connection>, sql: &str) {
+    let over_table = limbo_exec_rows(conn, &sql.replace('@', "t"));
+    let over_view = limbo_exec_rows(conn, &sql.replace('@', "v"));
+    assert_eq!(over_view, over_table, "view and table disagree on: {sql}");
+}
+
+fn identity_view_over_five_rows() -> (TempDatabase, Arc<turso_core::Connection>) {
+    let tmp_db = TempDatabase::builder().with_views(true).build();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT)")
+        .unwrap();
+    conn.execute("CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')")
+        .unwrap();
+    (tmp_db, conn)
+}
+
+const ROWID_RANGE_READS: [&str; 6] = [
+    "SELECT rowid, k FROM @ WHERE rowid > 1 AND rowid < 4 ORDER BY rowid",
+    "SELECT rowid, k FROM @ WHERE rowid > 2 ORDER BY rowid",
+    "SELECT rowid, k FROM @ WHERE rowid >= 2 ORDER BY rowid",
+    "SELECT rowid, k FROM @ WHERE rowid < 3 ORDER BY rowid",
+    "SELECT rowid, k FROM @ WHERE rowid <= 2 ORDER BY rowid DESC",
+    "SELECT rowid, k FROM @ WHERE rowid BETWEEN 2 AND 4 ORDER BY rowid DESC",
+];
+
+const REVERSE_READS: [&str; 3] = [
+    "SELECT rowid, k FROM @ ORDER BY rowid DESC",
+    "SELECT max(rowid) FROM @",
+    "SELECT k FROM @ ORDER BY rowid DESC LIMIT 1",
+];
+
+#[test]
+fn materialized_view_rowid_range_reads_like_its_table() {
+    let (_tmp_db, conn) = identity_view_over_five_rows();
+    for sql in ROWID_RANGE_READS {
+        assert_view_reads_like_its_table(&conn, sql);
+    }
+    // Uncommitted rows reach the view only through its transaction overlay.
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (6, 'f')").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 3").unwrap();
+    for sql in ROWID_RANGE_READS {
+        assert_view_reads_like_its_table(&conn, sql);
+    }
+}
+
+#[test]
+fn materialized_view_reverse_reads_like_its_table() {
+    let (_tmp_db, conn) = identity_view_over_five_rows();
+    for sql in REVERSE_READS {
+        assert_view_reads_like_its_table(&conn, sql);
+    }
+    // Uncommitted rows reach the view only through its transaction overlay.
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (6, 'f')").unwrap();
+    conn.execute("DELETE FROM t WHERE id = 3").unwrap();
+    for sql in REVERSE_READS {
+        assert_view_reads_like_its_table(&conn, sql);
+    }
+}
+
+#[test]
+fn reverse_rowid_reads_of_an_ordered_materialized_view_are_refused() {
+    let (_tmp_db, conn) = identity_view_over_five_rows();
+    conn.execute("CREATE MATERIALIZED VIEW vo AS SELECT id, k FROM t ORDER BY 2 DESC")
+        .unwrap();
+    for sql in [
+        "SELECT max(rowid) FROM vo",
+        "SELECT k FROM vo ORDER BY rowid DESC",
+    ] {
+        let err = conn
+            .prepare(sql)
+            .and_then(|mut stmt| stmt.run_with_row_callback(|_| Ok(())))
+            .expect_err(sql);
+        assert!(
+            err.to_string()
+                .contains("Reverse rowid-order reads are not supported"),
+            "{sql}: {err}"
+        );
+    }
+}
