@@ -13,6 +13,7 @@ pub mod fdw_mirror;
 #[cfg(test)]
 mod fdw_mirror_scope_tests;
 pub mod filter_operator;
+pub mod index_cursor;
 pub mod input_operator;
 pub mod join_operator;
 pub mod literal_operator;
