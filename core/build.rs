@@ -1,7 +1,7 @@
-// cfg_aliases 0.2.1 expands with a trailing semicolon in expression position,
-// a hard error when --cap-lints allow is not applied to the build script. The
-// pinned nightly reports it as `..._from_non_local_macros`, older nightlies as
-// `..._from_macros`. Remove when cfg_aliases moves.
+// cfg_aliases 0.2.1 expands with a trailing semicolon in expression position:
+// a future-incompatibility warning that `clippy -- -D warnings` turns into an
+// error. The pinned nightly reports it as `..._from_non_local_macros`, older
+// nightlies as `..._from_macros`. Remove when cfg_aliases moves.
 #![allow(semicolon_in_expressions_from_macros)]
 #![allow(semicolon_in_expressions_from_non_local_macros)]
 use cfg_aliases::cfg_aliases;
