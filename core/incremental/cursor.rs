@@ -59,106 +59,43 @@ struct UpstreamOutputs {
     any_full_result: bool,
 }
 
-/// Cursor for reading materialized views that combines:
-/// 1. Persistent btree data (committed state)
-/// 2. Transaction-specific DBSP deltas (uncommitted changes)
+/// A materialized view's uncommitted rows, as a read on this connection sees
+/// them: the view's circuit run over the transaction's staged deltas.
 ///
-/// Works like a regular table cursor - reads from disk on-demand
-/// and overlays transaction changes as needed.
-pub struct MaterializedViewCursor {
-    // Core components
-    btree_cursor: Box<dyn CursorTrait>,
+/// The transaction state only grows (a deletion is an append with weight < 0),
+/// so its length identifies the state the overlay was computed from.
+pub(crate) struct ViewOverlay {
     view: Arc<Mutex<IncrementalView>>,
     pager: Arc<Pager>,
-    conn: crate::sync::Arc<crate::Connection>,
-
-    // Current changes that are uncommitted
-    uncommitted: RowKeyZSet,
-
-    // Reference to shared transaction state for this specific view - shared with Connection
     tx_state: Arc<ViewTransactionState>,
-
-    // The transaction state always grows. It never gets reduced. That is in the very nature of
-    // DBSP, because deletions are just appends with weight < 0. So we will use the length of the
-    // state to check if we have to recompute the transaction state
+    conn: crate::sync::Arc<crate::Connection>,
     last_tx_state_len: usize,
-
-    // Current row cache - only cache the current row we're looking at
-    current_row: Option<(i64, RowValues)>,
-
-    // Execution state for circuit processing
     execute_state: ExecuteState,
-
-    // State machine for seek operations
-    seek_state: SeekState,
-
-    // When true, `uncommitted` contains the COMPLETE matview result (not a delta).
-    // The cursor reads only from `uncommitted`, ignoring the btree.
-    // Used for recursive CTE matviews during uncommitted transaction reads.
-    full_result_mode: bool,
-
-    /// LIMIT from the matview's defining SELECT, applied at cursor level.
-    limit: Option<i64>,
-    /// Rows returned so far (for LIMIT enforcement).
-    rows_returned: i64,
-
-    /// True if the matview has ORDER BY (uses an index btree with composite keys).
-    is_index_organized: bool,
-    /// Cached copy of the matview's ORDER BY metadata. Empty for non-ORDER-BY views.
-    order_by: super::view::MatviewOrderBy,
-
-    /// In-tx materialized snapshot for ORDER BY views with a non-empty
-    /// uncommitted overlay. Populated lazily by `materialize_index_snapshot`
-    /// and consumed by `rewind`/`next`. Each entry is `(rowid, logical_values)`,
-    /// in composite-key sort order. None means we should walk the btree directly
-    /// (autocommit / empty overlay path).
-    sorted_index_snapshot: Option<Vec<(i64, RowValues)>>,
-    /// Position into `sorted_index_snapshot` for the current iteration.
-    sorted_index_pos: usize,
+    /// The view's uncommitted delta, or its complete contents when
+    /// `full_result_mode` is set.
+    pub(crate) uncommitted: RowKeyZSet,
+    /// `uncommitted` is the complete view (recursive-CTE views read inside a
+    /// transaction); the committed btree must not be read at all.
+    pub(crate) full_result_mode: bool,
 }
 
-impl MaterializedViewCursor {
-    pub fn new(
-        btree_cursor: Box<dyn CursorTrait>,
+impl ViewOverlay {
+    pub(crate) fn new(
         view: Arc<Mutex<IncrementalView>>,
         pager: Arc<Pager>,
         tx_state: Arc<ViewTransactionState>,
         conn: crate::sync::Arc<crate::Connection>,
-    ) -> Result<Self> {
-        let (limit, order_by, is_index_organized) = {
-            let view_guard = view.lock();
-            (
-                view_guard.limit,
-                view_guard.order_by.clone(),
-                !view_guard.order_by.is_empty(),
-            )
-        };
-        Ok(Self {
-            btree_cursor,
+    ) -> Self {
+        Self {
             view,
             pager,
-            conn,
-            uncommitted: RowKeyZSet::new(),
             tx_state,
+            conn,
             last_tx_state_len: 0,
-            current_row: None,
             execute_state: ExecuteState::Uninitialized,
-            seek_state: SeekState::Init,
+            uncommitted: RowKeyZSet::new(),
             full_result_mode: false,
-            limit,
-            rows_returned: 0,
-            is_index_organized,
-            order_by,
-            sorted_index_snapshot: None,
-            sorted_index_pos: 0,
-        })
-    }
-
-    /// Get mutable access to the underlying btree cursor.
-    /// Used for operations like count() that need direct btree access.
-    /// Note: This returns the committed btree data only, not uncommitted changes.
-    pub fn btree_cursor_mut(&mut self) -> &mut dyn CursorTrait {
-        self.btree_cursor.as_mut()
+        }
     }
 
     /// Compute transaction changes lazily on first access.
@@ -175,7 +112,9 @@ impl MaterializedViewCursor {
     /// while marking the upstream's own state absorbed, so recomputing the
     /// upstream yields nothing and substituting would drop the rebuild — the
     /// read would return the pre-refresh value until COMMIT.
-    fn ensure_tx_changes_computed(&mut self) -> IOResultOr<()> {
+    ///
+    /// Returns whether the overlay was recomputed from the transaction state.
+    pub(crate) fn ensure_computed(&mut self) -> IOResultOr<bool> {
         if self.conn.matview_rebuild_in_progress() {
             // A rebuild is reading us as its source. It must see our committed
             // state only: whatever we hold uncommitted will reach the view it
@@ -188,12 +127,12 @@ impl MaterializedViewCursor {
             );
             self.uncommitted = RowKeyZSet::new();
             self.full_result_mode = false;
-            return Ok(IOResult::Done(()));
+            return Ok(IOResult::Done(false));
         }
 
         let current_len = self.total_relevant_tx_len();
         if current_len == self.last_tx_state_len {
-            return Ok(IOResult::Done(()));
+            return Ok(IOResult::Done(false));
         }
 
         let upstream_outputs = return_if_io!(self.compute_upstream_outputs());
@@ -212,9 +151,7 @@ impl MaterializedViewCursor {
             self.uncommitted = RowKeyZSet::from_delta(&full_result);
             self.full_result_mode = true;
             self.last_tx_state_len = current_len;
-            self.sorted_index_snapshot = None;
-            self.sorted_index_pos = 0;
-            return Ok(IOResult::Done(()));
+            return Ok(IOResult::Done(true));
         }
 
         let mut uncommitted = DeltaSet::new();
@@ -247,11 +184,7 @@ impl MaterializedViewCursor {
         self.uncommitted = RowKeyZSet::from_delta(&processed_delta);
         self.full_result_mode = is_full_result;
         self.last_tx_state_len = current_len;
-        // Snapshot is now stale; the next read for an ORDER BY view with
-        // overlay will rebuild it.
-        self.sorted_index_snapshot = None;
-        self.sorted_index_pos = 0;
-        Ok(IOResult::Done(()))
+        Ok(IOResult::Done(true))
     }
 
     /// Total size of tx state across this view and every transitively-upstream
@@ -384,6 +317,91 @@ impl MaterializedViewCursor {
         }
         Ok(IOResult::Done(outputs))
     }
+}
+
+/// Cursor for reading materialized views that combines:
+/// 1. Persistent btree data (committed state)
+/// 2. Transaction-specific DBSP deltas (uncommitted changes)
+///
+/// Works like a regular table cursor - reads from disk on-demand
+/// and overlays transaction changes as needed.
+pub struct MaterializedViewCursor {
+    // Core components
+    btree_cursor: Box<dyn CursorTrait>,
+    overlay: ViewOverlay,
+
+    // Current row cache - only cache the current row we're looking at
+    current_row: Option<(i64, RowValues)>,
+
+    // State machine for seek operations
+    seek_state: SeekState,
+
+    /// LIMIT from the matview's defining SELECT, applied at cursor level.
+    limit: Option<i64>,
+    /// Rows returned so far (for LIMIT enforcement).
+    rows_returned: i64,
+
+    /// True if the matview has ORDER BY (uses an index btree with composite keys).
+    is_index_organized: bool,
+    /// Cached copy of the matview's ORDER BY metadata. Empty for non-ORDER-BY views.
+    order_by: super::view::MatviewOrderBy,
+
+    /// In-tx materialized snapshot for ORDER BY views with a non-empty
+    /// uncommitted overlay. Populated lazily by `materialize_index_snapshot`
+    /// and consumed by `rewind`/`next`. Each entry is `(rowid, logical_values)`,
+    /// in composite-key sort order. None means we should walk the btree directly
+    /// (autocommit / empty overlay path).
+    sorted_index_snapshot: Option<Vec<(i64, RowValues)>>,
+    /// Position into `sorted_index_snapshot` for the current iteration.
+    sorted_index_pos: usize,
+}
+
+impl MaterializedViewCursor {
+    pub fn new(
+        btree_cursor: Box<dyn CursorTrait>,
+        view: Arc<Mutex<IncrementalView>>,
+        pager: Arc<Pager>,
+        tx_state: Arc<ViewTransactionState>,
+        conn: crate::sync::Arc<crate::Connection>,
+    ) -> Result<Self> {
+        let (limit, order_by, is_index_organized) = {
+            let view_guard = view.lock();
+            (
+                view_guard.limit,
+                view_guard.order_by.clone(),
+                !view_guard.order_by.is_empty(),
+            )
+        };
+        Ok(Self {
+            btree_cursor,
+            overlay: ViewOverlay::new(view, pager, tx_state, conn),
+            current_row: None,
+            seek_state: SeekState::Init,
+            limit,
+            rows_returned: 0,
+            is_index_organized,
+            order_by,
+            sorted_index_snapshot: None,
+            sorted_index_pos: 0,
+        })
+    }
+
+    /// Get mutable access to the underlying btree cursor.
+    /// Used for operations like count() that need direct btree access.
+    /// Note: This returns the committed btree data only, not uncommitted changes.
+    pub fn btree_cursor_mut(&mut self) -> &mut dyn CursorTrait {
+        self.btree_cursor.as_mut()
+    }
+
+    fn ensure_tx_changes_computed(&mut self) -> IOResultOr<()> {
+        if return_if_io!(self.overlay.ensure_computed()) {
+            // The snapshot is stale; the next read of an ORDER BY view with an
+            // overlay rebuilds it.
+            self.sorted_index_snapshot = None;
+            self.sorted_index_pos = 0;
+        }
+        Ok(IOResult::Done(()))
+    }
 
     /// Build the in-tx merged-and-sorted snapshot for an ORDER BY view.
     ///
@@ -406,7 +424,7 @@ impl MaterializedViewCursor {
 
         let mut zset: HashMap<HashableRow, isize> = HashMap::default();
 
-        if !self.full_result_mode {
+        if !self.overlay.full_result_mode {
             // Walk the entire btree; insert each row into the weighted map.
             return_if_io!(self.btree_cursor.rewind());
             loop {
@@ -422,7 +440,7 @@ impl MaterializedViewCursor {
         }
 
         // Layer the overlay on top.
-        for (row, w) in self.uncommitted.iter() {
+        for (row, w) in self.overlay.uncommitted.iter() {
             *zset.entry(row.clone()).or_insert(0) += w;
         }
 
@@ -564,7 +582,7 @@ impl MaterializedViewCursor {
         changes: Vec<(HashableRow, isize)>,
     ) -> IOResultOr<()> {
         let mut btree_entries = Delta { changes };
-        let changes = self.uncommitted.seek(target, op);
+        let changes = self.overlay.uncommitted.seek(target, op);
 
         let uncommitted_entries = Delta { changes };
         btree_entries.merge(&uncommitted_entries);
@@ -646,7 +664,7 @@ impl MaterializedViewCursor {
                     // In full-result mode the overlay IS the whole view; the
                     // btree rows are already part of it and merging them in
                     // would count them twice.
-                    let changes = if self.full_result_mode {
+                    let changes = if self.overlay.full_result_mode {
                         Vec::new()
                     } else {
                         let btree_result =
@@ -768,7 +786,7 @@ impl MaterializedViewCursor {
         // emitted. `full_result_mode` already has LIMIT baked into its SQL
         // string (see `view::execute_with_uncommitted` for recursive CTEs),
         // so we don't apply it twice.
-        if !self.full_result_mode {
+        if !self.overlay.full_result_mode {
             if let Some(limit) = self.limit {
                 if self.rows_returned >= limit {
                     self.current_row = None;
@@ -841,7 +859,7 @@ impl MaterializedViewCursor {
     }
 
     fn check_reverse_read_supported(&self) -> Result<()> {
-        if self.is_index_organized || (self.limit.is_some() && !self.full_result_mode) {
+        if self.is_index_organized || (self.limit.is_some() && !self.overlay.full_result_mode) {
             return Err(LimboError::ParseError(
                 "Reverse rowid-order reads are not supported on materialized views with ORDER BY or LIMIT"
                     .to_string(),
@@ -909,7 +927,7 @@ impl MaterializedViewCursor {
 
         if self.is_index_organized {
             return_if_io!(self.ensure_tx_changes_computed());
-            if !self.uncommitted.is_empty() {
+            if !self.overlay.uncommitted.is_empty() {
                 // In-tx with overlay: materialize merged sorted snapshot.
                 if self.sorted_index_snapshot.is_none() {
                     return_if_io!(self.materialize_index_snapshot());
@@ -938,7 +956,7 @@ impl MaterializedViewCursor {
         }
 
         // Apply LIMIT to the first row (LIMIT 0 → no rows; LIMIT >0 → consume one).
-        if !self.full_result_mode {
+        if !self.overlay.full_result_mode {
             if let Some(limit) = self.limit {
                 if limit <= 0 {
                     self.current_row = None;
