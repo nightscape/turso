@@ -3176,6 +3176,7 @@ impl Connection {
                 }
             }
             match schema.populate_materialized_views(
+                &syms,
                 materialized_view_info,
                 dbsp_state_roots,
                 dbsp_state_index_roots,

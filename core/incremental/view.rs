@@ -970,6 +970,10 @@ impl IncrementalView {
         &self.name
     }
 
+    pub fn set_output_indexes(&mut self, indexes: Vec<crate::incremental::compiler::MatviewIndex>) {
+        self.circuit.set_output_indexes(indexes);
+    }
+
     /// Parse ORDER BY and LIMIT from the SELECT statement.
     /// Returns (order_by, limit) where order_by columns are indices into the
     /// expanded column_schema.
