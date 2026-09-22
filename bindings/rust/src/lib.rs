@@ -61,6 +61,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::Poll;
 
+pub use turso_sdk_kit::rsapi::{
+    CallbackId, DatabaseChange, DatabaseChangeType, RelationChangeEvent,
+};
+
 // Re-exports rows
 pub use crate::rows::{Row, Rows};
 
@@ -180,6 +184,7 @@ pub struct Builder {
     vfs: IoBackend,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
     io: Option<Arc<dyn turso_core::IO>>,
+    scalar_functions: Vec<turso_sdk_kit::rsapi::DeterministicScalarFunction>,
 }
 
 impl Builder {
@@ -201,6 +206,7 @@ impl Builder {
             vfs: IoBackend::Default,
             encryption_opts: None,
             io: None,
+            scalar_functions: Vec::new(),
         }
     }
 
@@ -280,6 +286,25 @@ impl Builder {
         self
     }
 
+    /// Register `func` as the SQL function `name` before the schema loads, so
+    /// that materialized views that call it work at every open. `func` is a
+    /// plain `fn`, not a closure; it must return the same result for the same
+    /// arguments and must not panic.
+    pub fn with_deterministic_scalar_function(
+        mut self,
+        name: &str,
+        arg_count: usize,
+        func: turso_core::DeterministicScalarFn,
+    ) -> Self {
+        self.scalar_functions
+            .push(turso_sdk_kit::rsapi::DeterministicScalarFunction {
+                name: name.to_string(),
+                arg_count,
+                func,
+            });
+        self
+    }
+
     /// Open the database without write access.
     pub fn read_only(mut self, read_only: bool) -> Self {
         self.read_only = read_only;
@@ -343,6 +368,7 @@ impl Builder {
                 } else {
                     turso_core::OpenFlags::default()
                 },
+                scalar_functions: self.scalar_functions,
             });
         while let Some(io_c) = db.open()?.io() {
             // At this point IO must already be created

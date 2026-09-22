@@ -197,6 +197,7 @@ fn test_sdk_close_finalizes_leaked_statements() {
         db_file: None,
         page_codec: None,
         open_flags: OpenFlags::default(),
+        scalar_functions: Vec::new(),
     });
     let _ = db_a.open().unwrap();
     let conn_a = db_a.connect().unwrap();

@@ -30,6 +30,41 @@ expect {
     C|1
 }
 
+test matview-group-emptied-after-two-inserts-comes-back {
+    CREATE TABLE t(g TEXT, v TEXT);
+    CREATE MATERIALIZED VIEW v AS
+    SELECT g, COUNT(*) AS cnt
+    FROM t
+    GROUP BY g;
+    INSERT INTO t VALUES ('a', 'x');
+    INSERT INTO t VALUES ('a', 'y');
+    DELETE FROM t WHERE g = 'a';
+    SELECT * FROM v;
+    INSERT INTO t VALUES ('a', 'x');
+    SELECT * FROM v;
+}
+expect {
+    a|1
+}
+
+test matview-group-emptied-in-its-first-transaction-comes-back {
+    CREATE TABLE t(g TEXT, v TEXT);
+    CREATE MATERIALIZED VIEW v AS
+    SELECT g, COUNT(*) AS cnt
+    FROM t
+    GROUP BY g;
+    BEGIN;
+    INSERT INTO t VALUES ('a', 'x');
+    DELETE FROM t WHERE g = 'a';
+    COMMIT;
+    SELECT * FROM v;
+    INSERT INTO t VALUES ('a', 'x');
+    SELECT * FROM v;
+}
+expect {
+    a|1
+}
+
 test matview-basic-filter-population {
     CREATE TABLE products(id INTEGER, name TEXT, price INTEGER, category TEXT);
     INSERT INTO products VALUES
@@ -315,6 +350,23 @@ expect {
     2|70.0|2
     1|85.0|4
     2|75.0|2
+}
+
+# With 100 groups the aggregate state index spans more than one btree page.
+# A group whose state sits at a page boundary must still be found.
+test matview-sum-finds-group-state-across-index-pages {
+    CREATE TABLE t(g TEXT, v INTEGER);
+    CREATE MATERIALIZED VIEW mv AS SELECT g, SUM(v) AS s FROM t GROUP BY g;
+    INSERT INTO t
+    WITH RECURSIVE c(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM c WHERE i < 99)
+    SELECT 'g' || i, 1 FROM c;
+    INSERT INTO t VALUES ('g46', 1);
+    SELECT * FROM mv WHERE g = 'g46';
+    SELECT count(*), sum(s) FROM mv;
+}
+expect {
+    g46|2.0
+    100|101.0
 }
 
 test matview-empty-table-population {
@@ -2528,4 +2580,322 @@ test matview-reserved-prefix-sqlite {
 }
 expect error {
     object name reserved for internal use: sqlite_matview
+}
+
+# An ungrouped aggregate is evaluated over exactly one implicit group, so the
+# view holds one row even when the source table is empty.
+test matview-ungrouped-aggregate-over-empty-input {
+    CREATE TABLE t(x REAL);
+    CREATE MATERIALIZED VIEW mv AS
+    SELECT COUNT(*), SUM(x), SUM(DISTINCT x), AVG(x), MIN(x), MAX(x) FROM t;
+    SELECT * FROM mv;
+}
+expect {
+    0|||||
+}
+
+test matview-ungrouped-aggregate-fills-after-empty-create {
+    CREATE TABLE t(x REAL);
+    CREATE MATERIALIZED VIEW mv AS SELECT COUNT(*), SUM(x) FROM t;
+    SELECT * FROM mv;
+    INSERT INTO t VALUES (5.0), (7.5);
+    SELECT * FROM mv;
+}
+expect {
+    0|
+    2|12.5
+}
+
+# Emptying the source returns the view to the zero row rather than dropping it.
+test matview-ungrouped-aggregate-returns-to-zero-row {
+    CREATE TABLE t(x REAL);
+    INSERT INTO t VALUES (5.0), (7.5);
+    CREATE MATERIALIZED VIEW mv AS SELECT COUNT(*), SUM(x) FROM t;
+    SELECT * FROM mv;
+    DELETE FROM t;
+    SELECT * FROM mv;
+    INSERT INTO t VALUES (3.5);
+    SELECT * FROM mv;
+}
+expect {
+    2|12.5
+    0|
+    1|3.5
+}
+
+# Control: a grouped aggregate has no implicit group, so an empty source means
+# no rows both at creation and after all rows are deleted.
+test matview-grouped-aggregate-over-empty-input-has-no-rows {
+    CREATE TABLE t(g TEXT, x REAL);
+    CREATE MATERIALIZED VIEW mv AS SELECT g, COUNT(*), SUM(x) FROM t GROUP BY g;
+    SELECT * FROM mv;
+    INSERT INTO t VALUES ('a', 1.0);
+    DELETE FROM t;
+    SELECT * FROM mv;
+    SELECT 'end';
+}
+expect {
+    end
+}
+
+test matview-create-index-is-refused {
+    CREATE TABLE t(id TEXT PRIMARY KEY, st TEXT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, st FROM t;
+    CREATE INDEX idx_v_st ON v(st);
+}
+expect error {
+    views may not be indexed
+}
+
+test matview-aggregate-with-a-literal-over-an-empty-view {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t;
+    SELECT 'c', count(*) FROM v;
+}
+expect {
+    c|0
+}
+
+test matview-left-join-on-rowid-reads-null-for-an-unmatched-key {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t;
+    INSERT INTO t VALUES (1, 'a');
+    CREATE TABLE probe(id INTEGER PRIMARY KEY, vid);
+    INSERT INTO probe VALUES (1, 1), (2, NULL), (3, 'x');
+    SELECT p.id, v.rowid, v.k FROM probe p LEFT JOIN v ON v.rowid = p.vid ORDER BY p.id;
+}
+expect {
+    1|1|a
+    2||
+    3||
+}
+
+test matview-left-join-on-a-column-reads-null-for-an-unmatched-key {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t;
+    INSERT INTO t VALUES (1, 'a');
+    CREATE TABLE probe(id INTEGER PRIMARY KEY, want TEXT);
+    INSERT INTO probe VALUES (1, 'a'), (2, 'missing');
+    SELECT p.id, v.k FROM probe p LEFT JOIN v ON v.k = p.want ORDER BY p.id;
+}
+expect {
+    1|a
+    2|
+}
+
+test matview-left-join-on-rowid-reads-a-match-after-an-unmatched-key {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t;
+    INSERT INTO t VALUES (1, 'a'), (2, 'b');
+    CREATE TABLE probe(id INTEGER PRIMARY KEY, vid);
+    INSERT INTO probe VALUES (1, NULL), (2, 2), (3, 'x'), (4, 1);
+    SELECT p.id, v.rowid, v.k FROM probe p LEFT JOIN v ON v.rowid = p.vid ORDER BY p.id;
+}
+expect {
+    1||
+    2|2|b
+    3||
+    4|1|a
+}
+
+test matview-rowid-range-reads {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t;
+    INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');
+    SELECT 'gt-lt', rowid, k FROM v WHERE rowid > 1 AND rowid < 4 ORDER BY rowid;
+    SELECT 'gt', rowid, k FROM v WHERE rowid > 3 ORDER BY rowid;
+    SELECT 'ge', rowid, k FROM v WHERE rowid >= 4 ORDER BY rowid;
+    SELECT 'lt', rowid, k FROM v WHERE rowid < 3 ORDER BY rowid;
+    SELECT 'le-desc', rowid, k FROM v WHERE rowid <= 2 ORDER BY rowid DESC;
+    SELECT 'between-desc', rowid, k FROM v WHERE rowid BETWEEN 2 AND 4 ORDER BY rowid DESC;
+}
+expect {
+    gt-lt|2|b
+    gt-lt|3|c
+    gt|4|d
+    gt|5|e
+    ge|4|d
+    ge|5|e
+    lt|1|a
+    lt|2|b
+    le-desc|2|b
+    le-desc|1|a
+    between-desc|4|d
+    between-desc|3|c
+    between-desc|2|b
+}
+
+test matview-rowid-range-reads-see-uncommitted-rows {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t;
+    INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');
+    BEGIN;
+    INSERT INTO t VALUES (6, 'f');
+    DELETE FROM t WHERE id = 3;
+    SELECT 'gt-lt', rowid, k FROM v WHERE rowid > 1 AND rowid < 5 ORDER BY rowid;
+    SELECT 'ge', rowid, k FROM v WHERE rowid >= 3 ORDER BY rowid;
+    SELECT 'between-desc', rowid, k FROM v WHERE rowid BETWEEN 2 AND 6 ORDER BY rowid DESC;
+}
+expect {
+    gt-lt|2|b
+    gt-lt|4|d
+    ge|4|d
+    ge|5|e
+    ge|6|f
+    between-desc|6|f
+    between-desc|5|e
+    between-desc|4|d
+    between-desc|2|b
+}
+
+test matview-reverse-rowid-reads {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t;
+    INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    SELECT 'desc', rowid, k FROM v ORDER BY rowid DESC;
+    SELECT 'max', max(rowid) FROM v;
+    SELECT 'last', k FROM v ORDER BY rowid DESC LIMIT 1;
+}
+expect {
+    desc|3|c
+    desc|2|b
+    desc|1|a
+    max|3
+    last|c
+}
+
+test matview-reverse-rowid-reads-see-uncommitted-rows {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t;
+    INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    BEGIN;
+    INSERT INTO t VALUES (4, 'd');
+    DELETE FROM t WHERE id = 2;
+    SELECT 'desc', rowid, k FROM v ORDER BY rowid DESC;
+    SELECT 'max', max(rowid) FROM v;
+    SELECT 'last', k FROM v ORDER BY rowid DESC LIMIT 1;
+}
+expect {
+    desc|4|d
+    desc|3|c
+    desc|1|a
+    max|4
+    last|d
+}
+
+test matview-reverse-rowid-read-of-an-empty-view {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t;
+    SELECT 'max', max(rowid) FROM v;
+    SELECT 'desc', rowid FROM v ORDER BY rowid DESC;
+}
+expect {
+    max|
+}
+
+test matview-rowid-below-a-text-key-reads-every-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t;
+    INSERT INTO t VALUES (1, 'a'), (2, 'b');
+    SELECT rowid, k FROM v WHERE rowid < 'x' ORDER BY rowid DESC;
+}
+expect {
+    2|b
+    1|a
+}
+
+test matview-rowid-seek-applies-numeric-affinity-to-the-key {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t;
+    INSERT INTO t VALUES (1, 'a'), (2, 'b');
+    CREATE TABLE probe(id INTEGER PRIMARY KEY, vid);
+    INSERT INTO probe VALUES (1, 1), (2, 1.0), (3, '1'), (4, 'x'), (5, NULL);
+    SELECT p.id, v.rowid, v.k FROM probe p LEFT JOIN v ON v.rowid = p.vid ORDER BY p.id;
+    SELECT 'real', rowid, k FROM v WHERE rowid = (SELECT 2.0);
+    SELECT 'text', rowid, k FROM v WHERE rowid = (SELECT '2');
+}
+expect {
+    1|1|a
+    2|1|a
+    3|1|a
+    4||
+    5||
+    real|2|b
+    text|2|b
+}
+
+test matview-on-the-hash-join-build-side-sees-uncommitted-rows {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t;
+    CREATE TABLE probe(id INTEGER PRIMARY KEY, kk TEXT);
+    WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300)
+    INSERT INTO t SELECT i, 'k' || i FROM n;
+    INSERT INTO probe SELECT id, k FROM t WHERE id % 2 = 0;
+    BEGIN;
+    INSERT INTO t VALUES (901, 'k2');
+    DELETE FROM t WHERE id = 4;
+    SELECT count(*), sum(X.id) FROM v X JOIN probe p ON p.kk = X.k;
+}
+expect {
+    150|23547
+}
+
+test matview-expression-columns-have-no-declared-type {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, st TEXT, k INTEGER);
+    CREATE MATERIALIZED VIEW agg AS SELECT st, count(*) AS n, sum(k) AS s FROM t GROUP BY st;
+    CREATE MATERIALIZED VIEW proj AS SELECT id, k + 1 AS kp, 1 AS one, CAST(k AS TEXT) AS kt FROM t;
+    SELECT 'agg', name, type FROM pragma_table_info('agg');
+    SELECT 'proj', name, type FROM pragma_table_info('proj');
+}
+expect {
+    agg|st|TEXT
+    agg|n|
+    agg|s|
+    proj|id|INTEGER
+    proj|kp|
+    proj|one|
+    proj|kt|TEXT
+}
+
+test matview-count-column-does-not-equal-a-text-key {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, st TEXT);
+    CREATE MATERIALIZED VIEW agg AS SELECT st, count(*) AS n FROM t GROUP BY st;
+    INSERT INTO t VALUES (1, 'X'), (2, 'X'), (3, 'Y');
+    SELECT 'int', st, n FROM agg WHERE n = 1;
+    SELECT 'text', st, n FROM agg WHERE n = '1';
+}
+expect {
+    int|Y|1
+}
+
+test matview-column-declared-type-follows-sqlite {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, st TEXT, k INTEGER);
+    CREATE MATERIALIZED VIEW mv AS SELECT
+        (k) AS paren, ((t.st)) AS parenqual,
+        CAST(k AS INTEGER) AS cint, CAST(k AS VARCHAR(10)) AS cvar, CAST(k AS NUMERIC) AS cnum,
+        CAST(k AS REAL) AS creal, CAST(k AS BLOB) AS cblob, CAST(k AS FOO) AS cfoo
+    FROM t;
+    SELECT name, type FROM pragma_table_info('mv');
+}
+expect {
+    paren|INTEGER
+    parenqual|TEXT
+    cint|INT
+    cvar|TEXT
+    cnum|NUM
+    creal|REAL
+    cblob|BLOB
+    cfoo|NUM
+}
+
+test matview-parenthesized-column-compares-as-its-source-column {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE MATERIALIZED VIEW mv AS SELECT (k) AS paren, CAST(k AS INTEGER) AS cint FROM t;
+    INSERT INTO t VALUES (1, 7);
+    SELECT 'paren', paren FROM mv WHERE paren = '7';
+    SELECT 'cint', cint FROM mv WHERE cint = '7';
+}
+expect {
+    paren|7
+    cint|7
 }

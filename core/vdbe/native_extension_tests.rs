@@ -1085,6 +1085,7 @@ fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
             &mut crate::HashMap::default(),
             &|_| None,
             &SqliteDialect,
+            &mut Vec::new(),
         )
         .unwrap();
     assert!(matches!(
