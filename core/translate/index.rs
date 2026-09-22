@@ -137,6 +137,14 @@ pub fn translate_create_index(
         }
         crate::bail_parse_error!("index {} already exists", original_idx_name.name.as_str());
     }
+    // A materialized view is registered in `tables` so it can be read like
+    // one (`Schema::add_materialized_view`), so it must be rejected before the
+    // table lookup: reached through the `else` below it never is, and the
+    // accepted index leaves a sqlite_schema row whose table does not exist at
+    // load time, which makes the database impossible to open.
+    if resolver.with_schema(database_id, |s| s.is_materialized_view(&tbl_name)) {
+        crate::bail_parse_error!("views may not be indexed");
+    }
     let table = resolver.with_schema(database_id, |s| s.get_table(&tbl_name));
     let Some(table) = table else {
         if resolver.with_schema(database_id, |s| {
@@ -151,9 +159,6 @@ pub fn translate_create_index(
             .unwrap_or_else(|| "main".to_string());
         crate::bail_parse_error!("no such table: {}.{}", db_name, original_tbl_name.as_str());
     };
-    if resolver.with_schema(database_id, |s| s.is_materialized_view(&tbl_name)) {
-        crate::bail_parse_error!("Error: cannot create index on materialized view '{tbl_name}'.");
-    }
     let Some(tbl) = table.btree() else {
         crate::bail_parse_error!("virtual tables may not be indexed");
     };
