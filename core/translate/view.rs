@@ -896,8 +896,20 @@ pub fn translate_refresh_materialized_view(
         )));
     }
 
-    // Clear matview data
+    // Clear matview data, and its indexes: the repopulation writes an entry
+    // for every row it rebuilds and nothing else.
     emit_clear_btree(program, view_cursor_id, &normalized_view_name);
+    let view_index_roots: Vec<i64> = resolver.with_schema(database_id, |s| {
+        s.get_indices(&normalized_view_name)
+            .map(|index| index.root_page)
+            .collect()
+    });
+    for root in view_index_roots {
+        program.emit_insn(Insn::ClearBtree {
+            db: database_id,
+            root,
+        });
+    }
 
     // Clear DBSP operator state
     use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
@@ -1168,6 +1180,14 @@ pub fn translate_drop_view(
         return Ok(());
     }
 
+    let view_indexes: Vec<_> = if is_materialized_view {
+        resolver.with_schema(database_id, |s| {
+            s.get_indices(&normalized_view_name).cloned().collect()
+        })
+    } else {
+        Vec::new()
+    };
+
     // If this is a materialized view, we need to destroy its btree as well
     // and also clean up the associated DBSP state table and index
     let dbsp_table_name = if is_materialized_view {
@@ -1183,6 +1203,14 @@ pub fn translate_drop_view(
                     is_temp: 0,
                 });
             }
+        }
+        for index in &view_indexes {
+            program.emit_insn(Insn::Destroy {
+                db: database_id,
+                root: index.root_page,
+                former_root_reg: 0, // No autovacuum
+                is_temp: 0,
+            });
         }
 
         // Construct the DBSP state table name
@@ -1461,8 +1489,9 @@ pub fn translate_drop_view(
         program.preassign_label_to_next_insn(dbsp_end_loop_label);
     }
 
-    // Delete the mirrors' sqlite_schema rows. Their btrees were destroyed above.
-    let mirror_schema_targets: Vec<(&'static str, String)> = mirror_table_names
+    // Delete the sqlite_schema rows of the mirrors and of the view's own
+    // indexes. Their btrees were destroyed above.
+    let schema_targets: Vec<(&'static str, String)> = mirror_table_names
         .iter()
         .flat_map(|name| {
             [
@@ -1473,8 +1502,9 @@ pub fn translate_drop_view(
                 ),
             ]
         })
+        .chain(view_indexes.iter().map(|i| ("index", i.name.clone())))
         .collect();
-    emit_delete_schema_rows(program, sqlite_schema_cursor_id, &mirror_schema_targets);
+    emit_delete_schema_rows(program, sqlite_schema_cursor_id, &schema_targets);
 
     // Remove the view from the in-memory schema
     program.emit_insn(Insn::DropView {

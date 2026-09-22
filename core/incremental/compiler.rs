@@ -23,7 +23,7 @@ use crate::incremental::recursive_operator::{
 use crate::schema::Type;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::types::IOResultOr;
-use crate::SqliteDialect;
+use crate::{turso_assert, SqliteDialect};
 // Note: logical module must be made pub(crate) in translate/mod.rs
 use crate::numeric::Numeric;
 use crate::sync::{atomic::Ordering, Arc};
@@ -66,7 +66,11 @@ pub enum WriteRowView {
     InsertRow {
         final_weight: isize,
     },
-    Done,
+    /// `row_is_live` is false when the row is absent from the view's btree
+    /// afterwards; the view's secondary indexes follow it.
+    Done {
+        row_is_live: bool,
+    },
 }
 
 impl WriteRowView {
@@ -82,20 +86,22 @@ impl WriteRowView {
     /// * `build_record` - Function that builds the record values to insert.
     ///   Takes the final_weight and returns the complete record values.
     /// * `weight` - The weight delta to apply
+    ///
+    /// Returns whether the row is live in the view afterwards.
     pub fn write_row(
         &mut self,
         cursor: &mut BTreeCursor,
         key: SeekKey,
         build_record: impl Fn(isize) -> Vec<Value>,
         weight: isize,
-    ) -> IOResultOr<()> {
+    ) -> IOResultOr<bool> {
         loop {
             match self {
                 WriteRowView::GetRecord => {
                     let res = return_if_io!(cursor.seek(key.clone(), SeekOp::GE { eq_only: true }));
                     if !matches!(res, SeekResult::Found) {
                         if weight <= 0 {
-                            *self = WriteRowView::Done;
+                            *self = WriteRowView::Done { row_is_live: false };
                         } else {
                             *self = WriteRowView::Insert {
                                 final_weight: weight,
@@ -139,7 +145,7 @@ impl WriteRowView {
                 }
                 WriteRowView::Delete => {
                     return_if_io!(cursor.delete());
-                    *self = WriteRowView::Done;
+                    *self = WriteRowView::Done { row_is_live: false };
                 }
                 WriteRowView::Insert { final_weight } => {
                     return_if_io!(cursor.seek(key.clone(), SeekOp::GE { eq_only: true }));
@@ -168,10 +174,10 @@ impl WriteRowView {
                     let btree_key = BTreeKey::new_table_rowid(key_i64, Some(&immutable_record));
 
                     return_if_io!(cursor.insert(&btree_key));
-                    *self = WriteRowView::Done;
+                    *self = WriteRowView::Done { row_is_live: true };
                 }
-                WriteRowView::Done => {
-                    return Ok(IOResult::Done(()));
+                WriteRowView::Done { row_is_live } => {
+                    return Ok(IOResult::Done(*row_is_live));
                 }
             }
         }
@@ -324,6 +330,124 @@ impl WriteRowViewIndex {
     }
 }
 
+/// One secondary index on a materialized view: where its btree lives and
+/// which output columns form the key.
+#[derive(Debug, Clone)]
+pub struct MatviewIndex {
+    pub index: Arc<crate::schema::Index>,
+    /// Positions in the view's output row that make up the key, in key order.
+    pub key_positions: Vec<usize>,
+}
+
+impl MatviewIndex {
+    /// The entry for a row, `[key values..., rowid]`, laid out like any
+    /// secondary index on a rowid table.
+    fn entry(&self, values: &[Value], rowid: i64) -> Result<ImmutableRecord> {
+        let mut key: Vec<Value> = Vec::with_capacity(self.key_positions.len() + 1);
+        for pos in &self.key_positions {
+            let v = values.get(*pos).ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "matview index {} key position {pos} out of range for a {}-column row",
+                    self.index.name,
+                    values.len()
+                ))
+            })?;
+            key.push(v.clone());
+        }
+        key.push(Value::from_i64(rowid));
+        ImmutableRecord::from_values(&key, key.len())
+    }
+
+    fn new_cursor(&self, pager: &Arc<Pager>) -> Result<Box<BTreeCursor>> {
+        let mut cursor = BTreeCursor::new_index_boxed(
+            pager.clone(),
+            self.index.root_page,
+            &self.index,
+            self.key_positions.len() + 1,
+        )?;
+        install_dbsp_yield_context(&mut cursor, pager);
+        Ok(cursor)
+    }
+}
+
+/// State machine that makes one row's index entry present or absent. Each
+/// arm issues one cursor op and advances only when it completes.
+///
+/// A `TryAdvance` seek resolves through `next()`, which can land on another
+/// row's entry, so `Check` compares the entry under the cursor with this
+/// row's before deleting it.
+#[derive(Debug, Default)]
+pub enum WriteIndexEntry {
+    #[default]
+    Start,
+    Advancing,
+    Check,
+    Inserting,
+    Deleting,
+    Done,
+}
+
+impl WriteIndexEntry {
+    /// `present` is whether the row is live in the view after its table write.
+    pub fn write(
+        &mut self,
+        cursor: &mut BTreeCursor,
+        entry: &ImmutableRecord,
+        present: bool,
+    ) -> IOResultOr<()> {
+        let seek_key = SeekKey::IndexKey(entry.as_record_ref());
+        let when_absent = || {
+            if present {
+                WriteIndexEntry::Inserting
+            } else {
+                WriteIndexEntry::Done
+            }
+        };
+        loop {
+            match self {
+                WriteIndexEntry::Start => {
+                    let res =
+                        return_if_io!(cursor.seek(seek_key.clone(), SeekOp::GE { eq_only: true }));
+                    *self = match res {
+                        SeekResult::Found => WriteIndexEntry::Check,
+                        SeekResult::TryAdvance => WriteIndexEntry::Advancing,
+                        SeekResult::NotFound => when_absent(),
+                    };
+                }
+                WriteIndexEntry::Advancing => {
+                    return_if_io!(cursor.next());
+                    *self = if cursor.has_record() {
+                        WriteIndexEntry::Check
+                    } else {
+                        when_absent()
+                    };
+                }
+                WriteIndexEntry::Check => {
+                    let at_cursor = return_if_io!(cursor.record());
+                    let is_ours = match at_cursor {
+                        Some(r) => r.get_values_owned()? == entry.get_values_owned()?,
+                        None => false,
+                    };
+                    *self = match (is_ours, present) {
+                        (true, true) | (false, false) => WriteIndexEntry::Done,
+                        (true, false) => WriteIndexEntry::Deleting,
+                        (false, true) => WriteIndexEntry::Inserting,
+                    };
+                }
+                WriteIndexEntry::Inserting => {
+                    return_if_io!(cursor.insert(&BTreeKey::new_index_key(entry.as_record_ref())));
+                    *self = WriteIndexEntry::Done;
+                }
+                WriteIndexEntry::Deleting => {
+                    return_if_io!(cursor.delete());
+                    *self = WriteIndexEntry::Done;
+                }
+                WriteIndexEntry::Done => return Ok(IOResult::Done(())),
+            }
+        }
+    }
+}
+
 /// State machine for commit operations
 pub enum CommitState {
     /// Initial state - ready to start commit
@@ -355,6 +479,20 @@ pub enum CommitState {
         num_columns: usize,
         /// ORDER BY info copied from circuit for building composite keys
         view_order_by: super::view::MatviewOrderBy,
+    },
+
+    /// Bringing the view's secondary indexes in step with the row `UpdateView`
+    /// just wrote, one index at a time.
+    UpdateViewIndexes {
+        delta: Delta,
+        /// The row in `delta.changes` whose index entries are being written.
+        current_index: usize,
+        row_is_live: bool,
+        /// Position in the circuit's `output_indexes`.
+        index_pos: usize,
+        entry_state: WriteIndexEntry,
+        index_cursor: Box<BTreeCursor>,
+        num_columns: usize,
     },
 
     /// Persisting each recursive operator's rowid-bookkeeping state to the DBSP
@@ -409,6 +547,19 @@ impl std::fmt::Debug for CommitState {
                 .field("current_index", current_index)
                 .field("write_row_state", write_row_state)
                 .field("has_view_cursor", &true)
+                .finish(),
+            Self::UpdateViewIndexes {
+                current_index,
+                row_is_live,
+                index_pos,
+                entry_state,
+                ..
+            } => f
+                .debug_struct("UpdateViewIndexes")
+                .field("current_index", current_index)
+                .field("row_is_live", row_is_live)
+                .field("index_pos", index_pos)
+                .field("entry_state", entry_state)
                 .finish(),
             Self::PersistRecursive {
                 ops,
@@ -773,6 +924,10 @@ pub struct DbspCircuit {
     /// Cleared at the start of each `commit()` / `execute()` so it never
     /// leaks across circuit runs.
     exec_node_cache: HashMap<i64, Delta>,
+
+    /// Secondary indexes on the view's output. The schema owns them; callers
+    /// hand the current set over before each commit.
+    output_indexes: Vec<MatviewIndex>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -805,7 +960,16 @@ impl DbspCircuit {
             order_by,
             limit,
             exec_node_cache: HashMap::default(),
+            output_indexes: Vec::new(),
         }
+    }
+
+    pub fn set_output_indexes(&mut self, indexes: Vec<MatviewIndex>) {
+        turso_assert!(
+            indexes.is_empty() || (self.order_by.is_empty() && self.limit.is_none()),
+            "an index on a materialized view with ORDER BY or LIMIT is refused at CREATE INDEX"
+        );
+        self.output_indexes = indexes;
     }
 
     /// Convenience constructor for tests and internal use where ORDER BY is not needed.
@@ -1401,11 +1565,24 @@ impl DbspCircuit {
                                 values
                             };
 
-                            return_and_restore_if_io!(
+                            let row_is_live = return_and_restore_if_io!(
                                 &mut self.commit_state,
                                 state,
                                 write_row_state.write_row(view_cursor, key, build_fn, weight)
                             );
+
+                            if let Some(first) = self.output_indexes.first() {
+                                self.commit_state = CommitState::UpdateViewIndexes {
+                                    delta: std::mem::take(delta),
+                                    current_index: *current_index,
+                                    row_is_live,
+                                    index_pos: 0,
+                                    entry_state: WriteIndexEntry::default(),
+                                    index_cursor: first.new_cursor(&pager)?,
+                                    num_columns: nc,
+                                };
+                                continue;
+                            }
                         }
 
                         // Move to next row
@@ -1426,6 +1603,53 @@ impl DbspCircuit {
                             view_order_by: view_order_by.clone(),
                         };
                     }
+                }
+                CommitState::UpdateViewIndexes {
+                    delta,
+                    current_index,
+                    row_is_live,
+                    index_pos,
+                    entry_state,
+                    index_cursor,
+                    num_columns,
+                } => {
+                    let row = &delta.changes[*current_index].0;
+                    let entry = self.output_indexes[*index_pos].entry(&row.values, row.rowid)?;
+                    return_and_restore_if_io!(
+                        &mut self.commit_state,
+                        state,
+                        entry_state.write(index_cursor, &entry, *row_is_live)
+                    );
+
+                    let delta = std::mem::take(delta);
+                    let next_pos = *index_pos + 1;
+                    self.commit_state = if let Some(next) = self.output_indexes.get(next_pos) {
+                        CommitState::UpdateViewIndexes {
+                            delta,
+                            current_index: *current_index,
+                            row_is_live: *row_is_live,
+                            index_pos: next_pos,
+                            entry_state: WriteIndexEntry::default(),
+                            index_cursor: next.new_cursor(&pager)?,
+                            num_columns: *num_columns,
+                        }
+                    } else {
+                        CommitState::UpdateView {
+                            delta,
+                            current_index: *current_index + 1,
+                            write_row_state: WriteRowView::new(),
+                            write_row_index_state: WriteRowViewIndex::new(),
+                            view_cursor: self.new_view_cursor(
+                                &pager,
+                                false,
+                                &self.order_by,
+                                *num_columns,
+                            ),
+                            is_index_organized: false,
+                            num_columns: *num_columns,
+                            view_order_by: self.order_by.clone(),
+                        }
+                    };
                 }
                 CommitState::PersistRecursive {
                     delta,
