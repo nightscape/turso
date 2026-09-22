@@ -813,6 +813,43 @@ impl MaterializedViewCursor {
         Ok(IOResult::Done(result == SeekResult::Found))
     }
 
+    /// Positions on the row with the largest rowid. Reverse reads walk the
+    /// view in rowid order, which ORDER BY views and LIMIT views do not keep.
+    pub fn last(&mut self) -> IOResultOr<()> {
+        self.btree_cursor.set_null_flag(false);
+        return_if_io!(self.ensure_tx_changes_computed());
+        self.check_reverse_read_supported()?;
+        return_if_io!(self.do_seek(i64::MAX, SeekOp::LE { eq_only: false }));
+        Ok(IOResult::Done(()))
+    }
+
+    pub fn prev(&mut self) -> IOResultOr<bool> {
+        self.check_reverse_read_supported()?;
+        // A seek interrupted by IO resumes from `seek_state`, as in `next`.
+        if matches!(
+            self.seek_state,
+            SeekState::Seek { .. } | SeekState::Advancing { .. }
+        ) {
+            let result = return_if_io!(self.do_seek(0, SeekOp::LT));
+            return Ok(IOResult::Done(result == SeekResult::Found));
+        }
+        let Some((current_rowid, _)) = &self.current_row else {
+            return Ok(IOResult::Done(false));
+        };
+        let result = return_if_io!(self.do_seek(*current_rowid, SeekOp::LT));
+        Ok(IOResult::Done(result == SeekResult::Found))
+    }
+
+    fn check_reverse_read_supported(&self) -> Result<()> {
+        if self.is_index_organized || (self.limit.is_some() && !self.full_result_mode) {
+            return Err(LimboError::ParseError(
+                "Reverse rowid-order reads are not supported on materialized views with ORDER BY or LIMIT"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Cursor advance for ORDER BY views.
     /// - With overlay: consume from the materialized snapshot.
     /// - Without overlay: walk the btree in composite-key order.
@@ -839,8 +876,8 @@ impl MaterializedViewCursor {
 
     /// `NullRow` sets the flag on the inner btree cursor; `current_row` keeps
     /// the last row this cursor produced, so row reads consult the flag first.
-    /// `seek` and `rewind` clear it: not every path through them repositions
-    /// the inner cursor.
+    /// The positioning methods clear it: not every path through them
+    /// repositions the inner cursor.
     fn is_null_row(&self) -> bool {
         self.btree_cursor.get_null_flag()
     }

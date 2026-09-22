@@ -3436,7 +3436,6 @@ impl Cursor {
         match self {
             Self::BTree(cursor) => cursor.as_mut(),
             Self::Dyn(cursor) => cursor.as_mut(),
-            Self::MaterializedView(cursor) => cursor.btree_cursor_mut(),
             _ => {
                 mark_unlikely();
                 panic!("Cursor is not a btree cursor");

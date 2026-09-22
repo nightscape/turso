@@ -1951,9 +1951,14 @@ pub fn op_last(
     assert!(pc_if_empty.is_offset());
     let is_empty = {
         let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Last");
-        let cursor = cursor.as_btree_mut();
-        return_if_io!(state, cursor.last());
-        cursor.is_empty()
+        if let Cursor::MaterializedView(mv_cursor) = cursor {
+            return_if_io!(state, mv_cursor.last());
+            !mv_cursor.is_valid()?
+        } else {
+            let cursor = cursor.as_btree_mut();
+            return_if_io!(state, cursor.last());
+            cursor.is_empty()
+        }
     };
     if is_empty {
         state.pc = pc_if_empty.as_offset_int();
@@ -3703,13 +3708,16 @@ pub fn op_prev(
     );
     let is_empty = {
         let cursor = must_be_btree_cursor!(*cursor_id, program.cursor_ref, state, "Prev");
-        let cursor = cursor.as_btree_mut();
-        match cursor.prev_row() {
-            CursorStep::Row => false,
-            CursorStep::Empty => true,
-            CursorStep::Error(err) => return Err(err),
-            CursorStep::IO(io) => {
-                return Ok(state.suspend_on_io(io));
+        if let Cursor::MaterializedView(mv_cursor) = cursor {
+            !return_if_io!(state, mv_cursor.prev())
+        } else {
+            match cursor.as_btree_mut().prev_row() {
+                CursorStep::Row => false,
+                CursorStep::Empty => true,
+                CursorStep::Error(err) => return Err(err),
+                CursorStep::IO(io) => {
+                    return Ok(state.suspend_on_io(io));
+                }
             }
         }
     };
@@ -6820,8 +6828,12 @@ pub fn seek_internal(
                 OpSeekState::Seek { key, op } => {
                     let seek_result = match key {
                         OpSeekKey::TableRowId(rowid) => {
-                            let cursor = get_cursor!(state, cursor_id).as_btree_mut();
-                            match cursor.seek(SeekKey::TableRowId(*rowid), *op)? {
+                            let key = SeekKey::TableRowId(*rowid);
+                            let seeked = match get_cursor!(state, cursor_id) {
+                                Cursor::MaterializedView(mv_cursor) => mv_cursor.seek(key, *op)?,
+                                cursor => cursor.as_btree_mut().seek(key, *op)?,
+                            };
+                            match seeked {
                                 IOResult::Done(seek_result) => seek_result,
                                 IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
                             }
@@ -6929,6 +6941,17 @@ pub fn seek_internal(
                 }
                 OpSeekState::MoveLast => {
                     let cursor = state.get_cursor(cursor_id);
+                    if let Cursor::MaterializedView(mv_cursor) = cursor {
+                        match mv_cursor.last()? {
+                            IOResult::Done(()) => {}
+                            IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
+                        }
+                        return Ok(if mv_cursor.is_valid()? {
+                            SeekInternalResult::Found
+                        } else {
+                            SeekInternalResult::NotFound
+                        });
+                    }
                     let cursor = cursor.as_btree_mut();
                     match cursor.last()? {
                         IOResult::Done(()) => {}
