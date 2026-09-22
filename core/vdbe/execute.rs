@@ -1495,6 +1495,47 @@ pub fn op_open_read(
                 .replace(cursor.into_cursor());
         }
         CursorType::BTreeIndex(index) => {
+            // An index on a materialized view holds only COMMITTED rows: it is
+            // maintained by `apply_view_deltas` at commit, while this
+            // transaction's own changes live in the view cursor's overlay.
+            // Driving a read from the index would skip them silently, so
+            // refuse — but only for a view THIS connection has actually
+            // written to. An open transaction that has not touched this view's
+            // bases leaves its overlay empty and reads normally. IVM
+            // maintenance is unaffected: it builds its own index cursors
+            // (`DbspCircuit::new_index_cursor`), never through OpenRead.
+            // The dependency is TRANSITIVE: a base-table write stages a delta
+            // for the view directly above it, and every view chained on top of
+            // that one is equally stale until commit. So test the whole
+            // closure, with the same walk the cursor layer feeds its circuit
+            // from (`Schema::dfs_upstream_matviews`).
+            let pending_view = {
+                let schema = program.connection.schema.read();
+                schema
+                    .matview_dependency_closure(&index.table_name)
+                    .into_iter()
+                    .find(|name| {
+                        program
+                            .connection
+                            .view_transaction_states
+                            .get(name)
+                            .is_some_and(|tx_state| !tx_state.is_empty())
+                    })
+            };
+            if let Some(pending) = pending_view {
+                let on_view = &index.table_name;
+                let via = if pending == *on_view {
+                    String::new()
+                } else {
+                    format!(" (through '{pending}', which it reads)")
+                };
+                return Err(LimboError::ParseError(format!(
+                    "index '{}' on materialized view '{on_view}'{via} cannot be read while this \
+                     transaction has uncommitted changes to it; commit first",
+                    index.name,
+                ))
+                .into());
+            }
             let btree_cursor = BTreeCursor::new_index_boxed(
                 pager,
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
@@ -2288,7 +2329,8 @@ fn op_column_fetch_other(
     {
         let cursor = state.get_cursor(cursor_id);
         if let Cursor::MaterializedView(mv_cursor) = cursor {
-            // Handle materialized view column access
+            // `column` honours the outer-join null flag itself, so every
+            // caller of the wrapper inherits it.
             let value = return_if_io!(state, mv_cursor.column(column));
             state.registers[dest].set_value(value);
             return Ok(InsnFunctionStepResult::Step);
@@ -6284,11 +6326,28 @@ fn op_row_id_deferred(state: &mut ProgramState, cursor_id: usize, dest: usize) -
             } => {
                 {
                     let table_cursor = state.get_cursor(table_cursor_id);
-                    let table_cursor = table_cursor.as_btree_mut();
-                    return_if_io!(
-                        state,
-                        table_cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                    );
+                    // A materialized view must be positioned through its own
+                    // cursor: `as_btree_mut()` hands out the INNER btree and
+                    // leaves the wrapper's `current_row` — the only thing its
+                    // `rowid()` and `column()` read — behind. Mirrors the
+                    // matview arm in `op_column_impl`'s `Seek` state.
+                    match table_cursor {
+                        Cursor::MaterializedView(mv_cursor) => {
+                            return_if_io!(
+                                state,
+                                mv_cursor
+                                    .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
+                            );
+                        }
+                        _ => {
+                            let table_cursor = table_cursor.as_btree_mut();
+                            return_if_io!(
+                                state,
+                                table_cursor
+                                    .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
+                            );
+                        }
+                    }
                 }
                 *state.active_op_state.row_id() = OpRowIdState::GetRowid;
             }

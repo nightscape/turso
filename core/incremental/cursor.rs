@@ -283,36 +283,9 @@ impl MaterializedViewCursor {
         let mut order: Vec<String> = Vec::new();
         // DFS each direct reference; only matview references contribute.
         for name in &direct_refs {
-            Self::dfs_upstream(&schema, name, &mut visited, &mut order);
+            schema.dfs_upstream_matviews(name, &mut visited, &mut order);
         }
         order
-    }
-
-    fn dfs_upstream(
-        schema: &crate::schema::Schema,
-        name: &str,
-        visited: &mut std::collections::HashSet<String>,
-        order: &mut Vec<String>,
-    ) {
-        if visited.contains(name) {
-            return;
-        }
-        let Some(view_arc) = schema.get_materialized_view(name) else {
-            return;
-        };
-        visited.insert(name.to_string());
-        let upstream_refs: Vec<String> = {
-            let upstream = view_arc.lock();
-            upstream
-                .get_referenced_tables()
-                .iter()
-                .map(|t| t.name.clone())
-                .collect()
-        };
-        for upstream_name in &upstream_refs {
-            Self::dfs_upstream(schema, upstream_name, visited, order);
-        }
-        order.push(name.to_string());
     }
 
     /// Compute the uncommitted output delta for each transitively-upstream
@@ -836,7 +809,19 @@ impl MaterializedViewCursor {
         }
     }
 
+    /// The unmatched side of an outer join. `NullRow` can only record that on
+    /// the inner btree cursor (`Cursor::set_null_flag`), so every read through
+    /// the wrapper has to consult it: `current_row` still holds the last row
+    /// this cursor seeked, and without the check the view reports THAT row's
+    /// values for a row which did not match.
+    fn is_null_row(&self) -> bool {
+        self.btree_cursor.get_null_flag()
+    }
+
     pub fn column(&mut self, col: usize) -> IOResultOr<Value> {
+        if self.is_null_row() {
+            return Ok(IOResult::Done(Value::Null));
+        }
         if let Some((_, ref values)) = self.current_row {
             Ok(IOResult::Done(
                 values.get(col).cloned().unwrap_or(Value::Null),
@@ -847,6 +832,9 @@ impl MaterializedViewCursor {
     }
 
     pub fn rowid(&self) -> IOResultOr<Option<i64>> {
+        if self.is_null_row() {
+            return Ok(IOResult::Done(None));
+        }
         Ok(IOResult::Done(self.current_row.as_ref().map(|(id, _)| *id)))
     }
 
