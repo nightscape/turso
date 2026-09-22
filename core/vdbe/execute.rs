@@ -1326,6 +1326,19 @@ fn ensure_index_method_context(
     Ok(context)
 }
 
+/// The view's transaction state for a read. A missing one is not created: a
+/// spurious entry would make `apply_view_deltas` process this view with empty
+/// deltas at commit, overwriting the output delta of a prior write.
+fn view_transaction_state_for_read(
+    conn: &Connection,
+    view_mutex: &Arc<crate::sync::Mutex<crate::incremental::view::IncrementalView>>,
+) -> Arc<crate::incremental::view::ViewTransactionState> {
+    let view_name = view_mutex.lock().name().to_string();
+    conn.view_transaction_states
+        .get(&view_name)
+        .unwrap_or_else(|| Arc::new(crate::incremental::view::ViewTransactionState::new()))
+}
+
 pub fn op_open_read(
     program: &Program,
     state: &mut ProgramState,
@@ -1437,18 +1450,7 @@ pub fn op_open_read(
             };
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, mvcc_cursor_type)?;
 
-            // Look up the view's transaction state if it exists.
-            // Don't create one here — creating a spurious entry would cause
-            // apply_view_deltas to process this view with empty deltas during
-            // commit, overwriting any correct output_delta from a prior write.
-            let view_name = view_mutex.lock().name().to_string();
-            let tx_state = program
-                .connection
-                .view_transaction_states
-                .get(&view_name)
-                .unwrap_or_else(|| {
-                    std::sync::Arc::new(crate::incremental::view::ViewTransactionState::new())
-                });
+            let tx_state = view_transaction_state_for_read(&program.connection, view_mutex);
 
             // Create materialized view cursor with this view's transaction state
             let mv_cursor = crate::incremental::cursor::MaterializedViewCursor::new(
@@ -1496,7 +1498,7 @@ pub fn op_open_read(
         }
         CursorType::BTreeIndex(index) => {
             let btree_cursor = BTreeCursor::new_index_boxed(
-                pager,
+                pager.clone(),
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 index.as_ref(),
                 num_columns,
@@ -1506,12 +1508,41 @@ pub fn op_open_read(
             } else {
                 IndexInfo::new_from_index(index)?
             });
-            let cursor =
-                maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
+            let cursor = maybe_promote_to_mvcc_cursor(
+                btree_cursor,
+                MvccCursorType::Index(index_info.clone()),
+            )?;
+            let view_mutex = program
+                .connection
+                .schema
+                .read()
+                .get_materialized_view(&index.table_name);
+            let cursor = match view_mutex {
+                Some(view_mutex) => {
+                    let tx_state =
+                        view_transaction_state_for_read(&program.connection, &view_mutex);
+                    let overlay = crate::incremental::cursor::ViewOverlay::new(
+                        view_mutex,
+                        pager.clone(),
+                        tx_state,
+                        program.connection.clone(),
+                    );
+                    Cursor::Dyn(Box::new(
+                        crate::incremental::index_cursor::MaterializedViewIndexCursor::new(
+                            cursor.into_dyn(),
+                            pager,
+                            overlay,
+                            index_info,
+                            index.columns.iter().map(|c| c.pos_in_table).collect(),
+                        ),
+                    ))
+                }
+                None => cursor.into_cursor(),
+            };
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
-                .replace(cursor.into_cursor());
+                .replace(cursor);
         }
         CursorType::Pseudo(_) => {
             panic!("OpenRead on pseudo cursor");
