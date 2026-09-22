@@ -3026,6 +3026,7 @@ impl Program {
                     let schema = self.connection.schema.read();
                     if let Some(view_mutex) = schema.get_materialized_view(view_name) {
                         let mut view = view_mutex.lock();
+                        view.set_output_indexes(schema.matview_indexes(view_name));
 
                         // Create a DeltaSet from the per-table deltas
                         let mut delta_set = crate::incremental::compiler::DeltaSet::new();

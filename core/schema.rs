@@ -763,6 +763,10 @@ pub struct Schema {
     /// Materialized views in sqlite_schema that failed to load, mapped to why.
     pub incompatible_views: HashMap<String, IncompatibleViewReason>,
 
+    /// `CREATE INDEX` rows whose table is a materialized view, held by
+    /// `populate_indices` until `populate_materialized_views` registers the view.
+    pub(crate) deferred_matview_indexes: Vec<UnparsedFromSqlIndex>,
+
     /// View rows in sqlite_schema whose stored SQL failed to parse (e.g.
     /// older versions wrote view column lists without identifier quoting).
     /// The rows are tolerated at load time so the database stays usable;
@@ -922,6 +926,7 @@ impl Schema {
             analyze_stats: AnalyzeStats::default(),
             table_to_materialized_views,
             incompatible_views,
+            deferred_matview_indexes: Vec::new(),
             broken_views: HashSet::default(),
             dropped_root_pages: HashSet::default(),
             type_registry,
@@ -1190,6 +1195,7 @@ impl Schema {
         } else if self.materialized_view_names.contains(&name) {
             // Remove from tables
             self.remove_table(&name);
+            self.remove_indices_for_table(&name);
 
             // Remove DBSP state table and its indexes from in-memory schema
             let dbsp_table_name = format!("{DBSP_TABLE_PREFIX}{DBSP_CIRCUIT_VERSION}_{name}");
@@ -1667,6 +1673,32 @@ impl Schema {
             .filter(|i| !i.is_backing_btree_index())
     }
 
+    /// The secondary indexes on a materialized view, as the view's delta
+    /// applier maintains them.
+    pub fn matview_indexes(
+        &self,
+        view_name: &str,
+    ) -> Vec<crate::incremental::compiler::MatviewIndex> {
+        self.get_indices(view_name)
+            .map(|idx| {
+                turso_assert!(
+                    idx.columns.iter().all(|c| c.expr.is_none()),
+                    "expression index on a materialized view is refused at CREATE INDEX",
+                    { "index": idx.name, "view": view_name }
+                );
+                turso_assert!(
+                    idx.where_clause.is_none(),
+                    "partial index on a materialized view is refused at CREATE INDEX",
+                    { "index": idx.name, "view": view_name }
+                );
+                crate::incremental::compiler::MatviewIndex {
+                    index: idx.clone(),
+                    key_positions: idx.columns.iter().map(|c| c.pos_in_table).collect(),
+                }
+            })
+            .collect()
+    }
+
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     pub fn has_fts_index(&self, table_name: &str) -> bool {
         self.get_indices(table_name).any(|idx| {
@@ -1898,6 +1930,7 @@ impl Schema {
                         }
 
                         self.populate_materialized_views(
+                            syms,
                             acc.materialized_view_info,
                             acc.dbsp_state_roots,
                             acc.dbsp_state_index_roots,
@@ -1982,19 +2015,12 @@ impl Schema {
         for unparsed_sql_from_index in from_sql_indexes {
             let table_name = &unparsed_sql_from_index.table_name;
             let Some(table) = self.get_btree_table(table_name) else {
-                let normalized = self.normalize_table_lookup_name(table_name);
-                let hint = if known_matview_names.contains(&normalized)
-                    || self.incremental_views.contains_key(&normalized)
-                {
-                    format!(
-                        " — '{table_name}' is a materialized view, not a regular table; \
-                         indexes cannot be created on materialized views"
-                    )
-                } else {
-                    String::new()
-                };
+                if known_matview_names.contains(&self.normalize_table_lookup_name(table_name)) {
+                    self.deferred_matview_indexes.push(unparsed_sql_from_index);
+                    continue;
+                }
                 return Err(LimboError::ParseError(format!(
-                    "Index references unknown table '{table_name}'{hint}. \
+                    "Index references unknown table '{table_name}'. \
                      The schema row in sqlite_master is stale or corrupt. SQL: {}",
                     unparsed_sql_from_index.sql,
                 )));
@@ -2136,6 +2162,7 @@ impl Schema {
     /// If a full pass makes zero progress, there is a circular or unresolvable dependency.
     pub fn populate_materialized_views(
         &mut self,
+        syms: &SymbolTable,
         materialized_view_info: HashMap<String, (String, i64)>,
         dbsp_state_roots: HashMap<String, i64>,
         dbsp_state_index_roots: HashMap<String, i64>,
@@ -2251,6 +2278,25 @@ impl Schema {
             }
         }
 
+        self.attach_deferred_matview_indexes(syms)
+    }
+
+    fn attach_deferred_matview_indexes(&mut self, syms: &SymbolTable) -> Result<()> {
+        for unparsed in std::mem::take(&mut self.deferred_matview_indexes) {
+            let Some(table) = self.get_btree_table(&unparsed.table_name) else {
+                // The view is already reported unusable, and so is its index.
+                if self.is_unusable_view(&self.normalize_table_lookup_name(&unparsed.table_name)) {
+                    continue;
+                }
+                return Err(LimboError::Corrupt(format!(
+                    "sqlite_schema contains index for materialized view '{}', which neither \
+                     loaded nor was reported unusable: rootpage={} sql={}",
+                    unparsed.table_name, unparsed.root_page, unparsed.sql,
+                )));
+            };
+            let index = Index::from_sql(syms, &unparsed.sql, unparsed.root_page, table.as_ref())?;
+            self.add_index(Arc::new(index))?;
+        }
         Ok(())
     }
 
@@ -3215,6 +3261,7 @@ impl TryClone for Schema {
             analyze_stats: self.analyze_stats.clone(),
             table_to_materialized_views: self.table_to_materialized_views.try_clone()?,
             incompatible_views,
+            deferred_matview_indexes: self.deferred_matview_indexes.try_clone()?,
             broken_views: self.broken_views.try_clone()?,
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
@@ -6782,6 +6829,7 @@ mod matview_dependency_classification_tests {
                 ),
             ];
         let result = schema.populate_materialized_views(
+            &SymbolTable::default(),
             view_info(views),
             dbsp_roots(views),
             HashMap::default(),
@@ -6840,6 +6888,7 @@ mod matview_dependency_classification_tests {
             ),
         ];
         let result = schema.populate_materialized_views(
+            &SymbolTable::default(),
             view_info(views),
             dbsp_roots(views),
             HashMap::default(),

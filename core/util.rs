@@ -204,10 +204,23 @@ pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 /// Unparsed index that comes from a sql query, i.e not an automatic index
 ///
 /// CREATE INDEX idx ON table_name(sql)
+#[derive(Debug)]
 pub struct UnparsedFromSqlIndex {
     pub table_name: String,
     pub root_page: i64,
     pub sql: String,
+}
+
+impl crate::alloc::TryClone for UnparsedFromSqlIndex {
+    type Error = crate::alloc::TryReserveError;
+
+    fn try_clone(&self) -> std::result::Result<Self, Self::Error> {
+        Ok(Self {
+            table_name: self.table_name.clone(),
+            root_page: self.root_page,
+            sql: self.sql.clone(),
+        })
+    }
 }
 
 /// Carries the in-progress state of [`parse_schema_rows`] across IO yields:
@@ -326,6 +339,7 @@ pub fn parse_schema_rows(
     }
 
     schema.populate_materialized_views(
+        syms,
         inner.materialized_view_info,
         inner.dbsp_state_roots,
         inner.dbsp_state_index_roots,
