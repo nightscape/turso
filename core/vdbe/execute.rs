@@ -15527,6 +15527,7 @@ fn op_parse_schema_step(state: &mut ProgramState, conn: &Arc<Connection>) -> Ins
                     schema.populate_foreign_table(&name, &sql, &syms)?;
                 }
                 let res2 = schema.populate_materialized_views(
+                    &syms,
                     materialized_view_info,
                     dbsp_state_roots,
                     dbsp_state_index_roots,
@@ -16033,6 +16034,7 @@ pub fn op_populate_materialized_views(
         let schema = conn.schema.read();
         if let Some(view) = schema.get_materialized_view(&view_name) {
             let mut view = view.lock();
+            view.set_output_indexes(schema.matview_indexes(&view_name));
             // Drop the schema borrow before calling populate_from_table
             drop(schema);
 
