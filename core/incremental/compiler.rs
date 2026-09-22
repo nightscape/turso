@@ -389,6 +389,8 @@ pub enum WriteIndexEntry {
 
 impl WriteIndexEntry {
     /// `present` is whether the row is live in the view after its table write.
+    /// A row that is not live was just deleted from the view, so it must own
+    /// an entry here.
     pub fn write(
         &mut self,
         cursor: &mut BTreeCursor,
@@ -397,11 +399,12 @@ impl WriteIndexEntry {
     ) -> IOResultOr<()> {
         let seek_key = SeekKey::IndexKey(entry.as_record_ref());
         let when_absent = || {
-            if present {
-                WriteIndexEntry::Inserting
-            } else {
-                WriteIndexEntry::Done
-            }
+            turso_assert!(
+                present,
+                "the circuit retracted a row whose index entry does not exist",
+                { "entry": format!("{entry:?}") }
+            );
+            WriteIndexEntry::Inserting
         };
         loop {
             match self {
@@ -429,9 +432,9 @@ impl WriteIndexEntry {
                         None => false,
                     };
                     *self = match (is_ours, present) {
-                        (true, true) | (false, false) => WriteIndexEntry::Done,
+                        (true, true) => WriteIndexEntry::Done,
                         (true, false) => WriteIndexEntry::Deleting,
-                        (false, true) => WriteIndexEntry::Inserting,
+                        (false, _) => when_absent(),
                     };
                 }
                 WriteIndexEntry::Inserting => {
