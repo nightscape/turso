@@ -1297,6 +1297,51 @@ impl Schema {
             .push(view_name);
     }
 
+    /// Walk `name` and everything it transitively reads, appending every
+    /// materialized view found to `order`, deepest first. Non-matview
+    /// references contribute nothing. `name` itself is included when it is a
+    /// materialized view.
+    ///
+    /// The single definition of "which views does this one depend on": the
+    /// matview cursor uses it to feed upstream deltas into its circuit, and
+    /// `OpenRead` uses it to decide whether an index on a view may be read
+    /// inside this transaction. Those two must not drift apart.
+    pub fn dfs_upstream_matviews(
+        &self,
+        name: &str,
+        visited: &mut std::collections::HashSet<String>,
+        order: &mut Vec<String>,
+    ) {
+        if visited.contains(name) {
+            return;
+        }
+        let Some(view_arc) = self.get_materialized_view(name) else {
+            return;
+        };
+        visited.insert(name.to_string());
+        let upstream_refs: Vec<String> = {
+            let upstream = view_arc.lock();
+            upstream
+                .get_referenced_tables()
+                .iter()
+                .map(|t| t.name.clone())
+                .collect()
+        };
+        for upstream_name in &upstream_refs {
+            self.dfs_upstream_matviews(upstream_name, visited, order);
+        }
+        order.push(name.to_string());
+    }
+
+    /// `view_name` together with every materialized view it transitively
+    /// reads. Empty when `view_name` is not a materialized view.
+    pub fn matview_dependency_closure(&self, view_name: &str) -> Vec<String> {
+        let mut visited = std::collections::HashSet::<String>::new();
+        let mut order: Vec<String> = Vec::new();
+        self.dfs_upstream_matviews(view_name, &mut visited, &mut order);
+        order
+    }
+
     /// Get all materialized views that depend on a given table
     pub fn get_dependent_materialized_views(&self, table_name: &str) -> Vec<String> {
         if self.table_to_materialized_views.is_empty() {
