@@ -2638,15 +2638,6 @@ expect {
     end
 }
 
-test matview-create-index-is-refused {
-    CREATE TABLE t(id TEXT PRIMARY KEY, st TEXT);
-    CREATE MATERIALIZED VIEW v AS SELECT id, st FROM t;
-    CREATE INDEX idx_v_st ON v(st);
-}
-expect error {
-    views may not be indexed
-}
-
 test matview-aggregate-with-a-literal-over-an-empty-view {
     CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
     CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t;

@@ -1,3 +1,4 @@
+mod matview_index_oracle;
 mod test_alter_table_reopen;
 mod test_btree;
 mod test_cdc_callback_attached;
@@ -35,7 +36,12 @@ mod test_ivm_left_join;
 mod test_ivm_left_join_aggregate_duplicate;
 mod test_ivm_matview_ddl_column_validation;
 mod test_ivm_matview_first_open_partial;
+mod test_ivm_matview_index;
+mod test_ivm_matview_index_overlay;
+mod test_ivm_matview_index_overlay_fork;
+mod test_ivm_matview_index_reads;
 mod test_ivm_matview_index_txn;
+mod test_ivm_matview_index_types;
 mod test_ivm_nested_join;
 mod test_ivm_pager_bulk_insert;
 mod test_ivm_populate_stash_drop;

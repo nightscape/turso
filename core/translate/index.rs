@@ -137,10 +137,40 @@ pub fn translate_create_index(
         }
         crate::bail_parse_error!("index {} already exists", original_idx_name.name.as_str());
     }
-    if resolver.with_schema(database_id, |s| {
-        s.get_view(&tbl_name).is_some() || s.is_materialized_view(&tbl_name)
-    }) {
+    if resolver.with_schema(database_id, |s| s.get_view(&tbl_name).is_some()) {
         crate::bail_parse_error!("views may not be indexed");
+    }
+    // The delta applier (`core/incremental/compiler.rs`) maintains a plain,
+    // total, non-unique key over the output columns of a rowid-stored view;
+    // an index-organized view (ORDER BY, LIMIT) has no rowid btree to index.
+    let matview = resolver.with_schema(database_id, |s| s.get_materialized_view(&tbl_name));
+    if let Some(view) = &matview {
+        let view = view.lock();
+        if view.limit.is_some() {
+            crate::bail_parse_error!(
+                "index on materialized view '{tbl_name}' with LIMIT is not supported"
+            );
+        }
+        if view.has_order_by {
+            crate::bail_parse_error!(
+                "index on materialized view '{tbl_name}' with ORDER BY is not supported"
+            );
+        }
+        if unique {
+            crate::bail_parse_error!(
+                "UNIQUE index on materialized view '{tbl_name}' is not supported"
+            );
+        }
+        if where_clause.is_some() {
+            crate::bail_parse_error!(
+                "partial index on materialized view '{tbl_name}' is not supported"
+            );
+        }
+        if using.is_some() {
+            crate::bail_parse_error!(
+                "index method on materialized view '{tbl_name}' is not supported"
+            );
+        }
     }
     let table = resolver.with_schema(database_id, |s| s.get_table(&tbl_name));
     let Some(table) = table else {
@@ -158,6 +188,11 @@ pub fn translate_create_index(
         bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
     }
     let columns = resolve_sorted_columns_with_resolver(&tbl, &columns, Some(resolver))?;
+    if matview.is_some() && columns.iter().any(|c| c.expr.is_some()) {
+        crate::bail_parse_error!(
+            "expression index on materialized view '{tbl_name}' is not supported"
+        );
+    }
 
     // Block CREATE INDEX on non-orderable custom type columns and STRUCT/UNION columns
     for col in &columns {
