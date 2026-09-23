@@ -279,6 +279,7 @@ pub fn translate_create_index(
         &tbl_name,
         root_page_reg,
         Some(sql),
+        database_id,
     )?;
 
     emit_refill_index(
@@ -1347,6 +1348,7 @@ pub fn translate_drop_index(
             None,
             None,
             SQLITE_TABLEID,
+            database_id,
         )?;
     }
 

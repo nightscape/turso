@@ -87,6 +87,7 @@ pub fn emit_sequence_backing_table(
         &backing_table_name,
         table_root_reg,
         Some(sql.clone()),
+        database_id,
     )?;
 
     // Open the newly-created table by its root page register and insert the initial row.

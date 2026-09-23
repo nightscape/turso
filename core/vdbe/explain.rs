@@ -2753,6 +2753,7 @@ pub fn insn_to_row(
             format!("db={db}"),
         ),
         Insn::NotifyCdcChange {
+            database_id,
             table_name_reg,
             change_type,
             rowid_reg,
@@ -2765,7 +2766,7 @@ pub fn insn_to_row(
             *rowid_reg as i64,
             Value::build_text(format!("before={before_record_reg} after={after_record_reg}")),
             0,
-            String::new(),
+            format!("db={database_id}"),
         ),
         Insn::InitCdcVersion { cdc_table_name, version, cdc_mode } => (
     "InitCdcVersion",

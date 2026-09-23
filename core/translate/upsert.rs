@@ -1436,6 +1436,7 @@ pub fn emit_upsert(
                 None,
                 None,
                 table.get_name(),
+                upsert_database_id,
             )?;
 
             // INSERT (after)
@@ -1456,6 +1457,7 @@ pub fn emit_upsert(
                 after_rec,
                 None,
                 table.get_name(),
+                upsert_database_id,
             )?;
         } else {
             let after_rec = if program.capture_data_changes_info().has_after() {
@@ -1490,6 +1492,7 @@ pub fn emit_upsert(
                 after_rec,
                 None,
                 table.get_name(),
+                upsert_database_id,
             )?;
         }
     }

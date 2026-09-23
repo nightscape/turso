@@ -765,6 +765,7 @@ fn emit_delete_row_common(
                 None,
                 None,
                 table_name,
+                unsafe { (*table_reference).database_id },
             )?;
         }
 
