@@ -212,6 +212,7 @@ pub fn translate_create_trigger(
         &normalized_table_name,
         0, // triggers don't have a root page
         Some(sql),
+        database_id,
     )?;
 
     // Update schema version
