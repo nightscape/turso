@@ -2528,6 +2528,7 @@ fn emit_update_insns<'a>(
                         None,
                         None,
                         table_name,
+                        update_database_id,
                     )?;
                     emit_cdc_insns(
                         program,
@@ -2539,6 +2540,7 @@ fn emit_update_insns<'a>(
                         None,
                         None,
                         table_name,
+                        update_database_id,
                     )?;
                 } else {
                     emit_cdc_insns(
@@ -2558,6 +2560,7 @@ fn emit_update_insns<'a>(
                         cdc_after_reg,
                         cdc_updates_record,
                         table_name,
+                        update_database_id,
                     )?;
                 }
             }
