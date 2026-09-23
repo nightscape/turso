@@ -3,9 +3,11 @@
 
 use std::sync::Arc;
 
+use super::matview_index_oracle::assert_reads_no_view_index;
 use crate::common::{limbo_exec_rows, TempDatabase};
 
 fn assert_index_matches_scan(conn: &Arc<turso_core::Connection>, indexed: &str, scanned: &str) {
+    assert_reads_no_view_index(conn, scanned);
     assert_eq!(
         limbo_exec_rows(conn, indexed),
         limbo_exec_rows(conn, scanned),
@@ -26,13 +28,13 @@ fn an_index_on_a_count_column(tmp_db: TempDatabase) -> anyhow::Result<()> {
         assert_index_matches_scan(
             &conn,
             &format!("SELECT st, n FROM v WHERE n = {key}"),
-            &format!("SELECT st, n FROM v WHERE +n = {key}"),
+            &format!("SELECT st, n FROM v NOT INDEXED WHERE n = {key}"),
         );
     }
     assert_index_matches_scan(
         &conn,
         "SELECT st, n FROM v WHERE n > 0 ORDER BY n",
-        "SELECT st, n FROM v WHERE +n > 0 ORDER BY +n",
+        "SELECT st, n FROM v NOT INDEXED WHERE n > 0 ORDER BY n",
     );
     assert_eq!(
         limbo_exec_rows(&conn, "SELECT count(*) FROM v WHERE n = 1"),
@@ -57,7 +59,7 @@ fn an_index_on_an_integer_recursive_view(tmp_db: TempDatabase) -> anyhow::Result
         assert_index_matches_scan(
             &conn,
             &format!("SELECT node FROM reach WHERE node = {node}"),
-            &format!("SELECT node FROM reach WHERE +node = {node}"),
+            &format!("SELECT node FROM reach NOT INDEXED WHERE node = {node}"),
         );
     }
     assert_eq!(

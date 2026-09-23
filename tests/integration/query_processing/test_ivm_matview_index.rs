@@ -5,13 +5,14 @@
 //! view's delta is applied at commit, so the index entries are written there
 //! too. The contract every test below states is the same: **an index-driven
 //! read of the view returns exactly what a scan of the same view returns.**
-//! The left query lets the planner use the index, the right defeats it with
-//! `+col`.
+//! The left query lets the planner use the index, the right reads the view
+//! `NOT INDEXED`.
 
 use std::sync::Arc;
 
 use rusqlite::types::Value;
 
+use super::matview_index_oracle::assert_reads_no_view_index;
 use crate::common::{limbo_exec_rows, TempDatabase};
 
 fn setup(conn: &Arc<turso_core::Connection>) -> anyhow::Result<()> {
@@ -33,6 +34,7 @@ fn assert_index_matches_scan(
     indexed: &str,
     scanned: &str,
 ) {
+    assert_reads_no_view_index(conn, scanned);
     let via_index = limbo_exec_rows(conn, indexed);
     let via_scan = limbo_exec_rows(conn, scanned);
     assert_eq!(
@@ -58,13 +60,13 @@ fn create_index_backfills_a_populated_view(tmp_db: TempDatabase) -> anyhow::Resu
         &conn,
         "backfilled point read",
         "SELECT id, st FROM v WHERE id = 'b3'",
-        "SELECT id, st FROM v WHERE +id = 'b3'",
+        "SELECT id, st FROM v NOT INDEXED WHERE id = 'b3'",
     );
     assert_index_matches_scan(
         &conn,
         "backfilled ordered read",
         "SELECT id FROM v ORDER BY id",
-        "SELECT id FROM v ORDER BY +id",
+        "SELECT id FROM v NOT INDEXED ORDER BY id",
     );
     Ok(())
 }
@@ -81,7 +83,7 @@ fn committed_writes_keep_the_index_in_step(tmp_db: TempDatabase) -> anyhow::Resu
         &conn,
         "inserted row",
         "SELECT id, st FROM v WHERE id = 'b9'",
-        "SELECT id, st FROM v WHERE +id = 'b9'",
+        "SELECT id, st FROM v NOT INDEXED WHERE id = 'b9'",
     );
 
     conn.execute("DELETE FROM t_raw WHERE id = 'b2'")?;
@@ -89,7 +91,7 @@ fn committed_writes_keep_the_index_in_step(tmp_db: TempDatabase) -> anyhow::Resu
         &conn,
         "deleted row",
         "SELECT count(*) FROM v WHERE id = 'b2'",
-        "SELECT count(*) FROM v WHERE +id = 'b2'",
+        "SELECT count(*) FROM v NOT INDEXED WHERE id = 'b2'",
     );
 
     conn.execute("UPDATE t_raw SET id = 'z5' WHERE id = 'b5'")?;
@@ -97,19 +99,19 @@ fn committed_writes_keep_the_index_in_step(tmp_db: TempDatabase) -> anyhow::Resu
         &conn,
         "old key of a key move",
         "SELECT count(*) FROM v WHERE id = 'b5'",
-        "SELECT count(*) FROM v WHERE +id = 'b5'",
+        "SELECT count(*) FROM v NOT INDEXED WHERE id = 'b5'",
     );
     assert_index_matches_scan(
         &conn,
         "new key of a key move",
         "SELECT id, st FROM v WHERE id = 'z5'",
-        "SELECT id, st FROM v WHERE +id = 'z5'",
+        "SELECT id, st FROM v NOT INDEXED WHERE id = 'z5'",
     );
     assert_index_matches_scan(
         &conn,
         "full ordered read",
         "SELECT id FROM v ORDER BY id",
-        "SELECT id FROM v ORDER BY +id",
+        "SELECT id FROM v NOT INDEXED ORDER BY id",
     );
     Ok(())
 }
@@ -126,7 +128,7 @@ fn a_non_key_update_leaves_the_index_entry_in_place(tmp_db: TempDatabase) -> any
         &conn,
         "row whose non-key column changed",
         "SELECT id, st FROM v WHERE id = 'b4'",
-        "SELECT id, st FROM v WHERE +id = 'b4'",
+        "SELECT id, st FROM v NOT INDEXED WHERE id = 'b4'",
     );
     assert_eq!(
         limbo_exec_rows(&conn, "SELECT st FROM v WHERE id = 'b4'"),
@@ -158,14 +160,14 @@ fn the_index_survives_a_reopen_and_stays_maintained(tmp_db: TempDatabase) -> any
         &conn,
         "after reopen",
         "SELECT id, st FROM v WHERE id = 'b3'",
-        "SELECT id, st FROM v WHERE +id = 'b3'",
+        "SELECT id, st FROM v NOT INDEXED WHERE id = 'b3'",
     );
     conn.execute("INSERT INTO t_raw (id, st) VALUES ('b9', 'NEW')")?;
     assert_index_matches_scan(
         &conn,
         "write after reopen",
         "SELECT id, st FROM v WHERE id = 'b9'",
-        "SELECT id, st FROM v WHERE +id = 'b9'",
+        "SELECT id, st FROM v NOT INDEXED WHERE id = 'b9'",
     );
     Ok(())
 }
@@ -225,14 +227,14 @@ fn writes_in_a_committed_transaction_reach_the_index(tmp_db: TempDatabase) -> an
             &conn,
             &format!("key {key} after COMMIT"),
             &format!("SELECT id, st FROM v WHERE id = '{key}'"),
-            &format!("SELECT id, st FROM v WHERE +id = '{key}'"),
+            &format!("SELECT id, st FROM v NOT INDEXED WHERE id = '{key}'"),
         );
     }
     assert_index_matches_scan(
         &conn,
         "full ordered read after COMMIT",
         "SELECT id, st FROM v ORDER BY id",
-        "SELECT id, st FROM v ORDER BY +id",
+        "SELECT id, st FROM v NOT INDEXED ORDER BY id",
     );
     Ok(())
 }
@@ -260,7 +262,7 @@ fn a_rolled_back_transaction_leaves_the_index_untouched(
             &conn,
             &format!("key {key} after ROLLBACK"),
             &format!("SELECT id, st FROM v WHERE id = '{key}'"),
-            &format!("SELECT id, st FROM v WHERE +id = '{key}'"),
+            &format!("SELECT id, st FROM v NOT INDEXED WHERE id = '{key}'"),
         );
     }
 
@@ -269,7 +271,7 @@ fn a_rolled_back_transaction_leaves_the_index_untouched(
         &conn,
         "write after ROLLBACK",
         "SELECT id, st FROM v ORDER BY id",
-        "SELECT id, st FROM v ORDER BY +id",
+        "SELECT id, st FROM v NOT INDEXED ORDER BY id",
     );
     Ok(())
 }
@@ -295,14 +297,14 @@ fn an_index_on_an_aggregate_column_follows_the_group(tmp_db: TempDatabase) -> an
             &conn,
             &format!("groups whose top is {top}"),
             &format!("SELECT st, top FROM v WHERE top = '{top}'"),
-            &format!("SELECT st, top FROM v WHERE +top = '{top}'"),
+            &format!("SELECT st, top FROM v NOT INDEXED WHERE top = '{top}'"),
         );
     }
     assert_index_matches_scan(
         &conn,
         "full ordered read",
         "SELECT st, top FROM v ORDER BY top",
-        "SELECT st, top FROM v ORDER BY +top",
+        "SELECT st, top FROM v NOT INDEXED ORDER BY top",
     );
     Ok(())
 }
@@ -324,7 +326,7 @@ fn refresh_rebuilds_the_index_with_the_view(tmp_db: TempDatabase) -> anyhow::Res
         &conn,
         "ordered read after REFRESH",
         "SELECT id, h FROM v ORDER BY h",
-        "SELECT id, h FROM v ORDER BY +h",
+        "SELECT id, h FROM v NOT INDEXED ORDER BY h",
     );
     Ok(())
 }
