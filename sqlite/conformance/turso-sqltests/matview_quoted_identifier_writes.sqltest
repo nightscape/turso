@@ -233,3 +233,12 @@ test matview-self-join-aggregate-with-two-spellings-counts-each-row-once {
 expect {
     red|2
 }
+
+# Table names are case-folded for lookup only; an error names the table as the
+# user wrote it. Error patterns ignore case unless they start with (?-i).
+test matview-missing-table-error-keeps-written-spelling {
+    CREATE MATERIALIZED VIEW v AS SELECT * FROM (SELECT * FROM MissingTbl);
+}
+expect error {
+    (?-i)Table 'MissingTbl' not found
+}
