@@ -168,6 +168,36 @@ impl WriteRow {
         record_values: Vec<Value>,
         weight: i64,
     ) -> IOResultOr<()> {
+        self.write(cursors, index_key, record_values, WeightUpdate::Add(weight))
+    }
+
+    /// Write a row that is either present with weight 1 or absent, whatever
+    /// weight it had before.
+    pub fn set_row(
+        &mut self,
+        cursors: &mut DbspStateCursors,
+        index_key: Vec<Value>,
+        record_values: Vec<Value>,
+        present: bool,
+    ) -> IOResultOr<()> {
+        self.write(
+            cursors,
+            index_key,
+            record_values,
+            WeightUpdate::Set(i64::from(present)),
+        )
+    }
+
+    fn write(
+        &mut self,
+        cursors: &mut DbspStateCursors,
+        index_key: Vec<Value>,
+        record_values: Vec<Value>,
+        update: WeightUpdate,
+    ) -> IOResultOr<()> {
+        let weight = match update {
+            WeightUpdate::Add(weight) | WeightUpdate::Set(weight) => weight,
+        };
         loop {
             match self {
                 WriteRow::GetRecord => {
@@ -236,7 +266,10 @@ impl WriteRow {
                             }
                         };
 
-                        let final_weight = existing_weight + weight;
+                        let final_weight = match update {
+                            WeightUpdate::Add(weight) => existing_weight + weight,
+                            WeightUpdate::Set(weight) => weight,
+                        };
                         if final_weight <= 0 {
                             // Store index_key for later deletion of index entry
                             *self = WriteRow::Delete { rowid }
@@ -383,6 +416,12 @@ impl WriteRow {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WeightUpdate {
+    Add(i64),
+    Set(i64),
 }
 
 #[cfg(test)]
