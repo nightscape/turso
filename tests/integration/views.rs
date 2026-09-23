@@ -341,3 +341,51 @@ fn ordered_materialized_view_on_the_hash_build_side_reads_its_rows() {
         assert_view_reads_like_its_table(&conn, sql);
     }
 }
+
+/// A view column that is an expression has no declared type, as in SQLite,
+/// except a CAST, which is declared as its target type.
+#[test]
+fn materialized_view_expression_columns_have_no_declared_type() {
+    let tmp_db = TempDatabase::builder().with_views(true).build();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, st TEXT, k INTEGER)")
+        .unwrap();
+    conn.execute(
+        "CREATE MATERIALIZED VIEW agg AS SELECT st, count(*) AS n, sum(k) AS s FROM t GROUP BY st",
+    )
+    .unwrap();
+    conn.execute(
+        "CREATE MATERIALIZED VIEW proj AS SELECT id, k + 1 AS kp, 1 AS one, CAST(k AS TEXT) AS kt FROM t",
+    )
+    .unwrap();
+    let declared = |view: &str| -> Vec<(String, String)> {
+        conn.exec_rows(&format!(
+            "SELECT name, type FROM pragma_table_info('{view}')"
+        ))
+    };
+    let expected = |cols: &[(&str, &str)]| -> Vec<(String, String)> {
+        cols.iter()
+            .map(|(n, t)| (n.to_string(), t.to_string()))
+            .collect()
+    };
+    assert_eq!(
+        declared("agg"),
+        expected(&[("st", "TEXT"), ("n", ""), ("s", "")])
+    );
+    assert_eq!(
+        declared("proj"),
+        expected(&[("id", "INTEGER"), ("kp", ""), ("one", ""), ("kt", "TEXT")])
+    );
+
+    conn.execute("INSERT INTO t VALUES (1, 'X', 5), (2, 'X', 6), (3, 'Y', 7)")
+        .unwrap();
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT st, n FROM agg WHERE n = 1"),
+        vec![vec![Text("Y".to_string()), Integer(1)]]
+    );
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT st, n FROM agg WHERE n = '1'"),
+        Vec::<Vec<rusqlite::types::Value>>::new(),
+        "without affinity the text key does not match the integer count"
+    );
+}

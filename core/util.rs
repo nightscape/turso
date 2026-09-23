@@ -1000,6 +1000,20 @@ pub(crate) fn expr_contains_null(expr: &ast::Expr) -> bool {
     contains_null
 }
 
+/// A view column computed by an expression. As in SQLite, it has no declared
+/// type, so no affinity, unless the expression is a CAST.
+fn view_expression_column(expr: &ast::Expr) -> Column {
+    let ty_str = match expr {
+        ast::Expr::Cast {
+            type_name: Some(type_name),
+            ..
+        } => type_name.name.to_string(),
+        _ => String::new(),
+    };
+    let (ty, _) = type_from_name(&ty_str);
+    Column::new(None, ty_str, None, None, ty, None, Default::default())
+}
+
 // this function returns the affinity type and whether the type name was exactly "INTEGER"
 // https://www.sqlite.org/datatype3.html
 pub(crate) fn type_from_name(type_name: &str) -> (Type, bool) {
@@ -2250,7 +2264,7 @@ fn extract_view_columns_inner(
                         .map(view_output_column)
                         .unwrap_or_else(|| ViewColumn {
                             table_index: usize::MAX,
-                            column: Column::new_default_text(None, "TEXT".to_string(), None),
+                            column: view_expression_column(expr),
                         });
                 column.column.name = Some(name);
                 deduplicate_view_column_name(&mut column, &mut column_name_counts);
