@@ -1,3 +1,4 @@
+mod matview_index_oracle;
 mod test_alter_table_reopen;
 mod test_btree;
 mod test_cdc_callback_attached;

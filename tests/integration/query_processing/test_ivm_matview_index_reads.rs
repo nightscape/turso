@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use super::matview_index_oracle::assert_reads_no_view_index;
 use crate::common::{limbo_exec_rows, TempDatabase};
 
 fn setup(conn: &Arc<turso_core::Connection>) -> anyhow::Result<()> {
@@ -24,6 +25,7 @@ fn setup(conn: &Arc<turso_core::Connection>) -> anyhow::Result<()> {
 }
 
 fn assert_index_matches_scan(conn: &Arc<turso_core::Connection>, indexed: &str, scanned: &str) {
+    assert_reads_no_view_index(conn, scanned);
     assert_eq!(
         limbo_exec_rows(conn, indexed),
         limbo_exec_rows(conn, scanned),
@@ -34,19 +36,19 @@ fn assert_index_matches_scan(conn: &Arc<turso_core::Connection>, indexed: &str, 
 const READS: [(&str, &str); 4] = [
     (
         "SELECT *, rowid AS _rowid FROM v WHERE watch_key = 'w1' ORDER BY ord",
-        "SELECT *, rowid AS _rowid FROM v WHERE watch_key = 'w1' ORDER BY +ord",
+        "SELECT *, rowid AS _rowid FROM v NOT INDEXED WHERE watch_key = 'w1' ORDER BY ord",
     ),
     (
         "SELECT rowid AS _rowid, * FROM v WHERE watch_key = 'w1' ORDER BY ord",
-        "SELECT rowid AS _rowid, * FROM v WHERE watch_key = 'w1' ORDER BY +ord",
+        "SELECT rowid AS _rowid, * FROM v NOT INDEXED WHERE watch_key = 'w1' ORDER BY ord",
     ),
     (
         "SELECT rowid, id FROM v WHERE ord = 'o1'",
-        "SELECT rowid, id FROM v WHERE +ord = 'o1'",
+        "SELECT rowid, id FROM v NOT INDEXED WHERE ord = 'o1'",
     ),
     (
         "SELECT rowid, id, ord FROM v ORDER BY ord",
-        "SELECT rowid, id, ord FROM v ORDER BY +ord",
+        "SELECT rowid, id, ord FROM v NOT INDEXED ORDER BY ord",
     ),
 ];
 

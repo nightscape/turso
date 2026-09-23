@@ -3,9 +3,11 @@
 
 use std::sync::Arc;
 
+use super::matview_index_oracle::assert_reads_no_view_index;
 use crate::common::{limbo_exec_rows, TempDatabase};
 
 fn assert_index_matches_scan(conn: &Arc<turso_core::Connection>, indexed: &str, scanned: &str) {
+    assert_reads_no_view_index(conn, scanned);
     let via_index = limbo_exec_rows(conn, indexed);
     let via_scan = limbo_exec_rows(conn, scanned);
     assert_eq!(
@@ -35,19 +37,19 @@ fn an_index_on_a_chained_view(tmp_db: TempDatabase) -> anyhow::Result<()> {
         assert_index_matches_scan(
             &conn,
             &format!("SELECT id, st FROM v2 WHERE st = '{st}' ORDER BY id"),
-            &format!("SELECT id, st FROM v2 WHERE +st = '{st}' ORDER BY id"),
+            &format!("SELECT id, st FROM v2 NOT INDEXED WHERE st = '{st}' ORDER BY id"),
         );
     }
     assert_index_matches_scan(
         &conn,
         "SELECT id, st FROM v2 ORDER BY st, id",
-        "SELECT id, st FROM v2 ORDER BY +st, id",
+        "SELECT id, st FROM v2 NOT INDEXED ORDER BY st, id",
     );
     conn.execute("COMMIT")?;
     assert_index_matches_scan(
         &conn,
         "SELECT id, st FROM v2 ORDER BY st, id",
-        "SELECT id, st FROM v2 ORDER BY +st, id",
+        "SELECT id, st FROM v2 NOT INDEXED ORDER BY st, id",
     );
     Ok(())
 }
@@ -73,16 +75,16 @@ fn an_index_on_a_recursive_view(tmp_db: TempDatabase) -> anyhow::Result<()> {
         assert_index_matches_scan(
             &conn,
             &format!("SELECT node FROM reach WHERE node = '{node}'"),
-            &format!("SELECT node FROM reach WHERE +node = '{node}'"),
+            &format!("SELECT node FROM reach NOT INDEXED WHERE node = '{node}'"),
         );
     }
     assert_index_matches_scan(
         &conn,
         "SELECT node FROM reach ORDER BY node",
-        "SELECT node FROM reach ORDER BY +node",
+        "SELECT node FROM reach NOT INDEXED ORDER BY node",
     );
     assert_eq!(
-        limbo_exec_rows(&conn, "SELECT count(*) FROM (SELECT +node FROM reach)"),
+        limbo_exec_rows(&conn, "SELECT count(*) FROM reach NOT INDEXED"),
         vec![vec![rusqlite::types::Value::Integer(1)]],
         "fixture: inside the transaction only n1 is reachable"
     );
@@ -90,14 +92,14 @@ fn an_index_on_a_recursive_view(tmp_db: TempDatabase) -> anyhow::Result<()> {
     assert_index_matches_scan(
         &conn,
         "SELECT node FROM reach ORDER BY node",
-        "SELECT node FROM reach ORDER BY +node",
+        "SELECT node FROM reach NOT INDEXED ORDER BY node",
     );
     Ok(())
 }
 
 /// Under NOCASE, 'a' and 'A' are the same key but different values. A covering
 /// read returns the value from the index entry, so the base table is the
-/// oracle; a `+name` scan of the view is not, since it may use the index too.
+/// oracle.
 #[turso_macros::test(views)]
 fn a_case_change_under_a_nocase_index(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
