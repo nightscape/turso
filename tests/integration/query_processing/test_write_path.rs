@@ -1955,6 +1955,30 @@ fn test_commit_survives_view_delta_io_yield(tmp_db: TempDatabase) -> anyhow::Res
     Ok(())
 }
 
+/// The creating connection hits the same I/O yield once other writes have
+/// pushed the view's state pages out of the page cache.
+#[turso_macros::test(views)]
+fn test_commit_survives_view_delta_io_yield_after_cache_eviction(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("PRAGMA cache_size = 200")?;
+    conn.execute("CREATE TABLE t (a INTEGER, b INTEGER)")?;
+    conn.execute("CREATE TABLE filler (x BLOB)")?;
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT a, sum(b) AS s FROM t GROUP BY a")?;
+    conn.execute("INSERT INTO t VALUES (1, 1), (2, 1)")?;
+    conn.execute("INSERT INTO filler SELECT zeroblob(3000) FROM generate_series(1, 1000)")?;
+
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO t VALUES (1, 1)")?;
+    conn.execute("COMMIT")?;
+
+    let view: Vec<(i64, f64)> = conn.exec_rows("SELECT a, s FROM mv ORDER BY a");
+    assert_eq!(view, vec![(1, 2.0), (2, 1.0)]);
+
+    Ok(())
+}
+
 /// Controls for `test_commit_survives_view_delta_io_yield`: the same write must
 /// keep working on the paths whose commit-time merge never yields.
 #[turso_macros::test(views)]
