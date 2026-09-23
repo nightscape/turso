@@ -2144,6 +2144,8 @@ pub enum Insn {
     /// This fires callbacks for table changes when CDC is enabled.
     /// The callbacks receive a RelationChangeEvent with the change details.
     NotifyCdcChange {
+        /// Database that holds the table.
+        database_id: usize,
         /// Register containing the table name (as Text)
         table_name_reg: usize,
         /// The type of change: 1 = INSERT, 0 = UPDATE, -1 = DELETE

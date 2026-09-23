@@ -1134,6 +1134,7 @@ pub fn translate_insert(
             after_record_reg,
             None,
             table_name.as_str(),
+            database_id,
         )?;
     }
 
@@ -3935,6 +3936,7 @@ fn emit_replace_delete_conflicting_row(
             None,
             None,
             table_name,
+            ctx.database_id,
         )?;
     }
     program.emit_insn(Insn::Delete {

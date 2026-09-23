@@ -20171,7 +20171,16 @@ pub fn op_notify_cdc_change(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
+    if program.connection.has_change_callbacks() {
+        stage_cdc_change_event(program, state, insn);
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+fn stage_cdc_change_event(program: &Program, state: &ProgramState, insn: &Insn) {
     let Insn::NotifyCdcChange {
+        database_id,
         table_name_reg,
         change_type,
         rowid_reg,
@@ -20182,32 +20191,7 @@ pub fn op_notify_cdc_change(
         unreachable!()
     };
 
-    if program.connection.has_change_callbacks() {
-        stage_cdc_change_event(
-            program,
-            state,
-            *table_name_reg,
-            *change_type,
-            *rowid_reg,
-            *before_record_reg,
-            *after_record_reg,
-        );
-    }
-
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
-}
-
-fn stage_cdc_change_event(
-    program: &Program,
-    state: &ProgramState,
-    table_name_reg: usize,
-    change_type: i8,
-    rowid_reg: usize,
-    before_record_reg: usize,
-    after_record_reg: usize,
-) {
-    let table_name = match &state.registers[table_name_reg].get_value() {
+    let table_name = match &state.registers[*table_name_reg].get_value() {
         Value::Text(t) => t.as_str().to_string(),
         other => unreachable!(
             "NotifyCdcChange: table_name_reg must contain Text, got {:?}",
@@ -20215,7 +20199,7 @@ fn stage_cdc_change_event(
         ),
     };
 
-    let rowid = match &state.registers[rowid_reg].get_value() {
+    let rowid = match &state.registers[*rowid_reg].get_value() {
         Value::Numeric(Numeric::Integer(i)) => *i,
         other => unreachable!(
             "NotifyCdcChange: rowid_reg must contain Integer, got {:?}",
@@ -20223,25 +20207,24 @@ fn stage_cdc_change_event(
         ),
     };
 
-    let Some(column_names) = program
-        .connection
-        .schema
-        .read()
-        .get_table(&table_name)
-        .map(|table| {
-            table
-                .columns()
-                .iter()
-                .filter_map(|col| col.name.clone())
-                .collect::<Vec<String>>()
-        })
-    else {
-        // Skip rather than stage an event with made-up column names.
-        tracing::warn!(
-            "NotifyCdcChange: Could not find schema for table '{}', skipping callback",
-            table_name
-        );
-        return;
+    let column_names = program.connection.with_schema(*database_id, |schema| {
+        let table = schema.get_table(&table_name).unwrap_or_else(|| {
+            panic!("NotifyCdcChange: table '{table_name}' is not in database {database_id}")
+        });
+        table
+            .columns()
+            .iter()
+            .filter_map(|col| col.name.clone())
+            .collect::<Vec<String>>()
+    });
+    let relation_name = if *database_id == MAIN_DB_ID {
+        table_name
+    } else {
+        let database_name = program
+            .connection
+            .get_database_name_by_index(*database_id)
+            .unwrap_or_else(|| panic!("NotifyCdcChange: no database with id {database_id}"));
+        format!("{database_name}.{table_name}")
     };
 
     let record_in = |reg: usize| {
@@ -20253,8 +20236,8 @@ fn stage_cdc_change_event(
             _ => None,
         }
     };
-    let bin_record = record_in(after_record_reg)
-        .or_else(|| record_in(before_record_reg))
+    let bin_record = record_in(*after_record_reg)
+        .or_else(|| record_in(*before_record_reg))
         .unwrap_or_default();
 
     let change = match change_type {
@@ -20269,13 +20252,13 @@ fn stage_cdc_change_event(
     program
         .connection
         .stage_change_event(crate::types::RelationChangeEvent::staged(
-            table_name.clone(),
+            relation_name.clone(),
             column_names,
             vec![crate::types::DatabaseChange {
                 change_id: 0,
                 change_time: 0,
                 change,
-                table_name,
+                table_name: relation_name,
                 id: rowid,
             }],
         ));

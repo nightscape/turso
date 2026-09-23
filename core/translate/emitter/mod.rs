@@ -1394,6 +1394,7 @@ pub fn emit_cdc_insns(
     after_record_reg: Option<usize>,
     updates_record_reg: Option<usize>,
     table_name: &str,
+    database_id: usize,
 ) -> Result<()> {
     let cdc_info = program.capture_data_changes_info().as_ref();
     match cdc_info.map(|info| info.cdc_version()) {
@@ -1417,6 +1418,7 @@ pub fn emit_cdc_insns(
             after_record_reg,
             updates_record_reg,
             table_name,
+            database_id,
         ),
         None => Err(crate::LimboError::InternalError(
             "cdc info not set".to_string(),
@@ -1434,6 +1436,7 @@ fn emit_cdc_insns_v1(
     after_record_reg: Option<usize>,
     updates_record_reg: Option<usize>,
     table_name: &str,
+    database_id: usize,
 ) -> Result<()> {
     // v1: (change_id, change_time, change_type, table_name, id, before, after, updates)
     let turso_cdc_registers = program.alloc_registers(8);
@@ -1537,6 +1540,7 @@ fn emit_cdc_insns_v1(
         OperationMode::DELETE => -1i8,
     };
     program.emit_insn(Insn::NotifyCdcChange {
+        database_id,
         table_name_reg: turso_cdc_registers + 3,
         change_type: change_type_i8,
         rowid_reg: turso_cdc_registers + 4,
