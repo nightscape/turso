@@ -17,7 +17,7 @@ use crate::types::IOResultOr;
 use crate::types::{
     IOResult, ImmutableRecord, ImmutableRecordRef, SeekKey, SeekOp, SeekResult, ValueRef,
 };
-use crate::{return_and_restore_if_io, return_if_io, LimboError, Result, Value};
+use crate::{return_and_restore_if_io, return_if_io, turso_assert, LimboError, Result, Value};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::BTreeMap;
 use std::fmt::{self, Display};
@@ -777,8 +777,12 @@ impl AggregateEvalState {
                             &mut cursors.table_cursor,
                             &operator.aggregates
                         ));
-                        // Process the fetched state
                         if let Some(state) = state {
+                            turso_assert!(
+                                state.count > 0 || operator.has_implicit_group(),
+                                "a stored aggregate group has no rows",
+                                { "group": group_key_str }
+                            );
                             let mut old_row = group_key.clone();
                             old_row.extend(state.to_values(&operator.aggregates)?);
                             old_values.insert(group_key_str.clone(), old_row);
@@ -2426,12 +2430,7 @@ impl IncrementalOperator for AggregateOperator {
                         let zset_hash = self.generate_group_hash(group_key_str);
                         let element_id = Hash128::new(0, 0); // Always zeros for regular aggregates
 
-                        // Determine weight: 1 if exists, -1 if deleted
-                        let weight = if agg_state.count == 0 && !self.has_implicit_group() {
-                            -1
-                        } else {
-                            1
-                        };
+                        let group_exists = agg_state.count > 0 || self.has_implicit_group();
 
                         // Serialize the aggregate state (only for regular aggregates, not plain DISTINCT)
                         let state_blob = agg_state.to_blob(&self.aggregates, group_key)?;
@@ -2457,7 +2456,7 @@ impl IncrementalOperator for AggregateOperator {
                         return_and_restore_if_io!(
                             &mut self.commit_state,
                             state,
-                            write_row.write_row(cursors, index_key, record_values, weight)
+                            write_row.set_row(cursors, index_key, record_values, group_exists)
                         );
 
                         let delta = std::mem::take(delta);
