@@ -469,3 +469,72 @@ fn alter_an_indexed_view(alter: &str, renamed: &str, reason: &str) -> Vec<String
     }
     wrong
 }
+
+/// Holon's `block` view: `block_raw` LEFT JOINed with one aggregate view per
+/// junction table. Each edge write replaces a block's junction rows, one
+/// autocommit statement at a time.
+#[turso_macros::test(views)]
+fn replacing_junction_rows_keeps_a_joined_aggregate_view_and_its_index_in_step(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE block_raw (id TEXT PRIMARY KEY, parent_id TEXT, content TEXT)")?;
+    for junction in ["block_tags", "block_requires", "block_advice"] {
+        conn.execute(&format!(
+            "CREATE TABLE {junction} (block_id TEXT NOT NULL, target TEXT NOT NULL, \
+             PRIMARY KEY (block_id, target))"
+        ))?;
+        conn.execute(&format!(
+            "CREATE MATERIALIZED VIEW {junction}_agg AS SELECT block_id AS source_id, \
+             json_group_array(target) AS vals FROM {junction} GROUP BY block_id"
+        ))?;
+    }
+    conn.execute(
+        "CREATE MATERIALIZED VIEW block AS SELECT b.id, b.parent_id, b.content, \
+         COALESCE(block_tags_agg.vals, '[]') AS tags, \
+         COALESCE(block_requires_agg.vals, '[]') AS requires, \
+         COALESCE(block_advice_agg.vals, '[]') AS advice \
+         FROM block_raw b \
+         LEFT OUTER JOIN block_tags_agg ON block_tags_agg.source_id = b.id \
+         LEFT OUTER JOIN block_requires_agg ON block_requires_agg.source_id = b.id \
+         LEFT OUTER JOIN block_advice_agg ON block_advice_agg.source_id = b.id \
+         WHERE b.id != 'sentinel'",
+    )?;
+    conn.execute("CREATE INDEX idx_block_id ON block(id)")?;
+    conn.execute("CREATE INDEX idx_block_parent_id ON block(parent_id)")?;
+    conn.execute("INSERT INTO block_raw VALUES ('sentinel', 'sentinel', '')")?;
+    conn.execute("INSERT INTO block_raw VALUES ('tg', 'sentinel', 'x')")?;
+
+    for (step, tags) in [
+        ("prior set", &["alpha"][..]),
+        ("replace", &["alpha", "beta"][..]),
+        ("undo", &["alpha"][..]),
+        ("redo", &["alpha", "beta"][..]),
+    ] {
+        conn.execute("DELETE FROM block_tags WHERE block_id = 'tg'")?;
+        for tag in tags {
+            conn.execute(&format!("INSERT INTO block_tags VALUES ('tg', '{tag}')"))?;
+        }
+        assert_eq!(
+            limbo_exec_rows(
+                &conn,
+                "SELECT count(*) FROM block NOT INDEXED WHERE id = 'tg'"
+            ),
+            vec![vec![Value::Integer(1)]],
+            "{step}: the view must hold exactly one row for the block"
+        );
+        assert_index_matches_scan(
+            &conn,
+            &format!("{step}: point read"),
+            "SELECT id, parent_id, tags FROM block WHERE id = 'tg'",
+            "SELECT id, parent_id, tags FROM block NOT INDEXED WHERE id = 'tg'",
+        );
+        assert_index_matches_scan(
+            &conn,
+            &format!("{step}: parent read"),
+            "SELECT id, tags FROM block WHERE parent_id = 'sentinel'",
+            "SELECT id, tags FROM block NOT INDEXED WHERE parent_id = 'sentinel'",
+        );
+    }
+    Ok(())
+}
