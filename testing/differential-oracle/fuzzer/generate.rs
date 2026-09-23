@@ -377,6 +377,8 @@ impl PropTestBackend {
             // CREATE TABLE to the main schema in matview mode.
             profile.create_table.extra.target_schemas =
                 sql_gen_prop::SchemaTargetProfile::main_only();
+            // Mostly draw from a small value domain so GROUP BY keys repeat and DELETEs can empty a whole group.
+            profile.generation.value = profile.generation.value.narrow();
         }
 
         Self {
