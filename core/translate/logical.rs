@@ -604,17 +604,17 @@ impl<'a> LogicalPlanBuilder<'a> {
     fn build_select_table(&mut self, table: &ast::SelectTable) -> Result<LogicalPlan> {
         match table {
             ast::SelectTable::Table(name, alias, _indexed) => {
-                let written_name = Self::table_ident(&name.name);
+                let lookup_name = Self::table_ident(&name.name);
                 // A CTE shadows a real table of the same name
-                if let Some(cte_plan) = self.ctes.get(&written_name) {
+                if let Some(cte_plan) = self.ctes.get(&lookup_name) {
                     return Ok(LogicalPlan::CTERef(CTERef {
-                        name: written_name.clone(),
+                        name: lookup_name.clone(),
                         schema: cte_plan.schema().clone(),
                     }));
                 }
 
-                let table = self.schema.get_table(&written_name).ok_or_else(|| {
-                    LimboError::ParseError(format!("Table '{written_name}' not found"))
+                let table = self.schema.get_table(&lookup_name).ok_or_else(|| {
+                    LimboError::ParseError(format!("Table '{}' not found", name.name.as_str()))
                 })?;
                 let table_name = table.get_name().to_string();
                 let table_alias = alias.as_ref().map(|a| Self::table_ident(a.name()));
