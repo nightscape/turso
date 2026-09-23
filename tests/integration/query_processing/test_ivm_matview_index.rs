@@ -383,3 +383,89 @@ fn unsupported_index_shapes_are_refused() {
         "a refused index left a schema row"
     );
 }
+
+/// A materialized view's columns and name are its definition's; ALTER TABLE
+/// on it would leave its circuit, its state table and its index out of step
+/// with its btree. Each form is refused, and the view stays maintained and
+/// openable.
+#[test]
+fn alter_table_on_an_indexed_view_is_refused() {
+    const REFUSED: &str = "cannot alter materialized view";
+    // (statement, the view's name if the statement is accepted, the refusal)
+    let forms = [
+        ("ALTER TABLE v RENAME TO v2", "v2", REFUSED),
+        ("ALTER TABLE v RENAME COLUMN st TO s2", "v", REFUSED),
+        ("ALTER TABLE v RENAME COLUMN k TO k2", "v", REFUSED),
+        ("ALTER TABLE v ADD COLUMN x TEXT", "v", REFUSED),
+        ("ALTER TABLE v DROP COLUMN k", "v", REFUSED),
+        (
+            "ALTER TABLE t RENAME TO t2",
+            "v",
+            "dependent materialized view",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (alter, renamed, reason) in forms {
+        let outcome = std::panic::catch_unwind(|| alter_an_indexed_view(alter, renamed, reason));
+        match outcome {
+            Ok(found) => wrong.extend(found),
+            Err(payload) => wrong.push(format!(
+                "{alter}: panicked: {}",
+                payload
+                    .downcast_ref::<String>()
+                    .map_or("<non-string payload>", String::as_str)
+            )),
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+fn alter_an_indexed_view(alter: &str, renamed: &str, reason: &str) -> Vec<String> {
+    let mut wrong = Vec::new();
+    let tmp_db = TempDatabase::builder().with_views(true).build();
+    let path = tmp_db.path.clone();
+    {
+        let conn = tmp_db.connect_limbo();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, st TEXT, k INTEGER)")
+            .unwrap();
+        conn.execute("CREATE MATERIALIZED VIEW v AS SELECT id, st, k FROM t")
+            .unwrap();
+        conn.execute("CREATE INDEX vi ON v(st)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a', 1), (2, 'b', 2)")
+            .unwrap();
+        let view = match conn.execute(alter) {
+            Ok(()) => {
+                wrong.push(format!("accepted: {alter}"));
+                renamed
+            }
+            Err(e) if e.to_string().contains(reason) => "v",
+            Err(e) => {
+                wrong.push(format!("{alter}: error does not say `{reason}`: {e}"));
+                "v"
+            }
+        };
+        conn.execute("INSERT INTO t VALUES (3, 'c', 3)").unwrap();
+        conn.execute("UPDATE t SET st = 'z' WHERE id = 1").unwrap();
+        let indexed = limbo_exec_rows(&conn, &format!("SELECT id, st FROM {view} ORDER BY st"));
+        let scanned = limbo_exec_rows(
+            &conn,
+            &format!("SELECT id, st FROM {view} NOT INDEXED ORDER BY st"),
+        );
+        if indexed != scanned {
+            wrong.push(format!("{alter}: index {indexed:?} != scan {scanned:?}"));
+        }
+    }
+    drop(tmp_db);
+    let reopened = TempDatabase::builder()
+        .with_db_path(&path)
+        .with_views(true)
+        .build();
+    let conn = reopened.connect_limbo();
+    let integrity = limbo_exec_rows(&conn, "PRAGMA integrity_check");
+    if integrity != vec![vec![Value::Text("ok".into())]] {
+        wrong.push(format!(
+            "{alter}: after reopen, integrity_check {integrity:?}"
+        ));
+    }
+    wrong
+}
