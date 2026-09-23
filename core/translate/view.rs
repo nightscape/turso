@@ -166,6 +166,7 @@ fn emit_create_fdw_mirrors(
             &spec.mirror_table,
             table_root_reg,
             Some(spec.create_sql()),
+            database_id,
         )?;
 
         let index_name = spec.index_name();
@@ -179,6 +180,7 @@ fn emit_create_fdw_mirrors(
             &spec.mirror_table,
             index_root_reg,
             None, // automatic indexes store no SQL
+            database_id,
         )?;
 
         created.push(spec.mirror_table.clone());
@@ -419,6 +421,7 @@ pub fn translate_create_materialized_view(
         &normalized_view_name,
         view_root_reg, // btree root for materialized view data
         Some(sql),
+        database_id,
     )?;
 
     // Add the DBSP state table to sqlite_master (required for materialized views)
@@ -644,6 +647,7 @@ pub fn translate_create_materialized_view(
         dbsp_table_name.as_str(),
         dbsp_state_root_reg, // Root for DBSP state table
         Some(dbsp_sql),
+        database_id,
     )?;
     tracing::debug!(
         "translate_create_materialized_view: Successfully emitted schema entry for DBSP table: {}",
@@ -675,6 +679,7 @@ pub fn translate_create_materialized_view(
         dbsp_table_name.as_str(),
         dbsp_index_root_reg,
         None, // Automatic indexes don't store SQL
+        database_id,
     )?;
 
     // Mirror every identity-declaring foreign source this view reads, so its
@@ -1039,6 +1044,7 @@ pub fn translate_create_view(
         &normalized_view_name,
         0, // Regular views don't have a btree
         Some(sql),
+        database_id,
     )?;
 
     // Parse schema to load the new view

@@ -1330,6 +1330,7 @@ pub fn translate_create_table(
             SQLITE_SEQUENCE_TABLE_NAME,
             seq_table_root_reg,
             Some(seq_sql.to_string()),
+            database_id,
         )?;
         true
     } else {
@@ -1420,6 +1421,7 @@ pub fn translate_create_table(
         &normalized_tbl_name,
         table_root_reg,
         Some(sql),
+        database_id,
     )?;
 
     if let Some(index_regs) = index_regs {
@@ -1439,6 +1441,7 @@ pub fn translate_create_table(
                 &normalized_tbl_name,
                 index_reg,
                 None,
+                database_id,
             )?;
         }
     }
@@ -1558,6 +1561,7 @@ pub fn emit_schema_entry(
     tbl_name: &str,
     root_page_reg: usize,
     sql: Option<String>,
+    database_id: usize,
 ) -> Result<()> {
     let rowid_reg = program.alloc_register();
     program.emit_insn(Insn::NewRowid {
@@ -1624,6 +1628,7 @@ pub fn emit_schema_entry(
             after_record_reg,
             None,
             SQLITE_TABLEID,
+            database_id,
         )?;
         emit_cdc_autocommit_commit(program, resolver, cdc_table_cursor_id)?;
     }
@@ -1811,6 +1816,7 @@ pub fn translate_create_virtual_table(
         tbl_name.name.as_str(),
         0, // virtual tables dont have a root page
         Some(sql),
+        crate::MAIN_DB_ID,
     )?;
 
     program.emit_insn(Insn::SetCookie {
@@ -1892,6 +1898,7 @@ pub fn translate_create_server(
         &server_name, // tbl_name = server_name for servers
         0,
         Some(sql),
+        crate::MAIN_DB_ID,
     )?;
 
     program.emit_insn(Insn::SetCookie {
@@ -1976,6 +1983,7 @@ pub fn translate_create_foreign_table(
         &table_name,
         0, // foreign tables have root_page=0 like virtual tables
         Some(sql),
+        crate::MAIN_DB_ID,
     )?;
 
     program.emit_insn(Insn::SetCookie {
@@ -2242,6 +2250,7 @@ pub fn translate_drop_table(
             None,
             None,
             SQLITE_TABLEID,
+            database_id,
         )?;
         program.preassign_label_to_next_insn(skip_cdc_label);
     }
@@ -2897,6 +2906,7 @@ fn persist_type_definition(
             TURSO_TYPES_TABLE_NAME,
             table_root_reg,
             Some(create_sql),
+            MAIN_DB_ID,
         )?;
 
         // Parse schema to register the new table in-memory

@@ -218,6 +218,7 @@ pub fn translate_analyze(
             "sqlite_stat1",
             table_root_reg,
             Some(sql.to_string()),
+            database_id,
         )?;
 
         let parse_schema_where_clause =
