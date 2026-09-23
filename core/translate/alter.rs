@@ -895,6 +895,13 @@ pub fn translate_alter_table(
             );
         }
     }
+    // A materialized view's name and columns belong to its definition, its
+    // DBSP state table and its indexes, none of which ALTER TABLE rewrites.
+    if resolver.with_schema(database_id, |s| s.is_materialized_view(table_name)) {
+        crate::bail_parse_error!(
+            "cannot alter materialized view \"{table_name}\"; drop and recreate it"
+        );
+    }
     let Some(original_btree) = table.btree() else {
         crate::bail_parse_error!("ALTER TABLE is only supported for BTree tables");
     };
