@@ -278,3 +278,79 @@ test matview-replace-changed-value-never-revisiting {
 expect {
     c|1
 }
+
+# The cases below declare REPLACE in the schema instead of the statement, so a
+# plain INSERT resolves the conflict with REPLACE.
+test matview-ddl-replace-unique-conflict-different-rowid {
+    CREATE TABLE r1(id INTEGER PRIMARY KEY, val TEXT UNIQUE ON CONFLICT REPLACE);
+    CREATE MATERIALIZED VIEW rv1 AS SELECT val, COUNT(*) AS cnt FROM r1 GROUP BY val;
+    INSERT INTO r1 VALUES (1,'a');
+    INSERT INTO r1 VALUES (2,'a');
+    SELECT val, cnt FROM rv1 ORDER BY val;
+    SELECT id, val FROM r1 ORDER BY id;
+}
+expect {
+    a|1
+    2|a
+}
+
+test matview-ddl-replace-unique-no-conflict {
+    CREATE TABLE r2(id INTEGER PRIMARY KEY, val TEXT UNIQUE ON CONFLICT REPLACE, grp TEXT);
+    CREATE MATERIALIZED VIEW rv2 AS SELECT grp, COUNT(*) AS cnt FROM r2 GROUP BY grp;
+    INSERT INTO r2 VALUES (1,'a','g');
+    INSERT INTO r2 VALUES (2,'b','g');
+    INSERT INTO r2 VALUES (3,'c','g');
+    SELECT grp, cnt FROM rv2 ORDER BY grp;
+}
+expect {
+    g|3
+}
+
+test matview-ddl-replace-primary-key-same-value {
+    CREATE TABLE r3(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, val TEXT);
+    CREATE MATERIALIZED VIEW rv3 AS SELECT val, COUNT(*) AS cnt FROM r3 GROUP BY val;
+    INSERT INTO r3 VALUES (1,'a');
+    INSERT INTO r3 VALUES (1,'a');
+    INSERT INTO r3 VALUES (1,'a');
+    SELECT val, cnt FROM rv3 ORDER BY val;
+}
+expect {
+    a|1
+}
+
+test matview-ddl-replace-primary-key-changed-value-revisiting-a-group {
+    CREATE TABLE r4(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, val TEXT);
+    CREATE MATERIALIZED VIEW rv4 AS SELECT val, COUNT(*) AS cnt FROM r4 GROUP BY val;
+    INSERT INTO r4 VALUES (1,'a');
+    INSERT INTO r4 VALUES (1,'b');
+    INSERT INTO r4 VALUES (1,'a');
+    SELECT val, cnt FROM rv4 ORDER BY val;
+}
+expect {
+    a|1
+}
+
+test matview-ddl-replace-primary-key-no-conflict {
+    CREATE TABLE r5(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, val TEXT);
+    CREATE MATERIALIZED VIEW rv5 AS SELECT val, COUNT(*) AS cnt FROM r5 GROUP BY val;
+    INSERT INTO r5 VALUES (1,'a');
+    INSERT INTO r5 VALUES (2,'a');
+    SELECT val, cnt FROM rv5 ORDER BY val;
+}
+expect {
+    a|2
+}
+
+test matview-ddl-replace-primary-key-join {
+    CREATE TABLE ja(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, k TEXT);
+    CREATE TABLE jb(id INTEGER PRIMARY KEY, k TEXT, v TEXT);
+    INSERT INTO ja VALUES (1,'k1');
+    INSERT INTO jb VALUES (1,'k1','x'),(2,'k1','y');
+    CREATE MATERIALIZED VIEW jv AS SELECT ja.id AS aid, jb.v FROM ja JOIN jb ON ja.k = jb.k;
+    INSERT INTO ja VALUES (1,'k1');
+    SELECT aid, v FROM jv ORDER BY v;
+}
+expect {
+    1|x
+    1|y
+}
