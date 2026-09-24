@@ -263,6 +263,7 @@ fn translate_statement(
     }
 
     let is_select = matches!(stmt, ast::Stmt::Select { .. });
+    let is_drop_trigger = matches!(stmt, ast::Stmt::DropTrigger { .. });
     let is_dml = matches!(
         stmt,
         ast::Stmt::Delete { .. } | ast::Stmt::Insert { .. } | ast::Stmt::Update { .. }
@@ -586,7 +587,7 @@ fn translate_statement(
             // without upgrading an unrelated main snapshot for attached-only
             // writes.
             program.begin_read_operation()?;
-        } else {
+        } else if !is_drop_trigger {
             program.begin_write_operation()?;
         }
     }
