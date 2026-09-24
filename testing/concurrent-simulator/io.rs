@@ -14,13 +14,37 @@ use turso_core::{
 pub struct IOFaultConfig {
     /// Probability of a cosmic ray bit flip on write (0.0-1.0)
     pub cosmic_ray_probability: f64,
+    /// If false, cosmic rays use the random numbers of a flip but change no bit.
+    pub flip_cosmic_ray_bits: bool,
 }
 
 impl Default for IOFaultConfig {
     fn default() -> Self {
         Self {
             cosmic_ray_probability: 0.0,
+            flip_cosmic_ray_bits: true,
         }
+    }
+}
+
+/// A bit that a cosmic ray flipped in a file that was open at that time.
+#[derive(Debug, Clone)]
+pub struct CosmicRayFlip {
+    pub time_micros: u64,
+    pub path: String,
+    pub offset: usize,
+    pub bit: u32,
+    pub old_byte: u8,
+    pub new_byte: u8,
+}
+
+impl std::fmt::Display for CosmicRayFlip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "time {}us, file {}, offset {}, bit {} (0x{:02x} -> 0x{:02x})",
+            self.time_micros, self.path, self.offset, self.bit, self.old_byte, self.new_byte
+        )
     }
 }
 
@@ -39,6 +63,7 @@ pub struct SimulatorIO {
     /// Simulated time in microseconds, incremented on each step
     time: AtomicU64,
     pending: PendingQueue,
+    cosmic_ray_flips: Mutex<Vec<CosmicRayFlip>>,
 }
 
 impl SimulatorIO {
@@ -52,7 +77,20 @@ impl SimulatorIO {
             fault_config,
             time: AtomicU64::new(0),
             pending: Arc::new(Mutex::new(Vec::new())),
+            cosmic_ray_flips: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The cosmic-ray flips that hit `path`, oldest first.
+    pub fn cosmic_ray_flips_into(&self, path: &str) -> Vec<CosmicRayFlip> {
+        let key = canonical_key(path);
+        self.cosmic_ray_flips
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|flip| flip.path == key)
+            .cloned()
+            .collect()
     }
 
     pub fn file_sizes(&self) -> Arc<Mutex<HashMap<String, u64>>> {
@@ -204,6 +242,7 @@ impl IO for SimulatorIO {
                     let files = self.files.lock().unwrap();
                     files
                         .iter()
+                        .filter(|(_, file)| Arc::strong_count(file) > 1)
                         .map(|(path, file)| (path.clone(), file.clone()))
                         .collect()
                 };
@@ -214,7 +253,10 @@ impl IO for SimulatorIO {
 
                     // Get the actual file size (not the mmap size)
                     let file_size = *file.size.lock().unwrap();
-                    if file_size > 0 {
+                    if file_size > 0 && !self.fault_config.flip_cosmic_ray_bits {
+                        rng.random_range(0..file_size);
+                        rng.random_range(0..8u32);
+                    } else if file_size > 0 {
                         // Pick a random offset within the actual file size
                         let byte_offset = rng.random_range(0..file_size);
                         let bit_idx = rng.random_range(0..8);
@@ -226,6 +268,14 @@ impl IO for SimulatorIO {
                             "Cosmic ray! File: {} - Flipped bit {} at offset {} (0x{:02x} -> 0x{:02x})",
                             path, bit_idx, byte_offset, old_byte, mmap[byte_offset]
                         );
+                        self.cosmic_ray_flips.lock().unwrap().push(CosmicRayFlip {
+                            time_micros: self.time.load(Ordering::Relaxed),
+                            path: path.clone(),
+                            offset: byte_offset,
+                            bit: bit_idx,
+                            old_byte,
+                            new_byte: mmap[byte_offset],
+                        });
                     }
                 }
             }
@@ -526,5 +576,59 @@ mod tests {
             };
             assert_eq!(std::fs::read(output.path().join(name)).unwrap(), bytes);
         }
+    }
+
+    #[test]
+    fn cosmic_rays_hit_only_live_files_and_no_flip_mode_draws_the_same_numbers() {
+        const STEPS: usize = 32;
+        let run = |flip_cosmic_ray_bits: bool| {
+            let directory = tempfile::tempdir().unwrap();
+            let dropped = directory.path().join("dropped.db");
+            let live = directory.path().join("live.db-wal");
+            let io = SimulatorIO::new(
+                false,
+                ChaCha8Rng::seed_from_u64(7),
+                IOFaultConfig {
+                    cosmic_ray_probability: 1.0,
+                    flip_cosmic_ray_bits,
+                },
+            );
+            let mut live_file = None;
+            let mut writes = Vec::new();
+            for path in [&dropped, &live] {
+                let file = io
+                    .open_file(path.to_str().unwrap(), OpenFlags::default(), false)
+                    .unwrap();
+                let buffer = Arc::new(turso_core::Buffer::new_temporary(64));
+                writes.push(
+                    file.pwrite(0, buffer, Completion::new_write(|_| {}))
+                        .unwrap(),
+                );
+                live_file = Some(file);
+            }
+            for _ in 0..STEPS {
+                io.step().unwrap();
+            }
+            drop(live_file);
+            assert!(writes.iter().all(Completion::succeeded));
+            (
+                io.cosmic_ray_flips_into(dropped.to_str().unwrap()).len(),
+                io.cosmic_ray_flips_into(live.to_str().unwrap()).len(),
+                io.db_file_bytes(),
+                io.generate_random_number(),
+                directory,
+            )
+        };
+
+        let (dropped_flips, live_flips, bytes, next_draw, _dir) = run(true);
+        assert_eq!(dropped_flips, 0);
+        assert_eq!(live_flips, STEPS);
+        assert_ne!(bytes[0], ("-wal".to_string(), vec![0; 64]));
+        assert_eq!(bytes[1], (".db".to_string(), vec![0; 64]));
+
+        let (dropped_flips, live_flips, bytes, no_flip_next_draw, _dir) = run(false);
+        assert_eq!((dropped_flips, live_flips), (0, 0));
+        assert!(bytes.iter().all(|(_, b)| b == &vec![0; 64]));
+        assert_eq!(no_flip_next_draw, next_draw);
     }
 }
