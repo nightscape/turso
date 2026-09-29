@@ -81,7 +81,7 @@ impl ProjectOperator {
         })
     }
 
-    fn project_values(&self, values: &[Value]) -> Vec<Value> {
+    fn project_values(&self, values: &[Value]) -> crate::Result<Vec<Value>> {
         let mut output = Vec::new();
 
         for col in &self.columns {
@@ -89,14 +89,10 @@ impl ProjectOperator {
             let internal_pager = self.internal_conn.pager.load().clone();
 
             // Execute the compiled expression (handles both columns and complex expressions)
-            let result = col
-                .compiled
-                .execute(values, internal_pager)
-                .expect("Failed to execute compiled expression for the Project operator");
-            output.push(result);
+            output.push(col.compiled.execute(values, internal_pager)?);
         }
 
-        output
+        Ok(output)
     }
 }
 
@@ -127,7 +123,7 @@ impl IncrementalOperator for ProjectOperator {
                 tracker.lock().record_project();
             }
 
-            let projected = self.project_values(&row.values);
+            let projected = self.project_values(&row.values)?;
             let projected_row = HashableRow::new(row.rowid, projected);
             output_delta.changes.push((projected_row, weight));
         }
@@ -150,7 +146,7 @@ impl IncrementalOperator for ProjectOperator {
             if let Some(tracker) = &self.tracker {
                 tracker.lock().record_project();
             }
-            let projected = self.project_values(&row.values);
+            let projected = self.project_values(&row.values)?;
             let projected_row = HashableRow::new(row.rowid, projected);
             output_delta.changes.push((projected_row, *weight));
         }
