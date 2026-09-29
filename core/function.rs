@@ -4,7 +4,7 @@ use std::fmt::{Debug, Display};
 use strum::IntoEnumIterator;
 use turso_ext::{
     ContextDestructor, FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction,
-    ValueDestructor,
+    Value as ExtValue, ValueDestructor,
 };
 
 use crate::LimboError;
@@ -165,6 +165,58 @@ impl ExtFunc {
             },
             _ => self.clone(),
         }
+    }
+}
+
+/// A scalar SQL function implemented in Rust. It must return the same result
+/// for the same arguments, and it must not panic: a panic crosses an
+/// `extern "C"` boundary and aborts the process.
+pub type DeterministicScalarFn = fn(&[crate::Value]) -> std::result::Result<crate::Value, String>;
+
+#[derive(Clone)]
+pub(crate) struct RustScalarFunction {
+    pub(crate) name: String,
+    pub(crate) arg_count: usize,
+    pub(crate) func: DeterministicScalarFn,
+}
+
+impl RustScalarFunction {
+    pub(crate) fn to_external_func(&self) -> ExternalFunc {
+        ExternalFunc::new_scalar(
+            self.name.clone(),
+            i32::try_from(self.arg_count).expect("scalar function arg_count must fit in i32"),
+            true,
+            self.func as usize,
+            call_rust_scalar_function,
+            None,
+            None,
+        )
+    }
+}
+
+unsafe extern "C" fn call_rust_scalar_function(
+    context: usize,
+    argc: i32,
+    argv: *const ExtValue,
+    _context_destructor: Option<ContextDestructor>,
+    _value_destructor: Option<ValueDestructor>,
+) -> ExtValue {
+    let func = unsafe { std::mem::transmute::<usize, DeterministicScalarFn>(context) };
+    let ffi_args: &[ExtValue] = if argc == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(argv, argc as usize) }
+    };
+    let args: Vec<crate::Value> = ffi_args
+        .iter()
+        .map(|arg| {
+            crate::Value::from_ffi_ref(arg)
+                .expect("an argument built by Value::to_ffi converts back")
+        })
+        .collect();
+    match func(&args) {
+        Ok(value) => value.to_ffi(),
+        Err(message) => ExtValue::error_with_message(message),
     }
 }
 

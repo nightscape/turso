@@ -20,6 +20,7 @@ use crate::{
     alloc, bail_corrupt_error,
     busy::BusyHandler,
     ext,
+    function::{DeterministicScalarFn, RustScalarFunction},
     incremental::view::AllViewsTxState,
     io, io_error, io_yield_one, mvcc,
     progress::ProgressHandler,
@@ -232,6 +233,7 @@ pub struct OpenOptions {
     /// time and shared by every user of the registered instance; a registry
     /// hit with a different dialect is an error.
     dialect: Arc<dyn Dialect>,
+    scalar_functions: Vec<RustScalarFunction>,
 }
 
 impl OpenOptions {
@@ -248,6 +250,7 @@ impl OpenOptions {
             durable_storage: None,
             allocators: DatabaseAllocators::default(),
             dialect,
+            scalar_functions: Vec::new(),
         }
     }
 
@@ -294,6 +297,23 @@ impl OpenOptions {
 
     pub fn allocators(mut self, allocators: DatabaseAllocators) -> Self {
         self.allocators = allocators;
+        self
+    }
+
+    /// Register `func` as the SQL function `name` on the database before its
+    /// schema loads, so that materialized views that call it load at every
+    /// open. A registry hit must request the same set of functions.
+    pub fn deterministic_scalar_function(
+        mut self,
+        name: &str,
+        arg_count: usize,
+        func: DeterministicScalarFn,
+    ) -> Self {
+        self.scalar_functions.push(RustScalarFunction {
+            name: crate::util::normalize_ident(name),
+            arg_count,
+            func,
+        });
         self
     }
 }
@@ -592,6 +612,7 @@ pub struct Database<
     // Use parking lot RwLock here and not `crate::sync::RwLock` because it relies on `data_ptr` and that is experimental
     // in std.
     pub(crate) builtin_syms: parking_lot::RwLock<SymbolTable>,
+    scalar_functions: Vec<RustScalarFunction>,
     /// SQL dialect this database runs under, interpreting `sqlite_schema`
     /// SQL rows. Passed explicitly by every open path, fixed at open time,
     /// and shared by all connections because the parsed [`Schema`] is
@@ -690,6 +711,7 @@ impl Database {
         allocators: DatabaseAllocators,
         page_codec_id: Option<PageCodecId>,
         dialect: Arc<dyn Dialect>,
+        scalar_functions: Vec<RustScalarFunction>,
     ) -> Result<Self> {
         let path = path.into();
         let wal_path = wal_path.into();
@@ -738,6 +760,7 @@ impl Database {
             shared_wal_coordination: OnceLock::new(),
             db_file,
             builtin_syms: parking_lot::RwLock::new(syms),
+            scalar_functions,
             dialect,
             io: io.clone(),
             open_flags: flags,
@@ -772,7 +795,23 @@ impl Database {
 
         db.register_global_builtin_extensions()
             .expect("unable to register global extensions");
+        db.register_scalar_functions()?;
         Ok(db)
+    }
+
+    fn register_scalar_functions(&self) -> Result<()> {
+        let mut syms = self.builtin_syms.write();
+        for function in &self.scalar_functions {
+            if syms.functions.contains_key(&function.name) {
+                return Err(LimboError::InvalidArgument(format!(
+                    "scalar function '{}' has the name of a built-in extension function",
+                    function.name
+                )));
+            }
+            syms.functions
+                .insert(function.name.clone(), Arc::new(function.to_external_func()));
+        }
+        Ok(())
     }
 
     /// Deprecated convenience shim: prefer [`Database::open`] with
@@ -888,7 +927,50 @@ impl Database {
                 "built-in encryption cannot be combined with an external page codec".to_string(),
             ));
         }
+        Self::validate_scalar_functions(options)
+    }
+
+    fn validate_scalar_functions(options: &OpenOptions) -> Result<()> {
+        for (i, function) in options.scalar_functions.iter().enumerate() {
+            if !Self::is_plain_identifier(&function.name) {
+                return Err(LimboError::InvalidArgument(format!(
+                    "scalar function name '{}' is not a plain identifier: it must start with \
+                     an ASCII letter or '_', contain only ASCII letters, digits and '_', and \
+                     not be an SQL keyword",
+                    function.name
+                )));
+            }
+            if options.scalar_functions[..i]
+                .iter()
+                .any(|earlier| earlier.name == function.name)
+            {
+                return Err(LimboError::InvalidArgument(format!(
+                    "scalar function '{}' is registered twice",
+                    function.name
+                )));
+            }
+            if !matches!(
+                options
+                    .dialect
+                    .resolve_function(&function.name, function.arg_count),
+                Ok(None)
+            ) {
+                return Err(LimboError::InvalidArgument(format!(
+                    "scalar function '{}' has the name of a built-in function",
+                    function.name
+                )));
+            }
+        }
         Ok(())
+    }
+
+    fn is_plain_identifier(name: &str) -> bool {
+        let mut chars = name.chars();
+        chars
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !turso_parser::lexer::is_quotable_keyword(name.as_bytes())
     }
 
     #[cfg(feature = "fs")]
@@ -990,6 +1072,29 @@ impl Database {
             )));
         }
         Ok(())
+    }
+
+    fn check_registry_scalar_functions(
+        db: &Database,
+        requested: &[RustScalarFunction],
+    ) -> Result<()> {
+        let open = Self::scalar_function_signatures(&db.scalar_functions);
+        let requested = Self::scalar_function_signatures(requested);
+        if open != requested {
+            return Err(LimboError::InvalidArgument(format!(
+                "database is already open with scalar functions {open:?}; requested {requested:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn scalar_function_signatures(functions: &[RustScalarFunction]) -> Vec<String> {
+        let mut signatures: Vec<String> = functions
+            .iter()
+            .map(|function| format!("{}/{}", function.name, function.arg_count))
+            .collect();
+        signatures.sort();
+        signatures
     }
 
     /// Look up a database in the process-wide registry by file identity.
@@ -1104,6 +1209,7 @@ impl Database {
                             .to_string(),
                     ));
                 }
+                Self::check_registry_scalar_functions(&db, &options.scalar_functions)?;
                 return Ok(Some(db));
             }
         }
@@ -1264,6 +1370,7 @@ impl Database {
                             }
                             db.validate_page_codec(options.page_codec.as_deref())?;
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
+                            Self::check_registry_scalar_functions(&db, &options.scalar_functions)?;
                             return Ok(IOResult::Done(db));
                         }
                         // Weak ref expired — treat as absent, fall through to insert Opening.
@@ -1301,6 +1408,7 @@ impl Database {
             options.page_codec.clone(),
             options.allocators.clone(),
             options.dialect.clone(),
+            &options.scalar_functions,
         );
 
         match &result {
@@ -1378,6 +1486,7 @@ impl Database {
             options.page_codec.clone(),
             options.allocators.clone(),
             options.dialect.clone(),
+            &options.scalar_functions,
         )
     }
 
@@ -1398,6 +1507,7 @@ impl Database {
         page_codec: Option<Arc<dyn PageCodec>>,
         allocators: DatabaseAllocators,
         dialect: Arc<dyn Dialect>,
+        scalar_functions: &[RustScalarFunction],
     ) -> IOResultOr<Arc<Database>> {
         Self::validate_external_page_codec_options(opts, page_codec.is_some())?;
         if encryption_opts.is_some() && page_codec.is_some() {
@@ -1419,6 +1529,7 @@ impl Database {
             page_codec,
             allocators,
             dialect,
+            scalar_functions,
         );
         if result.is_err() {
             let _ = state.schema_guard.take();
@@ -1440,6 +1551,7 @@ impl Database {
         page_codec: Option<Arc<dyn PageCodec>>,
         allocators: DatabaseAllocators,
         dialect: Arc<dyn Dialect>,
+        scalar_functions: &[RustScalarFunction],
     ) -> IOResultOr<Arc<Database>> {
         loop {
             tracing::debug!("do_open_async_internal: state.phase={:?}", state.phase);
@@ -1468,6 +1580,7 @@ impl Database {
                         allocators.clone(),
                         page_codec.as_deref().map(PageCodec::codec_id),
                         dialect.clone(),
+                        scalar_functions.to_vec(),
                     )?;
                     db.durable_storage.clone_from(&durable_storage);
 
