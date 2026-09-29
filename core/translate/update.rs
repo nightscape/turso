@@ -202,6 +202,7 @@ fn prepare_and_optimize_update_plan(
 
 fn validate_update(
     schema: &Schema,
+    database_id: usize,
     table_name: &str,
     is_internal_schema_change: bool,
     conn: &Arc<Connection>,
@@ -219,19 +220,7 @@ fn validate_update(
         bail_parse_error!("cannot modify materialized view {}", table_name);
     }
 
-    // Check if this table has any incompatible dependent views
-    schema.with_incompatible_dependent_views(table_name, |views| {
-    if !views.is_empty() {
-        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
-        crate::bail_parse_error!(
-            "Cannot UPDATE table '{table_name}' because it has incompatible dependent materialized view(s): {}. \n\
-             These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
-             Please DROP and recreate the view(s) before modifying this table.",
-            views.iter().map(|view| view.as_str()).collect::<Vec<_>>().join(", "),
-        );
-    }
-    Ok(())
-    })
+    schema.refuse_write_that_would_stale_a_view(database_id, table_name)
 }
 
 fn prepare_update_plan(
@@ -264,6 +253,7 @@ fn prepare_update_plan(
     program.begin_write_on_database(database_id, schema_cookie)?;
     validate_update(
         schema,
+        database_id,
         target_name.as_str(),
         is_internal_schema_change,
         connection,

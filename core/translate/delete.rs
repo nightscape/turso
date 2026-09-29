@@ -56,21 +56,9 @@ fn validate_delete(
         crate::bail_parse_error!("cannot modify materialized view {}", tbl_name);
     }
 
-    // Check if this table has any incompatible dependent views
-    resolver.schema().with_incompatible_dependent_views(tbl_name, |views| {
-    if !views.is_empty() {
-        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
-        crate::bail_parse_error!(
-            "Cannot DELETE from table '{tbl_name}' because it has incompatible dependent materialized view(s): {}. \n\
-             These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
-             Please DROP and recreate the view(s) before modifying this table.",
-            views.iter().fold(String::new(), |_, s| s.to_string() + ", "),
-        );
-    }
-    // Pins the closure's error type: bail_parse_error! is polymorphic over
-    // boxed and unboxed LimboError since the InsnResult migration.
-    Ok::<(), crate::LimboError>(())
-    })?;
+    resolver
+        .schema()
+        .refuse_write_that_would_stale_a_view(database_id, tbl_name)?;
     Ok(table)
 }
 
