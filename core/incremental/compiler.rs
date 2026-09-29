@@ -35,7 +35,7 @@ use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Value
 use crate::Pager;
 
 use crate::util::IOExt;
-use crate::{return_and_restore_if_io, return_if_io, LimboError, Result};
+use crate::{return_and_restore_if_io, return_if_io, LimboError, Result, SymbolTable};
 use rustc_hash::FxHashMap as HashMap;
 
 /// Which side of a join a filter expression references.
@@ -2258,14 +2258,15 @@ impl DbspCircuit {
 }
 
 /// Compiler from LogicalPlan to DBSP Circuit
-pub struct DbspCompiler {
+pub struct DbspCompiler<'a> {
     circuit: DbspCircuit,
     /// Maps recursive CTE names to their delay input node IDs
     /// Used during compilation to resolve RecursiveCTERef nodes
     recursive_cte_refs: HashMap<String, i64>,
+    syms: &'a SymbolTable,
 }
 
-impl DbspCompiler {
+impl<'a> DbspCompiler<'a> {
     /// Create a new DBSP compiler
     pub fn new(
         main_data_root: i64,
@@ -2273,6 +2274,7 @@ impl DbspCompiler {
         internal_state_index_root: i64,
         order_by: super::view::MatviewOrderBy,
         limit: Option<i64>,
+        syms: &'a SymbolTable,
     ) -> Self {
         Self {
             circuit: DbspCircuit::new(
@@ -2283,6 +2285,7 @@ impl DbspCompiler {
                 limit,
             ),
             recursive_cte_refs: HashMap::default(),
+            syms,
         }
     }
 
@@ -2633,7 +2636,7 @@ impl DbspCompiler {
             }
             for (computed_expr, name) in &temps {
                 let (compiled_computed, _alias) =
-                    Self::compile_expression(computed_expr, input_schema)?;
+                    self.compile_expression(computed_expr, input_schema)?;
                 compiled_exprs.push(compiled_computed);
                 aliases.push(Some(name.clone()));
                 output_names.push(name.clone());
@@ -2877,7 +2880,7 @@ impl DbspCompiler {
                 let mut compiled_exprs = Vec::new();
                 let mut aliases = Vec::new();
                 for expr in &proj.exprs {
-                    let (compiled, alias) = Self::compile_expression(expr, input_schema)?;
+                    let (compiled, alias) = self.compile_expression(expr, input_schema)?;
                     compiled_exprs.push(compiled);
                     aliases.push(alias);
                 }
@@ -3931,13 +3934,14 @@ impl DbspCompiler {
 
     /// Compile a logical expression to a CompiledExpression and optional alias
     fn compile_expression(
+        &self,
         expr: &LogicalExpr,
         input_schema: &LogicalSchema,
     ) -> Result<(CompiledExpression, Option<String>)> {
         // Check for alias first
         if let LogicalExpr::Alias { expr, alias } = expr {
             // For aliases, compile the underlying expression and return with alias
-            let (compiled, _) = Self::compile_expression(expr, input_schema)?;
+            let (compiled, _) = self.compile_expression(expr, input_schema)?;
             return Ok((compiled, Some(alias.clone())));
         }
 
@@ -3955,7 +3959,7 @@ impl DbspCompiler {
         // This handles both trivial cases and complex VDBE compilation
         // We need to set up the necessary context
         use crate::sync::Arc;
-        use crate::{Database, MemoryIO, SymbolTable};
+        use crate::{Database, MemoryIO};
 
         // Create an internal connection for expression compilation
         let io = Arc::new(MemoryIO::new());
@@ -3963,9 +3967,6 @@ impl DbspCompiler {
         let internal_conn = db.connect()?;
         internal_conn.set_query_only(true);
         internal_conn.auto_commit.store(false, Ordering::SeqCst);
-
-        // Create temporary symbol table
-        let temp_syms = SymbolTable::new();
 
         // Get a minimal schema for compilation (we don't need the full schema for expressions)
         let schema = crate::schema::Schema::new();
@@ -3975,7 +3976,7 @@ impl DbspCompiler {
             &ast_expr,
             &input_column_names,
             &schema,
-            &temp_syms,
+            self.syms,
             internal_conn,
         )?;
 
@@ -4972,6 +4973,7 @@ mod tests {
                             dbsp_state_index_page,
                             crate::incremental::view::MatviewOrderBy::default(),
                             None,
+                            &crate::SymbolTable::new(),
                         )
                         .compile(&logical_plan)
                         .unwrap(),
