@@ -15,7 +15,7 @@ use crate::types::IOResultOr;
 use crate::types::{IOResult, Value};
 use crate::util::{extract_view_columns, normalize_ident, ViewColumnSchema};
 use crate::vtab::VirtualTable;
-use crate::{return_if_io, LimboError, Pager, Result, Statement};
+use crate::{return_if_io, LimboError, Pager, Result, Statement, SymbolTable};
 use parking_lot::Mutex as ParkingLotMutex;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::fmt;
@@ -595,9 +595,11 @@ crate::assert::assert_send_sync!(IncrementalView);
 
 impl IncrementalView {
     /// Try to compile the SELECT statement into a DBSP circuit
+    #[allow(clippy::too_many_arguments)]
     fn try_compile_circuit(
         select: &ast::Select,
         schema: &Schema,
+        syms: &SymbolTable,
         main_data_root: i64,
         internal_state_root: i64,
         internal_state_index_root: i64,
@@ -627,6 +629,7 @@ impl IncrementalView {
             internal_state_index_root,
             order_by.clone(),
             limit,
+            syms,
         );
         let circuit = compiler.compile(&logical_plan)?;
 
@@ -692,6 +695,7 @@ impl IncrementalView {
     pub fn from_sql(
         sql: &str,
         schema: &Schema,
+        syms: &SymbolTable,
         main_data_root: i64,
         internal_state_root: i64,
         internal_state_index_root: i64,
@@ -709,6 +713,7 @@ impl IncrementalView {
                 view_name,
                 select,
                 schema,
+                syms,
                 main_data_root,
                 internal_state_root,
                 internal_state_index_root,
@@ -723,6 +728,7 @@ impl IncrementalView {
         view_name: ast::QualifiedName,
         select: ast::Select,
         schema: &Schema,
+        syms: &SymbolTable,
         main_data_root: i64,
         internal_state_root: i64,
         internal_state_index_root: i64,
@@ -788,6 +794,7 @@ impl IncrementalView {
             table_conditions,
             column_schema,
             schema,
+            syms,
             main_data_root,
             internal_state_root,
             internal_state_index_root,
@@ -889,6 +896,7 @@ impl IncrementalView {
         table_conditions: HashMap<String, Vec<Option<ast::Expr>>>,
         column_schema: ViewColumnSchema,
         schema: &Schema,
+        syms: &SymbolTable,
         main_data_root: i64,
         internal_state_root: i64,
         internal_state_index_root: i64,
@@ -902,6 +910,7 @@ impl IncrementalView {
             table_conditions,
             column_schema,
             schema,
+            syms,
             main_data_root,
             internal_state_root,
             internal_state_index_root,
@@ -920,6 +929,7 @@ impl IncrementalView {
         table_conditions: HashMap<String, Vec<Option<ast::Expr>>>,
         column_schema: ViewColumnSchema,
         schema: &Schema,
+        syms: &SymbolTable,
         main_data_root: i64,
         internal_state_root: i64,
         internal_state_index_root: i64,
@@ -938,6 +948,7 @@ impl IncrementalView {
         let circuit = Self::try_compile_circuit(
             &select_stmt,
             schema,
+            syms,
             main_data_root,
             internal_state_root,
             internal_state_index_root,
@@ -2909,6 +2920,7 @@ mod tests {
             table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
+            &SymbolTable::new(),
             1, // main_data_root
             2, // internal_state_root
             3, // internal_state_index_root
@@ -2939,6 +2951,7 @@ mod tests {
             table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
+            &SymbolTable::new(),
             1, // main_data_root
             2, // internal_state_root
             3, // internal_state_index_root
@@ -2973,6 +2986,7 @@ mod tests {
             table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
+            &SymbolTable::new(),
             1, // main_data_root
             2, // internal_state_root
             3, // internal_state_index_root
@@ -3014,6 +3028,7 @@ mod tests {
             table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
+            &SymbolTable::new(),
             1, // main_data_root
             2, // internal_state_root
             3, // internal_state_index_root
@@ -3056,6 +3071,7 @@ mod tests {
             table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
+            &SymbolTable::new(),
             1, // main_data_root
             2, // internal_state_root
             3, // internal_state_index_root
@@ -3094,6 +3110,7 @@ mod tests {
             table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
+            &SymbolTable::new(),
             1, // main_data_root
             2, // internal_state_root
             3, // internal_state_index_root
@@ -3128,6 +3145,7 @@ mod tests {
             table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
+            &SymbolTable::new(),
             1, // main_data_root
             2, // internal_state_root
             3, // internal_state_index_root
@@ -3163,6 +3181,7 @@ mod tests {
             table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
+            &SymbolTable::new(),
             1, // main_data_root
             2, // internal_state_root
             3, // internal_state_index_root
@@ -3199,6 +3218,7 @@ mod tests {
             table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
+            &SymbolTable::new(),
             1, // main_data_root
             2, // internal_state_root
             3, // internal_state_index_root
@@ -3325,6 +3345,7 @@ mod tests {
             table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
+            &SymbolTable::new(),
             1, // main_data_root
             2, // internal_state_root
             3, // internal_state_index_root
@@ -3370,6 +3391,7 @@ mod tests {
             table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
+            &SymbolTable::new(),
             1, // main_data_root
             2, // internal_state_root
             3, // internal_state_index_root
@@ -3418,6 +3440,7 @@ mod tests {
             table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
+            &SymbolTable::new(),
             1, // main_data_root
             2, // internal_state_root
             3, // internal_state_index_root
@@ -3514,6 +3537,7 @@ mod tests {
             table_conditions,
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
+            &SymbolTable::new(),
             1, // main_data_root
             2, // internal_state_root
             3, // internal_state_index_root
@@ -3650,6 +3674,7 @@ mod tests {
             },
             select,
             &schema,
+            &SymbolTable::new(),
             1,
             2,
             3,
@@ -3687,6 +3712,7 @@ mod tests {
             },
             select,
             &schema,
+            &SymbolTable::new(),
             1,
             2,
             3,
@@ -3733,6 +3759,7 @@ mod tests {
             HashMap::default(),
             extract_view_columns(&select, &schema).unwrap(),
             &schema,
+            &SymbolTable::new(),
             1,
             2,
             3,
@@ -4341,6 +4368,7 @@ mod fdw_mirror_redirect_tests {
             },
             parse_select(sql),
             schema,
+            &crate::SymbolTable::new(),
             1,
             2,
             3,
@@ -4426,6 +4454,7 @@ mod fdw_mirror_redirect_tests {
             },
             parse_select("SELECT uuid FROM msg_fdw"),
             &schema,
+            &crate::SymbolTable::new(),
             1,
             2,
             3,

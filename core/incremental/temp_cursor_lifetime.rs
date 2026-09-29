@@ -99,6 +99,7 @@ fn fixture() -> Fixture {
         state_index_root,
         Default::default(),
         None,
+        &crate::SymbolTable::new(),
     )
     .compile(&logical_plan)
     .unwrap();

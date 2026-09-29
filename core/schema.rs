@@ -2219,6 +2219,7 @@ impl Schema {
             let mut deferred = Vec::new();
             for view in pending {
                 match self.populate_one_materialized_view(
+                    syms,
                     &view.name,
                     &view.sql,
                     view.root,
@@ -2339,6 +2340,7 @@ impl Schema {
 
     fn populate_one_materialized_view(
         &mut self,
+        syms: &SymbolTable,
         view_name: &str,
         sql: &str,
         main_root: i64,
@@ -2376,6 +2378,7 @@ impl Schema {
         let incremental_view = IncrementalView::from_sql(
             sql,
             self,
+            syms,
             main_root,
             dbsp_state_root,
             dbsp_state_index_root,

@@ -52,6 +52,7 @@ mod test_ivm_refresh_dependent_matview;
 mod test_ivm_refresh_fdw_dependent;
 mod test_ivm_refresh_in_transaction;
 mod test_ivm_refresh_state_index_orphan;
+mod test_ivm_registered_scalar_fn;
 mod test_ivm_selfjoin_where;
 mod test_ivm_stale_matview_reopen;
 mod test_ivm_tx_insert_or_replace;
