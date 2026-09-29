@@ -348,7 +348,15 @@ pub fn translate_create_materialized_view(
             mirror_specs_for_view(&normalized_view_name, &source_names, s)?
         };
         if mirror_specs.is_empty() {
-            IncrementalView::from_stmt(view_name.clone(), select_stmt.clone(), s, 0, 0, 0)?;
+            IncrementalView::from_stmt(
+                view_name.clone(),
+                select_stmt.clone(),
+                s,
+                resolver.symbol_table,
+                0,
+                0,
+                0,
+            )?;
             return Ok(());
         }
         let mut dry_run_schema = s.try_clone()?;
@@ -364,6 +372,7 @@ pub fn translate_create_materialized_view(
             view_name.clone(),
             select_stmt.clone(),
             &dry_run_schema,
+            resolver.symbol_table,
             0,
             0,
             0,
