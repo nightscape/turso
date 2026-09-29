@@ -731,6 +731,18 @@ pub enum IncompatibleViewReason {
     CompileFailure(String),
 }
 
+impl std::fmt::Display for IncompatibleViewReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VersionMismatch => write!(
+                f,
+                "it was created with a DBSP version other than the current one ({DBSP_CIRCUIT_VERSION})"
+            ),
+            Self::CompileFailure(cause) => write!(f, "it could not be loaded: {cause}"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
@@ -1160,21 +1172,35 @@ impl Schema {
         self.materialized_view_names.contains(&name)
     }
 
-    /// Apply a function to a table's incompatible dependent materialized views
-    pub fn with_incompatible_dependent_views<F, T>(&self, table_name: &str, f: F) -> T
-    where
-        F: FnOnce(&[&String]) -> T,
-    {
-        let table_name = normalize_ident(table_name);
-        let mut views: SmallVec<[&String; 8]> = SmallVec::with_capacity(8);
-
-        // Get all materialized views that depend on this table
-        if let Some(v) = self.table_to_materialized_views.get(&table_name) {
-            v.iter()
-                .filter(|name| self.incompatible_views.contains_key(&**name))
-                .for_each(|n| views.push(n));
+    /// Refuses a write to `table_name` in database `database_id` when a
+    /// materialized view that the write would change, directly or through other
+    /// views, could not be loaded. Materialized views exist only in the main
+    /// database, so only writes to main tables can change one.
+    pub fn refuse_write_that_would_stale_a_view(
+        &self,
+        database_id: usize,
+        table_name: &str,
+    ) -> Result<()> {
+        if database_id != crate::MAIN_DB_ID {
+            return Ok(());
         }
-        f(&views)
+        let unusable: Vec<String> = self
+            .get_cascading_views_sorted(table_name)
+            .into_iter()
+            .filter_map(|view| {
+                self.incompatible_views
+                    .get(&view)
+                    .map(|reason| format!("'{view}' ({reason})"))
+            })
+            .collect();
+        if unusable.is_empty() {
+            return Ok(());
+        }
+        bail_parse_error!(
+            "cannot modify table '{table_name}': it feeds materialized view(s) that cannot be \
+             maintained: {}. DROP VIEW them, or make them loadable again and reopen the database",
+            unusable.join(", ")
+        )
     }
 
     /// A `sqlite_schema` view row this connection could not turn into a working
@@ -1214,18 +1240,21 @@ impl Schema {
             self.materialized_view_sql.remove(&name);
             self.incremental_views.remove(&name);
 
-            // Remove from table_to_materialized_views dependencies
-            // This handles both base table deps and view-to-view deps
-            self.table_to_materialized_views.remove(&name);
-            for views in self.table_to_materialized_views.values_mut() {
-                views.retain(|v| v != &name);
-            }
+            self.remove_materialized_view_dependencies(&name);
 
             Ok(())
         } else {
             Err(crate::LimboError::ParseError(format!(
                 "no such view: {name}"
             )))
+        }
+    }
+
+    /// Drops the view from the dependents of every table and view it reads.
+    pub fn remove_materialized_view_dependencies(&mut self, name: &str) {
+        self.table_to_materialized_views.remove(name);
+        for views in self.table_to_materialized_views.values_mut() {
+            views.retain(|v| v != name);
         }
     }
 
@@ -2208,11 +2237,7 @@ impl Schema {
                         });
                     }
                     Err(e) => {
-                        tracing::warn!("Materialized view '{}' is unusable: {}", view.name, e);
-                        self.incompatible_views.insert(
-                            view.name,
-                            IncompatibleViewReason::CompileFailure(e.to_string()),
-                        );
+                        self.mark_view_unloadable(view.name, &view.sql, e.to_string());
                     }
                 }
             }
@@ -2260,14 +2285,12 @@ impl Schema {
                 if reachable_matviews(&key, &edges).contains(&key) {
                     circular.push(view.name);
                 } else {
-                    stale.push((view.name, view.last_error));
+                    stale.push(view);
                 }
             }
 
-            for (view_name, reason) in stale {
-                tracing::warn!("Materialized view '{}' is unusable: {}", view_name, reason);
-                self.incompatible_views
-                    .insert(view_name, IncompatibleViewReason::CompileFailure(reason));
+            for view in stale {
+                self.mark_view_unloadable(view.name, &view.sql, view.last_error);
             }
 
             if !circular.is_empty() {
@@ -2279,6 +2302,20 @@ impl Schema {
         }
 
         self.attach_deferred_matview_indexes(syms)
+    }
+
+    /// The view stays registered as a dependent of every table it reads, so
+    /// writes to those tables can be refused instead of leaving it stale.
+    fn mark_view_unloadable(&mut self, view_name: String, sql: &str, reason: String) {
+        tracing::warn!("Materialized view '{}' is unusable: {}", view_name, reason);
+        let sources = matview_source_names(sql).unwrap_or_else(|e| {
+            panic!("stored SQL of materialized view '{view_name}' parsed before and must parse again: {e}")
+        });
+        for source in sources {
+            self.add_materialized_view_dependency(&source, &view_name);
+        }
+        self.incompatible_views
+            .insert(view_name, IncompatibleViewReason::CompileFailure(reason));
     }
 
     fn attach_deferred_matview_indexes(&mut self, syms: &SymbolTable) -> Result<()> {
