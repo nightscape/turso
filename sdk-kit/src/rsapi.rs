@@ -19,9 +19,9 @@ use tracing_subscriber::{
 };
 use turso_core::{
     storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
-    DatabaseStorage, EncryptionKey, IOResult, LimboError, OpenDbAsyncState, OpenFlags, OpenOptions,
-    PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, PageLocation, QueryMode,
-    SqliteDialect, Statement, StepResult, IO,
+    DatabaseStorage, DeterministicScalarFn, EncryptionKey, IOResult, LimboError, OpenDbAsyncState,
+    OpenFlags, OpenOptions, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId,
+    PageLocation, QueryMode, SqliteDialect, Statement, StepResult, IO,
 };
 
 use crate::{
@@ -150,6 +150,13 @@ impl TursoSetupConfig {
 }
 
 #[derive(Clone)]
+pub struct DeterministicScalarFunction {
+    pub name: String,
+    pub arg_count: usize,
+    pub func: DeterministicScalarFn,
+}
+
+#[derive(Clone)]
 pub struct TursoDatabaseConfig {
     /// path to the database file or ":memory:" for in-memory connection
     pub path: String,
@@ -185,6 +192,9 @@ pub struct TursoDatabaseConfig {
 
     /// database open flags
     pub open_flags: OpenFlags,
+
+    /// deterministic Rust scalar functions registered on the database before its schema loads
+    pub scalar_functions: Vec<DeterministicScalarFunction>,
 }
 
 #[derive(Clone)]
@@ -561,6 +571,7 @@ impl TursoDatabaseConfig {
                 None
             },
             open_flags,
+            scalar_functions: Vec::new(),
         })
     }
 }
@@ -1036,6 +1047,13 @@ impl TursoDatabase {
                         .db_opts(opts)
                         .encryption(self.config.encryption.clone())
                         .page_codec(self.config.page_codec.clone());
+                    let options =
+                        self.config
+                            .scalar_functions
+                            .iter()
+                            .fold(options, |options, f| {
+                                options.deterministic_scalar_function(&f.name, f.arg_count, f.func)
+                            });
                     match Database::open_async(
                         &mut state.open_db_state,
                         io.clone(),
@@ -1866,6 +1884,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         }
     }
 
@@ -2036,6 +2055,7 @@ mod tests {
             db_file: None,
             page_codec: Some(codec),
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2134,6 +2154,7 @@ mod tests {
                 reserved_bytes: 1,
             })),
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
 
         let error = db.open().unwrap_err();
@@ -2162,6 +2183,7 @@ mod tests {
                 db_file: None,
                 page_codec: None,
                 open_flags: OpenFlags::default(),
+                scalar_functions: Vec::new(),
             });
             let result = db.open().unwrap();
             assert!(!result.is_io());
@@ -2225,6 +2247,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2247,6 +2270,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2279,6 +2303,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2304,6 +2329,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2356,6 +2382,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2417,6 +2444,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2451,6 +2479,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2482,6 +2511,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2509,6 +2539,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2537,6 +2568,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2589,6 +2621,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2679,6 +2712,7 @@ mod tests {
                     db_file: None,
                     page_codec: None,
                     open_flags: OpenFlags::default(),
+                    scalar_functions: Vec::new(),
                 });
                 let result = db.open().unwrap();
                 assert!(!result.is_io());
@@ -2721,6 +2755,7 @@ mod tests {
                     db_file: None,
                     page_codec: None,
                     open_flags: OpenFlags::default(),
+                    scalar_functions: Vec::new(),
                 });
                 let result = db.open().unwrap();
                 assert!(!result.is_io());
@@ -2749,6 +2784,7 @@ mod tests {
                     db_file: None,
                     page_codec: None,
                     open_flags: OpenFlags::default(),
+                    scalar_functions: Vec::new(),
                 });
                 assert!(db.open().is_err(), "Opening with wrong key should fail");
             }
@@ -2765,6 +2801,7 @@ mod tests {
                     db_file: None,
                     page_codec: None,
                     open_flags: OpenFlags::default(),
+                    scalar_functions: Vec::new(),
                 });
                 let result = db.open();
                 println!("result: {result:?}");
@@ -2802,6 +2839,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let _ = db_a.open().unwrap();
         let conn_a = db_a.connect().unwrap();
@@ -2841,6 +2879,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let _ = db_a2.open().unwrap();
         let conn_a2 = db_a2.connect().unwrap();
@@ -2877,6 +2916,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
@@ -2913,6 +2953,7 @@ mod tests {
             db_file: None,
             page_codec: None,
             open_flags: OpenFlags::default(),
+            scalar_functions: Vec::new(),
         });
         let result = db.open().unwrap();
         assert!(!result.is_io());
