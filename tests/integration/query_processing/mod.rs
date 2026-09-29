@@ -55,6 +55,7 @@ mod test_ivm_refresh_state_index_orphan;
 mod test_ivm_selfjoin_where;
 mod test_ivm_stale_matview_reopen;
 mod test_ivm_tx_insert_or_replace;
+mod test_ivm_unusable_view_write_guard;
 mod test_ivm_update_abort_rollback;
 mod test_match_counter_uninitialized_repro;
 mod test_multi_index_scan;
