@@ -1,0 +1,75 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+
+# A view removes an old row by computing its expressions again, so every
+# function it calls must return the same result for the same arguments.
+test matview-refuses-random {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE MATERIALIZED VIEW v AS SELECT id, random() AS r FROM t;
+}
+expect error {
+    materialized view v cannot call random\(\)
+}
+
+test matview-refuses-randomblob {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE MATERIALIZED VIEW v AS SELECT id, randomblob(4) AS r FROM t;
+}
+expect error {
+    materialized view v cannot call randomblob\(\)
+}
+
+test matview-refuses-datetime-now {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE MATERIALIZED VIEW v AS SELECT id, datetime('now') AS r FROM t;
+}
+expect error {
+    materialized view v cannot call datetime\(\)
+}
+
+test matview-refuses-current-timestamp {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE MATERIALIZED VIEW v AS SELECT id, CURRENT_TIMESTAMP AS r FROM t;
+}
+expect error {
+    materialized view v cannot call CURRENT_TIMESTAMP
+}
+
+test matview-refuses-uuid4-str {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE MATERIALIZED VIEW v AS SELECT id, uuid4_str() AS r FROM t;
+}
+expect error {
+    materialized view v cannot call uuid4_str\(\)
+}
+
+test matview-refuses-random-in-where {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE MATERIALIZED VIEW v AS SELECT id FROM t WHERE random() > 0;
+}
+expect error {
+    materialized view v cannot call random\(\)
+}
+
+test matview-refuses-random-in-aggregate-argument {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE MATERIALIZED VIEW v AS SELECT x, sum(random()) AS s FROM t GROUP BY x;
+}
+expect error {
+    materialized view v cannot call random\(\)
+}
+
+test matview-accepts-deterministic-functions {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER, s TEXT, d TEXT);
+    INSERT INTO t VALUES (1, -5, 'AbC', '2024-01-02 03:04:05');
+    CREATE MATERIALIZED VIEW v AS
+    SELECT id, abs(x) AS a, lower(s) AS l, datetime(d) AS dt, date(d, '+1 day') AS next
+    FROM t;
+    INSERT INTO t VALUES (2, 7, 'XyZ', '2024-12-31 23:59:59');
+    SELECT * FROM v ORDER BY id;
+}
+expect {
+    1|5|abc|2024-01-02 03:04:05|2024-01-03
+    2|7|xyz|2024-12-31 23:59:59|2025-01-01
+}
