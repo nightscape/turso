@@ -66,7 +66,7 @@ fn validate(
     table_name: &str,
     resolver: &Resolver,
     _table: &Table,
-    _database_id: usize,
+    database_id: usize,
     conn: &Arc<Connection>,
 ) -> Result<()> {
     // Check if this is a system table that should be protected from direct writes
@@ -76,23 +76,13 @@ fn validate(
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
-    // Check if this table has any incompatible dependent views
     // Check if this is a materialized view
     if resolver.schema().is_materialized_view(table_name) {
         crate::bail_parse_error!("cannot modify materialized view {}", table_name);
     }
-    resolver.schema().with_incompatible_dependent_views(table_name, |views| {
-    if !views.is_empty() {
-        use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
-        crate::bail_parse_error!(
-            "Cannot DELETE from table '{table_name}' because it has incompatible dependent materialized view(s): {}. \n\
-             These views were created with a different DBSP version than the current version ({DBSP_CIRCUIT_VERSION}). \n\
-             Please DROP and recreate the view(s) before modifying this table.",
-            views.iter().fold(String::new(), |_, s| s.to_string() + ", "),
-        );
-    }
-    Ok(())
-    })
+    resolver
+        .schema()
+        .refuse_write_that_would_stale_a_view(database_id, table_name)
 }
 
 pub struct TempTableCtx {

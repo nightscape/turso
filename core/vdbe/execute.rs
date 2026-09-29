@@ -14557,7 +14557,9 @@ pub fn op_drop_view(
         // A view row that never became an in-memory view is dropped by clearing
         // the record of why it could not be loaded.
         schema.broken_views.remove(view_name);
-        schema.incompatible_views.remove(view_name);
+        if schema.incompatible_views.remove(view_name).is_some() {
+            schema.remove_materialized_view_dependencies(view_name);
+        }
     })?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
