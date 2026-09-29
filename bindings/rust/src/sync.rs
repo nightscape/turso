@@ -126,6 +126,7 @@ pub struct Builder {
     enable_generated_columns: bool,
     enable_multiprocess_wal: bool,
     enable_without_rowid: bool,
+    scalar_functions: Vec<turso_sdk_kit::rsapi::DeterministicScalarFunction>,
 }
 
 impl Builder {
@@ -150,6 +151,7 @@ impl Builder {
             enable_generated_columns: false,
             enable_multiprocess_wal: false,
             enable_without_rowid: false,
+            scalar_functions: Vec::new(),
         }
     }
 
@@ -213,6 +215,25 @@ impl Builder {
     /// [`crate::Builder::experimental_without_rowid`].
     pub fn experimental_without_rowid(mut self, enable: bool) -> Self {
         self.enable_without_rowid = enable;
+        self
+    }
+
+    /// Register `func` as the SQL function `name` before the schema loads, so
+    /// that materialized views that call it work at every open. `func` is a
+    /// plain `fn`, not a closure; it must return the same result for the same
+    /// arguments and must not panic.
+    pub fn with_deterministic_scalar_function(
+        mut self,
+        name: &str,
+        arg_count: usize,
+        func: turso_core::DeterministicScalarFn,
+    ) -> Self {
+        self.scalar_functions
+            .push(turso_sdk_kit::rsapi::DeterministicScalarFunction {
+                name: name.to_string(),
+                arg_count,
+                func,
+            });
         self
     }
 
@@ -362,6 +383,7 @@ impl Builder {
             db_file: None,
             page_codec: None,
             open_flags: Default::default(),
+            scalar_functions: self.scalar_functions.clone(),
         };
 
         let url = if let Some(remote_url) = &self.remote_url {
