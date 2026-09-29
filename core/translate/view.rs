@@ -1,20 +1,24 @@
 use crate::alloc::TryClone;
+use crate::function::Func;
 use crate::incremental::fdw_mirror::{mirror_specs_for_view, MirrorSpec};
 use crate::incremental::{
     compiler::DBSP_CIRCUIT_VERSION,
     view::{IncrementalView, PopulateCascade},
 };
 use crate::schema::{
-    BTreeCharacteristics, BTreeTable, SchemaObjectType, DBSP_TABLE_PREFIX, RESERVED_TABLE_PREFIXES,
+    is_deterministic_schema_function_call, BTreeCharacteristics, BTreeTable, SchemaObjectType,
+    DBSP_TABLE_PREFIX, RESERVED_TABLE_PREFIXES,
 };
 use crate::storage::pager::CreateBTreeFlags;
 use crate::sync::Arc;
+use crate::translate::expr::WalkControl;
 use crate::translate::{
     emitter::Resolver,
     schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
 };
 use crate::util::{
-    escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
+    escape_sql_string_literal, normalize_ident, walk_select_expressions,
+    PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
@@ -324,6 +328,7 @@ pub fn translate_create_materialized_view(
 
     // Check for cross-database table references first
     crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
+    refuse_nondeterministic_calls(&normalized_view_name, select_stmt, resolver)?;
 
     let view_column_schema = resolver.with_schema(database_id, |s| {
         IncrementalView::validate_and_extract_columns(select_stmt, s)
@@ -789,6 +794,51 @@ pub fn translate_create_materialized_view(
 
     program.epilogue(resolver.schema());
     Ok(())
+}
+
+/// A view removes an old row by computing its expressions again, so every
+/// function it calls must return the same result for the same arguments.
+/// Views already stored are still loaded.
+fn refuse_nondeterministic_calls(
+    view_name: &str,
+    select: &ast::Select,
+    resolver: &Resolver,
+) -> Result<()> {
+    walk_select_expressions(select, &mut |expr| {
+        if let Some(call) = nondeterministic_call(expr, resolver) {
+            bail_parse_error!(
+                "materialized view {view_name} cannot call {call}: its result can change \
+                 between calls, and the view calls it again to remove an old row"
+            );
+        }
+        Ok(WalkControl::Continue)
+    })
+}
+
+fn nondeterministic_call(expr: &ast::Expr, resolver: &Resolver) -> Option<String> {
+    let (name, args): (&ast::Name, &[Box<ast::Expr>]) = match expr {
+        ast::Expr::Literal(ast::Literal::CurrentDate) => return Some("CURRENT_DATE".into()),
+        ast::Expr::Literal(ast::Literal::CurrentTime) => return Some("CURRENT_TIME".into()),
+        ast::Expr::Literal(ast::Literal::CurrentTimestamp) => {
+            return Some("CURRENT_TIMESTAMP".into())
+        }
+        ast::Expr::FunctionCall { name, args, .. } => (name, args),
+        ast::Expr::FunctionCallStar { name, .. } => (name, &[]),
+        _ => return None,
+    };
+    // An unknown function or a wrong argument count is reported by the dry-run compile.
+    let Ok(Some(func)) = resolver.resolve_function(name.as_str(), args.len()) else {
+        return None;
+    };
+    let is_aggregate = match &func {
+        Func::Agg(_) | Func::Window(_) => true,
+        Func::External(external) => external.func.is_aggregate(),
+        _ => false,
+    };
+    if is_aggregate || is_deterministic_schema_function_call(&func, args) {
+        return None;
+    }
+    Some(format!("{}()", normalize_ident(name.as_str())))
 }
 
 pub fn translate_refresh_materialized_view(
