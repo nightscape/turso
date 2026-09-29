@@ -310,17 +310,38 @@ fn an_index_on_an_aggregate_column_follows_the_group(tmp_db: TempDatabase) -> an
 }
 
 /// REFRESH rebuilds the view's rows from scratch, and its indexes with them.
-/// `randomblob` makes every rebuilt row differ from the one it replaces.
-#[turso_macros::test(views)]
-fn refresh_rebuilds_the_index_with_the_view(tmp_db: TempDatabase) -> anyhow::Result<()> {
+/// A write by SQLite bypasses view maintenance, so the rebuilt rows get new keys;
+/// `writable_schema` lets SQLite skip the matview schema row it cannot parse.
+#[test]
+fn refresh_rebuilds_the_index_with_the_view() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::builder().with_views(true).build();
+    let path = tmp_db.path.clone();
     let conn = tmp_db.connect_limbo();
     conn.execute("CREATE TABLE t_raw (id TEXT PRIMARY KEY, st TEXT)")?;
-    conn.execute("CREATE MATERIALIZED VIEW v AS SELECT id, hex(randomblob(8)) AS h FROM t_raw")?;
+    conn.execute("CREATE MATERIALIZED VIEW v AS SELECT id, st AS h FROM t_raw")?;
     conn.execute("CREATE INDEX idx_v_h ON v(h)")?;
     for i in 0..4 {
-        conn.execute(&format!("INSERT INTO t_raw (id, st) VALUES ('b{i}', 'X')"))?;
+        conn.execute(&format!(
+            "INSERT INTO t_raw (id, st) VALUES ('b{i}', 's{i}')"
+        ))?;
     }
+    drop(conn);
+    drop(tmp_db);
+
+    let sqlite = rusqlite::Connection::open(&path)?;
+    sqlite.pragma_update(None, "writable_schema", "ON")?;
+    assert_eq!(sqlite.execute("UPDATE t_raw SET st = 'z' || st", [])?, 4);
+    drop(sqlite);
+
+    let tmp_db = TempDatabase::builder()
+        .with_db_path(&path)
+        .with_views(true)
+        .build();
+    let conn = tmp_db.connect_limbo();
+    let stale = limbo_exec_rows(&conn, "SELECT h FROM v NOT INDEXED ORDER BY id");
     conn.execute("REFRESH MATERIALIZED VIEW v")?;
+    let refreshed = limbo_exec_rows(&conn, "SELECT h FROM v NOT INDEXED ORDER BY id");
+    assert_ne!(stale, refreshed, "REFRESH kept the stale rows");
 
     assert_index_matches_scan(
         &conn,
