@@ -213,6 +213,7 @@ pub fn py_turso_database_open(config: &PyTursoDatabaseConfig) -> PyResult<PyTurs
         db_file: None,
         page_codec: None,
         open_flags: Default::default(),
+        scalar_functions: Vec::new(),
     });
     let result = database.open().map_err(turso_error_to_py_err)?;
     // async_io is false - so db.open() will return result immediately

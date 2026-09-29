@@ -147,7 +147,7 @@ pub(crate) use dialect::EngineDialect;
 pub use error::{
     io_error, CompletionError, ConstraintKind, ConstraintViolation, DialectError, LimboError,
 };
-pub use function::ContextCollationFunction;
+pub use function::{ContextCollationFunction, DeterministicScalarFn};
 #[cfg(feature = "io_memory_yield")]
 pub use io::MemoryYieldIO;
 #[cfg(all(feature = "fs", target_family = "unix", not(miri)))]

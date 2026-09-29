@@ -623,6 +623,7 @@ mod tests {
                 db_file: None,
                 page_codec: None,
                 open_flags: OpenFlags::default(),
+                scalar_functions: Vec::new(),
             },
             TursoDatabaseSyncConfig {
                 remote_url: None,

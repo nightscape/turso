@@ -42,6 +42,13 @@ tracks per connection), the difference is documented on the affected API.
 This suite is the enforcement mechanism for the behavioral half of the
 contract; extend the operation vocabulary when new API lands.
 
+Features that cannot exist on the serverless side are exempt from the
+pairing rule:
+
+* `Builder::with_deterministic_scalar_function` (`turso`, local and sync
+  builders): it registers an in-process Rust function, which a server
+  cannot call.
+
 ## Running against `@tursodatabase/serverless`
 
 ### 1. Create a scratch database
