@@ -1970,6 +1970,7 @@ where
 
 /// Walk a SELECT: the tables it reads and all of its expressions, including
 /// subqueries.
+#[recursive::recursive]
 pub fn visit_select<V: AstVisitor>(select: &ast::Select, visitor: &mut V) -> Result<()> {
     visit_with(select.with.as_ref(), visitor)?;
 
