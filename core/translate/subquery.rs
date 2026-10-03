@@ -118,6 +118,7 @@ fn count_shared_cte_references(
     }
 }
 
+#[recursive::recursive]
 fn count_shared_cte_references_in_plan(counts: &mut HashMap<usize, usize>, plan: &Plan) {
     match plan {
         Plan::Select(select_plan) => count_shared_cte_references(
@@ -151,6 +152,7 @@ fn count_shared_cte_references_in_plan(counts: &mut HashMap<usize, usize>, plan:
 
 /// Mark CTE references that must be materialized once and shared across
 /// multiple reads of the same query tree.
+#[recursive::recursive]
 pub(crate) fn mark_shared_cte_materialization_requirements(
     table_references: &mut TableReferences,
     non_from_clause_subqueries: &mut [NonFromClauseSubquery],
@@ -1196,6 +1198,7 @@ fn update_column_used_masks(
         Ok(())
     }
 
+    #[recursive::recursive]
     fn propagate_outer_refs_from_plan(table_refs: &mut TableReferences, plan: &Plan) -> Result<()> {
         match plan {
             Plan::Select(select_plan) => {
@@ -1259,6 +1262,7 @@ fn update_column_used_masks(
 /// Recursively pre-materialize all multi-ref CTEs in a plan tree.
 /// This must be called BEFORE emitting any coroutines to ensure CTEs referenced
 /// inside coroutines have their cursors opened at the top level.
+#[recursive::recursive]
 fn pre_materialize_multi_ref_ctes(
     program: &mut ProgramBuilder,
     plan: &mut Plan,
@@ -1742,6 +1746,7 @@ fn allocate_cursors_read_by_lateral_subquery(
 ///
 /// Since a subquery has its own Plan, it can contain nested subqueries,
 /// which can contain even more nested subqueries, etc.
+#[recursive::recursive]
 pub fn emit_from_clause_subquery(
     program: &mut ProgramBuilder,
     plan: &mut Plan,
@@ -2095,6 +2100,7 @@ fn emit_materialized_subquery_table(
 ///
 /// A correlated subquery is emitted as a subroutine, which is returned so
 /// that a `Gosub` can run the subquery again.
+#[recursive::recursive]
 pub fn emit_non_from_clause_subquery(
     program: &mut ProgramBuilder,
     resolver: &Resolver,

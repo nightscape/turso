@@ -1802,6 +1802,7 @@ where
     walk_select_expressions_inner(select, func)
 }
 
+#[recursive::recursive]
 fn walk_select_expressions_inner<F>(select: &ast::Select, func: &mut F) -> Result<()>
 where
     F: FnMut(&ast::Expr) -> Result<WalkControl>,

@@ -1648,6 +1648,7 @@ impl ProgramState {
         }
     }
 
+    #[recursive::recursive]
     pub(crate) fn metrics(&self) -> StatementMetrics {
         let mut metrics = self.metrics.clone();
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
@@ -1659,6 +1660,7 @@ impl ProgramState {
         metrics
     }
 
+    #[recursive::recursive]
     pub(crate) fn reset_metrics(&mut self) {
         self.metrics.reset();
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
@@ -1669,6 +1671,7 @@ impl ProgramState {
         }
     }
 
+    #[recursive::recursive]
     pub(crate) fn reset_stmt_status(&mut self, counter: crate::statement::StatementStatusCounter) {
         match counter {
             crate::statement::StatementStatusCounter::FullscanStep => {
@@ -2152,6 +2155,13 @@ pub struct PreparedProgram {
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
     pub read_databases: BitSet,
+}
+
+impl Drop for PreparedProgram {
+    #[recursive::recursive]
+    fn drop(&mut self) {
+        drop(std::mem::take(&mut self.insns));
+    }
 }
 
 #[derive(Clone)]
