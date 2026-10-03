@@ -157,6 +157,7 @@ fn select_plan_first_virtual_table_name(select_plan: &SelectPlan) -> Option<Stri
     None
 }
 
+#[recursive::recursive]
 pub fn prepare_select_plan(
     select: ast::Select,
     resolver: &Resolver,
@@ -1332,6 +1333,7 @@ fn ordinal(n: usize) -> String {
 }
 
 /// Counts cursors needed to emit a query plan.
+#[recursive::recursive]
 fn count_required_cursors_for_plan(plan: &Plan) -> usize {
     match plan {
         Plan::Select(select_plan) => count_required_cursors_for_simple_select(select_plan),
@@ -1390,6 +1392,7 @@ fn count_required_cursors_for_simple_select(plan: &SelectPlan) -> usize {
 }
 
 /// Estimates bytecode instructions needed to emit a query plan.
+#[recursive::recursive]
 fn estimate_num_instructions_for_plan(plan: &Plan) -> usize {
     match plan {
         Plan::Select(select_plan) => estimate_num_instructions_for_simple_select(select_plan),
@@ -1644,6 +1647,7 @@ fn select_has_non_from_subqueries(
 }
 
 /// Estimates jump labels needed to emit a query plan.
+#[recursive::recursive]
 fn estimate_num_labels_for_plan(plan: &Plan) -> usize {
     match plan {
         Plan::Select(select_plan) => estimate_num_labels_for_simple_select(select_plan),

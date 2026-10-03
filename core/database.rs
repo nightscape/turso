@@ -770,6 +770,7 @@ impl Database {
         dialect: Arc<dyn Dialect>,
         native_extensions: &crate::native_ext::NativeExtensions,
     ) -> Result<Self> {
+        crate::stack::configure_stack_growth();
         let path = path.into();
         let wal_path = wal_path.into();
         let shared_wal = WalFileShared::new_noop();
