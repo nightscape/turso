@@ -11,6 +11,7 @@ mod test_in_seek;
 mod test_is_seek;
 mod test_ivm_matview_mvcc_create;
 mod test_ivm_agg_matview_stale_group_on_delete;
+mod test_ivm_aggregate_differential;
 mod test_ivm_aggregate_filter;
 mod test_ivm_array_aggregation;
 mod test_ivm_block_matview_drift;
