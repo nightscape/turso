@@ -3,6 +3,7 @@
 use crate::function::{AggFunc, Func};
 use crate::incremental::dbsp::Hash128;
 use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
+use crate::incremental::exact_sum::SumState;
 use crate::incremental::filter_operator::{FilterOperator, FilterPredicate};
 use crate::incremental::operator::{
     generate_storage_id, ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
@@ -98,18 +99,22 @@ fn hash_value(value: &Value, column_idx: usize) -> Hash128 {
 // Serialization type codes for aggregate functions. These are persisted in the
 // aggregate state blob, so a code must never be renumbered or reused.
 const AGG_FUNC_COUNT: i64 = 0;
-const AGG_FUNC_SUM: i64 = 1;
-const AGG_FUNC_AVG: i64 = 2;
+const AGG_FUNC_SUM_AS_FLOAT: i64 = 1;
+const AGG_FUNC_AVG_AS_FLOAT: i64 = 2;
 const AGG_FUNC_MIN: i64 = 3;
 const AGG_FUNC_MAX: i64 = 4;
 const AGG_FUNC_COUNT_DISTINCT: i64 = 5;
-const AGG_FUNC_SUM_DISTINCT: i64 = 6;
-const AGG_FUNC_AVG_DISTINCT: i64 = 7;
+const AGG_FUNC_SUM_DISTINCT_AS_FLOAT: i64 = 6;
+const AGG_FUNC_AVG_DISTINCT_AS_FLOAT: i64 = 7;
 const AGG_FUNC_GROUP_CONCAT: i64 = 8;
 const AGG_FUNC_GROUP_CONCAT_DISTINCT: i64 = 9;
 const AGG_FUNC_JSON_GROUP_ARRAY: i64 = 10;
 const AGG_FUNC_JSON_GROUP_ARRAY_DISTINCT: i64 = 11;
 const AGG_FUNC_COUNT_COLUMN: i64 = 12;
+const AGG_FUNC_SUM: i64 = 13;
+const AGG_FUNC_AVG: i64 = 14;
+const AGG_FUNC_SUM_DISTINCT: i64 = 15;
+const AGG_FUNC_AVG_DISTINCT: i64 = 16;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AggregateFunction {
@@ -256,6 +261,19 @@ impl AggregateFunction {
             Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT)) => {
                 *cursor += 1;
                 AggregateFunction::Count
+            }
+            Value::Numeric(Numeric::Integer(
+                AGG_FUNC_SUM_AS_FLOAT
+                | AGG_FUNC_AVG_AS_FLOAT
+                | AGG_FUNC_SUM_DISTINCT_AS_FLOAT
+                | AGG_FUNC_AVG_DISTINCT_AS_FLOAT,
+            )) => {
+                return Err(LimboError::InternalError(
+                    "Persisted SUM/AVG state was written in the older single-float layout, \
+                     which cannot be read exactly. \
+                     Rebuild the view with REFRESH MATERIALIZED VIEW."
+                        .into(),
+                ));
             }
             Value::Numeric(Numeric::Integer(AGG_FUNC_COUNT_COLUMN)) => {
                 *cursor += 1;
@@ -512,6 +530,9 @@ enum AggregateCommitState {
     Idle,
     Eval {
         eval_state: EvalState,
+        min_max_deltas: MinMaxDeltas,
+        distinct_deltas: DistinctDeltas,
+        input_delta: Delta,
     },
     PersistDelta {
         delta: Delta,
@@ -618,10 +639,8 @@ pub struct AggregateState {
     pub count: i64,
     // For COUNT(column): column_index -> number of non-NULL values
     pub column_counts: HashMap<usize, i64>,
-    // For SUM: column_index -> sum value
-    pub sums: HashMap<usize, f64>,
-    // For AVG: column_index -> (sum, count) for computing average
-    pub avgs: HashMap<usize, (f64, i64)>,
+    pub sums: HashMap<usize, SumState>,
+    pub avgs: HashMap<usize, SumState>,
     // For MIN: column_index -> minimum value
     pub mins: HashMap<usize, Value>,
     // For MAX: column_index -> maximum value
@@ -629,7 +648,7 @@ pub struct AggregateState {
     // For DISTINCT aggregates: column_index -> computed value
     // These are populated during eval when we scan the BTree (or in-memory map)
     pub distinct_counts: HashMap<usize, i64>,
-    pub distinct_sums: HashMap<usize, f64>,
+    pub distinct_sums: HashMap<usize, SumState>,
 
     // Weights of specific distinct values needed for current delta processing
     // (column_index, value) -> weight
@@ -898,8 +917,9 @@ impl AggregateState {
     /// Convert the aggregate state to a vector of Values for unified serialization
     /// Format: [count, num_aggregates, (agg_metadata, agg_state)...]
     /// Each aggregate includes its type and column index for proper deserialization
-    pub fn to_value_vector(&self, aggregates: &[AggregateFunction]) -> Vec<Value> {
+    pub fn to_value_vector(&self, aggregates: &[AggregateFunction]) -> Result<Vec<Value>> {
         let mut values = Vec::new();
+        let no_inputs = SumState::default();
 
         // Include count first
         values.push(Value::from_i64(self.count));
@@ -927,27 +947,25 @@ impl AggregateState {
                     values.push(Value::from_i64(count));
                 }
                 AggregateFunction::Sum(col_idx) => {
-                    let sum = self.sums.get(col_idx).copied().unwrap_or(0.0);
-                    values.push(Value::from_f64(sum));
+                    self.sums
+                        .get(col_idx)
+                        .unwrap_or(&no_inputs)
+                        .to_values(&mut values)?;
                 }
-                AggregateFunction::SumDistinct(col_idx) => {
-                    // Store both the distinct count and sum for this column
+                AggregateFunction::SumDistinct(col_idx)
+                | AggregateFunction::AvgDistinct(col_idx) => {
                     let count = self.distinct_counts.get(col_idx).copied().unwrap_or(0);
-                    let sum = self.distinct_sums.get(col_idx).copied().unwrap_or(0.0);
                     values.push(Value::from_i64(count));
-                    values.push(Value::from_f64(sum));
+                    self.distinct_sums
+                        .get(col_idx)
+                        .unwrap_or(&no_inputs)
+                        .to_values(&mut values)?;
                 }
                 AggregateFunction::Avg(col_idx) => {
-                    let (sum, count) = self.avgs.get(col_idx).copied().unwrap_or((0.0, 0));
-                    values.push(Value::from_f64(sum));
-                    values.push(Value::from_i64(count));
-                }
-                AggregateFunction::AvgDistinct(col_idx) => {
-                    // Store both the distinct count and sum for this column
-                    let count = self.distinct_counts.get(col_idx).copied().unwrap_or(0);
-                    let sum = self.distinct_sums.get(col_idx).copied().unwrap_or(0.0);
-                    values.push(Value::from_i64(count));
-                    values.push(Value::from_f64(sum));
+                    self.avgs
+                        .get(col_idx)
+                        .unwrap_or(&no_inputs)
+                        .to_values(&mut values)?;
                 }
                 AggregateFunction::Min(col_idx) => {
                     if let Some(min_val) = self.mins.get(col_idx) {
@@ -992,7 +1010,7 @@ impl AggregateState {
             }
         }
 
-        values
+        Ok(values)
     }
 
     /// Reconstruct aggregate state from a vector of Values.
@@ -1071,97 +1089,32 @@ impl AggregateState {
                         )));
                     }
                 }
-                AggregateFunction::SumDistinct(col_idx) => {
+                AggregateFunction::SumDistinct(col_idx)
+                | AggregateFunction::AvgDistinct(col_idx) => {
                     let count = values.get(cursor).ok_or_else(|| {
-                        LimboError::InternalError("Missing SUM(DISTINCT) count".into())
+                        LimboError::InternalError("Missing DISTINCT value count".into())
                     })?;
                     if let Value::Numeric(Numeric::Integer(count)) = count {
                         state.distinct_counts.insert(col_idx, *count);
                         cursor += 1;
                     } else {
                         return Err(LimboError::InternalError(format!(
-                            "Expected Integer for SUM(DISTINCT) count, got {count:?}"
+                            "Expected Integer for DISTINCT value count, got {count:?}"
                         )));
                     }
-
-                    let sum = values.get(cursor).ok_or_else(|| {
-                        LimboError::InternalError("Missing SUM(DISTINCT) sum".into())
-                    })?;
-                    if let Value::Numeric(Numeric::Float(sum)) = sum {
-                        state.distinct_sums.insert(col_idx, f64::from(*sum));
-                        cursor += 1;
-                    } else {
-                        return Err(LimboError::InternalError(format!(
-                            "Expected Float for SUM(DISTINCT) sum, got {sum:?}"
-                        )));
-                    }
-                }
-                AggregateFunction::AvgDistinct(col_idx) => {
-                    let count = values.get(cursor).ok_or_else(|| {
-                        LimboError::InternalError("Missing AVG(DISTINCT) count".into())
-                    })?;
-                    if let Value::Numeric(Numeric::Integer(count)) = count {
-                        state.distinct_counts.insert(col_idx, *count);
-                        cursor += 1;
-                    } else {
-                        return Err(LimboError::InternalError(format!(
-                            "Expected Integer for AVG(DISTINCT) count, got {count:?}"
-                        )));
-                    }
-
-                    let sum = values.get(cursor).ok_or_else(|| {
-                        LimboError::InternalError("Missing AVG(DISTINCT) sum".into())
-                    })?;
-                    if let Value::Numeric(Numeric::Float(sum)) = sum {
-                        state.distinct_sums.insert(col_idx, f64::from(*sum));
-                        cursor += 1;
-                    } else {
-                        return Err(LimboError::InternalError(format!(
-                            "Expected Float for AVG(DISTINCT) sum, got {sum:?}"
-                        )));
-                    }
+                    state
+                        .distinct_sums
+                        .insert(col_idx, SumState::from_values(values, &mut cursor)?);
                 }
                 AggregateFunction::Sum(col_idx) => {
-                    let sum = values
-                        .get(cursor)
-                        .ok_or_else(|| LimboError::InternalError("Missing SUM value".into()))?;
-                    if let Value::Numeric(Numeric::Float(sum)) = sum {
-                        state.sums.insert(col_idx, f64::from(*sum));
-                        cursor += 1;
-                    } else {
-                        return Err(LimboError::InternalError(format!(
-                            "Expected Float for SUM value, got {sum:?}"
-                        )));
-                    }
+                    state
+                        .sums
+                        .insert(col_idx, SumState::from_values(values, &mut cursor)?);
                 }
                 AggregateFunction::Avg(col_idx) => {
-                    let sum = values
-                        .get(cursor)
-                        .ok_or_else(|| LimboError::InternalError("Missing AVG sum value".into()))?;
-                    let sum = match sum {
-                        Value::Numeric(Numeric::Float(f)) => f64::from(*f),
-                        _ => {
-                            return Err(LimboError::InternalError(format!(
-                                "Expected Float for AVG sum, got {sum:?}"
-                            )));
-                        }
-                    };
-                    cursor += 1;
-
-                    let count = values.get(cursor).ok_or_else(|| {
-                        LimboError::InternalError("Missing AVG count value".into())
-                    })?;
-                    let count = match count {
-                        Value::Numeric(Numeric::Integer(i)) => *i,
-                        _ => {
-                            return Err(LimboError::InternalError(format!(
-                                "Expected Integer for AVG count, got {count:?}"
-                            )));
-                        }
-                    };
-                    cursor += 1;
-
-                    state.avgs.insert(col_idx, (sum, count));
+                    state
+                        .avgs
+                        .insert(col_idx, SumState::from_values(values, &mut cursor)?);
                 }
                 AggregateFunction::Min(col_idx) => {
                     let has_value = values.get(cursor).ok_or_else(|| {
@@ -1312,7 +1265,7 @@ impl AggregateState {
         // Store the group key size first
         all_values.push(Value::from_i64(group_key.len() as i64));
         all_values.extend_from_slice(group_key);
-        all_values.extend(self.to_value_vector(aggregates));
+        all_values.extend(self.to_value_vector(aggregates)?);
 
         let record = ImmutableRecord::from_values(&all_values, all_values.len())?;
         Ok(record.into_payload())
@@ -1448,21 +1401,15 @@ impl AggregateState {
                             processed_counts.set(*col_idx)?;
                         }
 
-                        // Update sum if not already processed
                         if !processed_sums.get(*col_idx) {
-                            let current_sum =
-                                self.distinct_sums.get(col_idx).copied().unwrap_or(0.0);
-                            let value_as_float = match &transition.transitioned_value {
-                                Value::Numeric(Numeric::Integer(i)) => *i as f64,
-                                Value::Numeric(Numeric::Float(f)) => f64::from(*f),
-                                _ => 0.0,
+                            let weight = match transition.transition_type {
+                                TransitionType::Added => 1,
+                                TransitionType::Removed => -1,
                             };
-
-                            let new_sum = match transition.transition_type {
-                                TransitionType::Added => current_sum + value_as_float,
-                                TransitionType::Removed => current_sum - value_as_float,
-                            };
-                            self.distinct_sums.insert(*col_idx, new_sum);
+                            self.distinct_sums
+                                .entry(*col_idx)
+                                .or_default()
+                                .apply(&transition.transitioned_value, weight);
                             processed_sums.set(*col_idx)?;
                         }
                     }
@@ -1470,26 +1417,20 @@ impl AggregateState {
                 AggregateFunction::Sum(col_idx) => {
                     if filter_passes {
                         if let Some(val) = values.get(*col_idx) {
-                            let num_val = match val {
-                                Value::Numeric(Numeric::Integer(i)) => *i as f64,
-                                Value::Numeric(Numeric::Float(f)) => f64::from(*f),
-                                _ => 0.0,
-                            };
-                            *self.sums.entry(*col_idx).or_insert(0.0) += num_val * weight as f64;
+                            self.sums
+                                .entry(*col_idx)
+                                .or_default()
+                                .apply(val, weight as i64);
                         }
                     }
                 }
                 AggregateFunction::Avg(col_idx) => {
                     if filter_passes {
                         if let Some(val) = values.get(*col_idx) {
-                            let num_val = match val {
-                                Value::Numeric(Numeric::Integer(i)) => *i as f64,
-                                Value::Numeric(Numeric::Float(f)) => f64::from(*f),
-                                _ => 0.0,
-                            };
-                            let (sum, count) = self.avgs.entry(*col_idx).or_insert((0.0, 0));
-                            *sum += num_val * weight as f64;
-                            *count += weight as i64;
+                            self.avgs
+                                .entry(*col_idx)
+                                .or_default()
+                                .apply(val, weight as i64);
                         }
                     }
                 }
@@ -1564,15 +1505,9 @@ impl AggregateState {
         Ok(())
     }
 
-    /// Convert aggregate state to output values
-    ///
-    /// Note: SQLite returns INTEGER for SUM when all inputs are integers, and REAL when any input is REAL.
-    /// However, in an incremental system like DBSP, we cannot track whether all current values are integers
-    /// after deletions. For example:
-    /// - Initial: SUM(10, 20, 30.5) = 60.5 (REAL)
-    /// - After DELETE 30.5: SUM(10, 20) = 30 (SQLite returns INTEGER, but we only know the sum is 30.0)
-    ///
-    /// Therefore, we always return REAL for SUM operations.
+    /// Convert aggregate state to output values. Fails with integer overflow
+    /// where SQLite's SUM would, so a write that leads there fails instead of
+    /// storing a wrong value.
     pub fn to_values(&self, aggregates: &[AggregateFunction]) -> Result<Vec<Value>> {
         let mut result = Vec::new();
 
@@ -1591,45 +1526,28 @@ impl AggregateState {
                     result.push(Value::from_i64(count));
                 }
                 AggregateFunction::Sum(col_idx) => {
-                    // SUM over zero contributing rows is NULL, not 0. A group with no rows
-                    // has count 0; with FILTER a group can hold rows while nothing feeds
-                    // this sum, and `sums` only gains an entry for a row that passes.
-                    let sum = (self.count > 0)
-                        .then(|| self.sums.get(col_idx).copied())
-                        .flatten()
-                        .map_or(Value::Null, Value::from_f64);
-                    result.push(sum);
+                    result.push(
+                        self.sums
+                            .get(col_idx)
+                            .map_or(Ok(Value::Null), SumState::sum)?,
+                    );
                 }
                 AggregateFunction::SumDistinct(col_idx) => {
-                    let sum = if self.count == 0 {
-                        Value::Null
-                    } else {
-                        Value::from_f64(self.distinct_sums.get(col_idx).copied().unwrap_or(0.0))
-                    };
-                    result.push(sum);
+                    result.push(
+                        self.distinct_sums
+                            .get(col_idx)
+                            .map_or(Ok(Value::Null), SumState::sum)?,
+                    );
                 }
                 AggregateFunction::Avg(col_idx) => {
-                    if let Some((sum, count)) = self.avgs.get(col_idx) {
-                        if *count > 0 {
-                            result.push(Value::from_f64(sum / *count as f64));
-                        } else {
-                            result.push(Value::Null);
-                        }
-                    } else {
-                        result.push(Value::Null);
-                    }
+                    result.push(self.avgs.get(col_idx).map_or(Value::Null, SumState::avg));
                 }
                 AggregateFunction::AvgDistinct(col_idx) => {
-                    // Compute AVG from SUM(DISTINCT) / COUNT(DISTINCT)
-                    let count = self.distinct_counts.get(col_idx).copied().unwrap_or(0);
-                    if count > 0 {
-                        let sum = self.distinct_sums.get(col_idx).copied().unwrap_or(0.0);
-                        let avg = sum / count as f64;
-                        // AVG always returns a float value for consistency with SQLite
-                        result.push(Value::from_f64(avg));
-                    } else {
-                        result.push(Value::Null);
-                    }
+                    result.push(
+                        self.distinct_sums
+                            .get(col_idx)
+                            .map_or(Value::Null, SumState::avg),
+                    );
                 }
                 AggregateFunction::Min(col_idx) => {
                     // Return the MIN value from our state
@@ -2329,26 +2247,27 @@ impl IncrementalOperator for AggregateOperator {
                     panic!("Reached invalid state! State was replaced, and not replaced back");
                 }
                 AggregateCommitState::Idle => {
-                    let eval_state = EvalState::from_delta(delta.clone());
-                    self.commit_state = AggregateCommitState::Eval { eval_state };
-                }
-                AggregateCommitState::Eval { ref mut eval_state } => {
-                    // Clone the delta for MIN/MAX processing before eval consumes it
-                    // We need to get the delta from the eval_state if it's still in Init
-                    let input_delta = match eval_state {
-                        EvalState::Init { deltas } => deltas.left.clone(),
-                        _ => Delta::new(), // Empty delta if already processed
-                    };
-
-                    // Extract MIN/MAX and DISTINCT deltas before any I/O operations
-                    let min_max_deltas = self.extract_min_max_deltas(&input_delta);
-                    // For plain DISTINCT, we need to extract deltas too
+                    // Taken here, not in Eval: Eval is re-entered after I/O, and by
+                    // then `eval_state` no longer holds the input.
+                    let min_max_deltas = self.extract_min_max_deltas(&delta);
                     let distinct_deltas = if self.has_distinct() || self.is_distinct_only {
-                        self.extract_distinct_deltas(&input_delta)
+                        self.extract_distinct_deltas(&delta)
                     } else {
                         HashMap::default()
                     };
-
+                    self.commit_state = AggregateCommitState::Eval {
+                        eval_state: EvalState::from_delta(delta.clone()),
+                        min_max_deltas,
+                        distinct_deltas,
+                        input_delta: delta.clone(),
+                    };
+                }
+                AggregateCommitState::Eval {
+                    ref mut eval_state,
+                    min_max_deltas,
+                    distinct_deltas,
+                    input_delta,
+                } => {
                     // Get old counts before eval modifies the states
                     // We need to extract this from the eval_state before it's consumed
                     let old_states = HashMap::default(); // TODO: Extract from eval_state
@@ -2365,9 +2284,9 @@ impl IncrementalOperator for AggregateOperator {
                         old_states,
                         current_idx: 0,
                         write_row: WriteRow::new(),
-                        min_max_deltas,  // Store for later use
-                        distinct_deltas, // Store for distinct processing
-                        input_delta,     // Store original input
+                        min_max_deltas: std::mem::take(min_max_deltas),
+                        distinct_deltas: std::mem::take(distinct_deltas),
+                        input_delta: std::mem::take(input_delta),
                     };
                 }
                 AggregateCommitState::PersistDelta {
@@ -2893,6 +2812,46 @@ impl ScanState {
         Ok(IOResult::Done(Some(third?.to_owned()?)))
     }
 
+    /// The weight the state btree holds for a MIN/MAX value, before the
+    /// current delta is persisted. 0 when the value is not stored.
+    fn stored_weight(
+        cursors: &mut DbspStateCursors,
+        storage_id: i64,
+        zset_hash: Hash128,
+        value: &Value,
+    ) -> IOResultOr<i64> {
+        let index_key = vec![
+            Value::from_i64(storage_id),
+            zset_hash.to_value()?,
+            value.clone(),
+        ];
+        if !return_if_io!(seek_dbsp_index_key(&mut cursors.index_cursor, &index_key)) {
+            return Ok(IOResult::Done(0));
+        }
+        let rowid = return_if_io!(cursors.index_cursor.rowid()).ok_or_else(|| {
+            LimboError::InternalError("MIN/MAX index entry has no rowid".to_string())
+        })?;
+        let found = return_if_io!(cursors
+            .table_cursor
+            .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
+        if !matches!(found, SeekResult::Found) {
+            return Err(LimboError::InternalError(
+                "MIN/MAX index entry points to a missing table row".to_string(),
+            )
+            .into());
+        }
+        let record = return_if_io!(cursors.table_cursor.record()).ok_or_else(|| {
+            LimboError::InternalError("MIN/MAX table row could not be read".to_string())
+        })?;
+        match record.get_value_opt(4).map(|v| v.to_owned()).transpose()? {
+            Some(Value::Numeric(Numeric::Integer(weight))) => Ok(IOResult::Done(weight)),
+            other => Err(LimboError::InternalError(format!(
+                "MIN/MAX table row has no integer weight: {other:?}"
+            ))
+            .into()),
+        }
+    }
+
     pub fn new_for_max(
         current_max: Option<Value>,
         group_key: String,
@@ -2924,14 +2883,19 @@ impl ScanState {
                     group_values,
                     is_min,
                 } => {
-                    // First, check if we have a candidate
                     if let Some(cand_val) = candidate {
-                        // Check if the candidate is retracted (weight <= 0)
-                        // Create a HashableRow to look up the weight
                         let hashable_cand = HashableRow::new(0, vec![cand_val.clone()]);
                         let key = (*column_name, hashable_cand);
-                        let is_retracted =
-                            group_values.get(&key).is_some_and(|weight| *weight <= 0);
+                        let delta_weight = group_values.get(&key).copied().unwrap_or(0);
+                        // A retraction removes one copy of the value; others may remain.
+                        let is_retracted = delta_weight < 0
+                            && return_if_io!(Self::stored_weight(
+                                cursors,
+                                *storage_id,
+                                *zset_hash,
+                                cand_val
+                            )) + delta_weight as i64
+                                <= 0;
 
                         if is_retracted {
                             // Candidate is retracted, need to fetch next from index
@@ -3724,7 +3688,9 @@ mod tests {
     /// count DOWN.
     #[test]
     fn state_written_as_plain_count_is_rejected_for_count_column() {
-        let persisted = state_with_count(3).to_value_vector(&[AggregateFunction::Count]);
+        let persisted = state_with_count(3)
+            .to_value_vector(&[AggregateFunction::Count])
+            .unwrap();
 
         let err =
             AggregateState::from_value_vector(&persisted, &[AggregateFunction::CountColumn(1)])
@@ -3739,7 +3705,9 @@ mod tests {
     /// column index that moved under the view.
     #[test]
     fn state_written_for_a_different_column_is_rejected() {
-        let persisted = state_with_count(3).to_value_vector(&[AggregateFunction::CountColumn(1)]);
+        let persisted = state_with_count(3)
+            .to_value_vector(&[AggregateFunction::CountColumn(1)])
+            .unwrap();
 
         AggregateState::from_value_vector(&persisted, &[AggregateFunction::CountColumn(2)])
             .expect_err("a different column index must be rejected");
@@ -3748,7 +3716,9 @@ mod tests {
     /// ... and an aggregate list that gained or lost a function.
     #[test]
     fn state_written_for_a_different_number_of_aggregates_is_rejected() {
-        let persisted = state_with_count(3).to_value_vector(&[AggregateFunction::Count]);
+        let persisted = state_with_count(3)
+            .to_value_vector(&[AggregateFunction::Count])
+            .unwrap();
 
         AggregateState::from_value_vector(
             &persisted,
@@ -3761,10 +3731,73 @@ mod tests {
     /// CountColumn: any two different functions over the same column disagree.
     #[test]
     fn state_written_for_a_different_function_is_rejected() {
-        let persisted = state_with_count(3).to_value_vector(&[AggregateFunction::Sum(1)]);
+        let persisted = state_with_count(3)
+            .to_value_vector(&[AggregateFunction::Sum(1)])
+            .unwrap();
 
         AggregateState::from_value_vector(&persisted, &[AggregateFunction::Avg(1)])
             .expect_err("a different aggregate function must be rejected");
+    }
+
+    /// Before SUM and AVG kept exact state, each was one running float. That
+    /// float cannot tell an integer sum from a real one or undo an overflow,
+    /// so such a blob must be rejected, never reinterpreted.
+    #[test]
+    fn single_float_sum_and_avg_state_is_rejected() {
+        let old_sum = [
+            Value::from_i64(2),
+            Value::from_i64(1),
+            Value::from_i64(AGG_FUNC_SUM_AS_FLOAT),
+            Value::from_i64(1),
+            Value::from_f64(6.0),
+        ];
+        let old_avg = [
+            Value::from_i64(2),
+            Value::from_i64(1),
+            Value::from_i64(AGG_FUNC_AVG_AS_FLOAT),
+            Value::from_i64(1),
+            Value::from_f64(6.0),
+            Value::from_i64(2),
+        ];
+        for (persisted, expected) in [
+            (&old_sum[..], AggregateFunction::Sum(1)),
+            (&old_avg[..], AggregateFunction::Avg(1)),
+        ] {
+            let err = AggregateState::from_value_vector(persisted, &[expected])
+                .expect_err("single-float SUM/AVG state must be rejected");
+            assert!(
+                err.to_string().contains("REFRESH MATERIALIZED VIEW"),
+                "the error must name the recovery, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_sum_and_avg_state_round_trips() {
+        let aggregates = vec![
+            AggregateFunction::Sum(0),
+            AggregateFunction::Avg(0),
+            AggregateFunction::SumDistinct(0),
+        ];
+        let mut state = state_with_count(2);
+        for value in [Value::from_i64(i64::MAX), Value::from_i64(-3)] {
+            state.sums.entry(0).or_default().apply(&value, 1);
+            state.avgs.entry(0).or_default().apply(&value, 1);
+            state.distinct_sums.entry(0).or_default().apply(&value, 1);
+        }
+        let restored = AggregateState::from_value_vector(
+            &state.to_value_vector(&aggregates).unwrap(),
+            &aggregates,
+        )
+        .unwrap();
+        assert_eq!(
+            restored.to_values(&aggregates).unwrap(),
+            state.to_values(&aggregates).unwrap()
+        );
+        assert_eq!(
+            restored.to_values(&aggregates).unwrap()[0],
+            Value::from_i64(i64::MAX - 3)
+        );
     }
 
     /// The matching case must still round-trip, guard included.
@@ -3774,9 +3807,11 @@ mod tests {
         let mut state = state_with_count(3);
         state.column_counts.insert(1, 2);
 
-        let restored =
-            AggregateState::from_value_vector(&state.to_value_vector(&aggregates), &aggregates)
-                .unwrap();
+        let restored = AggregateState::from_value_vector(
+            &state.to_value_vector(&aggregates).unwrap(),
+            &aggregates,
+        )
+        .unwrap();
 
         assert_eq!(
             restored.to_values(&aggregates).unwrap()[0],
