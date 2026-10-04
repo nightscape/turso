@@ -2122,8 +2122,8 @@ fn test_commit_survives_view_delta_io_yield(tmp_db: TempDatabase) -> anyhow::Res
     let conn = after.connect_limbo();
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
     assert_eq!(rows, vec![(4,)], "committed row must survive reopen");
-    let view: Vec<(i64, f64)> = conn.exec_rows("SELECT a, s FROM mv ORDER BY a");
-    assert_eq!(view, vec![(1, 15.0), (2, 20.0), (3, 7.0)]);
+    let view: Vec<(i64, i64)> = conn.exec_rows("SELECT a, s FROM mv ORDER BY a");
+    assert_eq!(view, vec![(1, 15), (2, 20), (3, 7)]);
 
     Ok(())
 }
@@ -2192,8 +2192,8 @@ fn test_commit_with_view_controls(tmp_db: TempDatabase) -> anyhow::Result<()> {
     conn.execute("ROLLBACK")?;
     let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
     assert_eq!(rows, vec![(5,)]);
-    let view: Vec<(i64, f64)> = conn.exec_rows("SELECT a, s FROM mv ORDER BY a");
-    assert_eq!(view, vec![(1, 15.0), (2, 20.0), (3, 7.0), (4, 1.0)]);
+    let view: Vec<(i64, i64)> = conn.exec_rows("SELECT a, s FROM mv ORDER BY a");
+    assert_eq!(view, vec![(1, 15), (2, 20), (3, 7), (4, 1)]);
 
     Ok(())
 }
