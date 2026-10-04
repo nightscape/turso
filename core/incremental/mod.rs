@@ -8,6 +8,7 @@ pub mod dbsp;
 pub mod decorrelate;
 #[cfg(test)]
 mod eq_only_seek_boundary;
+pub mod exact_sum;
 pub mod expr_compiler;
 pub mod fdw_mirror;
 #[cfg(test)]
