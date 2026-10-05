@@ -2779,3 +2779,15 @@ expect {
     cblob|BLOB
     cfoo|NUM
 }
+
+test matview-parenthesized-column-compares-as-its-source-column {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER);
+    CREATE MATERIALIZED VIEW mv AS SELECT (k) AS paren, CAST(k AS INTEGER) AS cint FROM t;
+    INSERT INTO t VALUES (1, 7);
+    SELECT 'paren', paren FROM mv WHERE paren = '7';
+    SELECT 'cint', cint FROM mv WHERE cint = '7';
+}
+expect {
+    paren|7
+    cint|7
+}
