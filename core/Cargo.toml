@@ -312,6 +312,10 @@ name = "matview_benchmark"
 harness = false
 
 [[bench]]
+name = "matview_scan_benchmark"
+harness = false
+
+[[bench]]
 name = "scan_loop_benchmark"
 harness = false
 
