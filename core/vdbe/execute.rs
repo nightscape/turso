@@ -6354,13 +6354,7 @@ pub fn op_seek_rowid(
         // Handle MaterializedView cursor
         let (pc, did_seek) = match cursor {
             Cursor::MaterializedView(mv_cursor) => {
-                let rowid = match state.registers[*src_reg].get_value() {
-                    Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
-                    Value::Null => None,
-                    _ => None,
-                };
-
-                match rowid {
+                match seek_rowid_key(state.registers[*src_reg].get_value()) {
                     Some(rowid) => {
                         let seek_result = return_if_io!(
                             state,
@@ -6379,26 +6373,7 @@ pub fn op_seek_rowid(
             }
             Cursor::BTree(..) | Cursor::Dyn(..) => {
                 let btree_cursor = cursor.as_btree_mut();
-                let rowid = match state.registers[*src_reg].get_value() {
-                    Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
-                    Value::Null => None,
-                    // For non-integer values try to apply affinity and convert them to integer.
-                    other => {
-                        let mut temp_reg = Register::Value(other.clone());
-                        let converted = apply_affinity_char(&mut temp_reg, Affinity::Numeric);
-                        if converted {
-                            match temp_reg.get_value() {
-                                Value::Numeric(Numeric::Integer(i)) => Some(*i),
-                                Value::Numeric(Numeric::Float(f)) => Some(f64::from(*f) as i64),
-                                _ => None,
-                            }
-                        } else {
-                            None
-                        }
-                    }
-                };
-
-                match rowid {
+                match seek_rowid_key(state.registers[*src_reg].get_value()) {
                     Some(rowid) => {
                         let seek_result = return_if_io!(
                             state,
@@ -6426,6 +6401,24 @@ pub fn op_seek_rowid(
     }
     state.pc = pc;
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn seek_rowid_key(key: &Value) -> Option<i64> {
+    match key {
+        Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
+        Value::Null => None,
+        other => {
+            let mut temp_reg = Register::Value(other.clone());
+            if !apply_affinity_char(&mut temp_reg, Affinity::Numeric) {
+                return None;
+            }
+            match temp_reg.get_value() {
+                Value::Numeric(Numeric::Integer(i)) => Some(*i),
+                Value::Numeric(Numeric::Float(f)) => Some(f64::from(*f) as i64),
+                _ => None,
+            }
+        }
+    }
 }
 
 pub fn op_deferred_seek(
