@@ -4,9 +4,10 @@ use crate::schema::{ColDef, FromDefinitionFlags};
 use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{BitSet, JoinedTable};
-use crate::translate::planner::parse_row_id;
+use crate::translate::planner::{parse_row_id, ROWID_STRS};
 use crate::types::IOResult;
 use crate::types::IOResultOr;
+use crate::vdbe::affinity::Affinity;
 use crate::IO;
 use crate::{
     schema::{Column, Schema, Table, Type},
@@ -1953,25 +1954,26 @@ fn view_source_from_select_table(
             });
             let columns = schema
                 .get_table(&table_name)
-                .map(|table| {
-                    table
-                        .columns()
-                        .iter()
-                        .cloned()
-                        .map(|column| ViewColumn {
-                            table_index,
-                            column,
-                        })
-                        .collect()
+                .map(|table| table.columns().to_vec())
+                .or_else(|| {
+                    schema
+                        .get_view(&table_name)
+                        .map(|view| view.columns.clone())
                 })
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .into_iter()
+                .map(|column| ViewColumn {
+                    table_index,
+                    column,
+                })
+                .collect();
             Ok(ViewSource {
                 qualifiers,
                 columns,
             })
         }
         ast::SelectTable::Select(select, alias) => {
-            let derived = extract_view_columns_inner(select, schema, ctes)?;
+            let derived = extract_view_columns_inner(select, schema, ctes, &[])?;
             Ok(ViewSource {
                 qualifiers: alias
                     .as_ref()
@@ -2163,11 +2165,12 @@ fn extract_view_columns_inner(
     select_stmt: &ast::Select,
     schema: &Schema,
     outer_ctes: &HashMap<String, ViewColumnSchema>,
+    outer_scopes: &[&[(ViewSource, Vec<String>)]],
 ) -> Result<ViewColumnSchema> {
     let mut ctes = outer_ctes.clone();
     if let Some(with) = &select_stmt.with {
         for cte in &with.ctes {
-            let mut derived = extract_view_columns_inner(&cte.select, schema, &ctes)?;
+            let mut derived = extract_view_columns_inner(&cte.select, schema, &ctes, &[])?;
             for (column, explicit_name) in derived.columns.iter_mut().zip(&cte.columns) {
                 column.column.name = Some(explicit_name.col_name.as_str().to_string());
             }
@@ -2194,47 +2197,20 @@ fn extract_view_columns_inner(
         .transpose()?
         .unwrap_or_default();
 
+    let scopes: Vec<&[(ViewSource, Vec<String>)]> = std::iter::once(sources.as_slice())
+        .chain(outer_scopes.iter().copied())
+        .collect();
+
     for result_column in select_columns {
         match result_column {
             ast::ResultColumn::Expr(expr, alias) => {
-                let source_column = match expr.as_ref() {
-                    ast::Expr::Qualified(qualifier, column_name) => sources
-                        .iter()
-                        .find(|(source, _)| {
-                            source
-                                .qualifiers
-                                .iter()
-                                .any(|candidate| candidate.eq_ignore_ascii_case(qualifier.as_str()))
-                        })
-                        .and_then(|(source, _)| {
-                            source.columns.iter().find(|column| {
-                                view_column_name(column).is_some_and(|candidate| {
-                                    candidate.eq_ignore_ascii_case(column_name.as_str())
-                                })
-                            })
-                        }),
-                    ast::Expr::Id(column_name) => sources.iter().find_map(|(source, _)| {
-                        source.columns.iter().find(|column| {
-                            view_column_name(column).is_some_and(|candidate| {
-                                candidate.eq_ignore_ascii_case(column_name.as_str())
-                            })
-                        })
-                    }),
-                    _ => None,
-                };
                 let name = alias
                     .as_ref()
                     .filter(|alias| !matches!(alias, ast::As::ImplicitColumnName(_)))
                     .map(|alias| alias.name().as_str().to_string())
                     .or_else(|| extract_column_name_from_expr(expr))
                     .unwrap_or_else(|| expr.to_string());
-                let mut column =
-                    source_column
-                        .map(view_output_column)
-                        .unwrap_or_else(|| ViewColumn {
-                            table_index: usize::MAX,
-                            column: Column::new_default_text(None, "TEXT".to_string(), None),
-                        });
+                let mut column = view_result_column(expr, &scopes, schema, &ctes)?;
                 column.column.name = Some(name);
                 deduplicate_view_column_name(&mut column, &mut column_name_counts);
                 columns.push(column);
@@ -2276,6 +2252,129 @@ fn extract_view_columns_inner(
     Ok(ViewColumnSchema { tables, columns })
 }
 
+fn view_result_column(
+    expr: &ast::Expr,
+    scopes: &[&[(ViewSource, Vec<String>)]],
+    schema: &Schema,
+    ctes: &HashMap<String, ViewColumnSchema>,
+) -> Result<ViewColumn> {
+    if let Some(column) = view_referenced_column(expr, scopes, schema, ctes)? {
+        return Ok(column);
+    }
+    let affinity = view_expression_affinity(expr, scopes, schema, ctes)?;
+    Ok(ViewColumn {
+        table_index: usize::MAX,
+        column: column_of_declared_type(view_affinity_type_name(affinity)),
+    })
+}
+
+fn view_referenced_column(
+    expr: &ast::Expr,
+    scopes: &[&[(ViewSource, Vec<String>)]],
+    schema: &Schema,
+    ctes: &HashMap<String, ViewColumnSchema>,
+) -> Result<Option<ViewColumn>> {
+    let (qualifier, column_name) = match expr {
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            return view_referenced_column(&exprs[0], scopes, schema, ctes);
+        }
+        ast::Expr::Subquery(select) => {
+            let subquery = extract_view_columns_inner(select, schema, ctes, scopes)?;
+            return Ok(subquery.columns.first().map(|column| ViewColumn {
+                table_index: usize::MAX,
+                column: view_output_column(column).column,
+            }));
+        }
+        ast::Expr::Id(column_name) => (None, column_name),
+        ast::Expr::Qualified(qualifier, column_name) => (Some(qualifier), column_name),
+        _ => return Ok(None),
+    };
+    for (depth, sources) in scopes.iter().enumerate() {
+        let mut visible = sources.iter().filter(|(source, _)| {
+            qualifier.is_none_or(|qualifier| {
+                source
+                    .qualifiers
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(qualifier.as_str()))
+            })
+        });
+        let found = visible.clone().find_map(|(source, _)| {
+            source.columns.iter().find(|column| {
+                view_column_name(column)
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(column_name.as_str()))
+            })
+        });
+        if let Some(found) = found {
+            let mut column = view_output_column(found);
+            if depth > 0 {
+                column.table_index = usize::MAX;
+            }
+            return Ok(Some(column));
+        }
+        let names_rowid = ROWID_STRS
+            .iter()
+            .any(|rowid| rowid.eq_ignore_ascii_case(column_name.as_str()));
+        if names_rowid && visible.next().is_some() {
+            return Ok(Some(ViewColumn {
+                table_index: usize::MAX,
+                column: column_of_declared_type("INTEGER"),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn view_expression_affinity(
+    expr: &ast::Expr,
+    scopes: &[&[(ViewSource, Vec<String>)]],
+    schema: &Schema,
+    ctes: &HashMap<String, ViewColumnSchema>,
+) -> Result<Affinity> {
+    match expr {
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            view_expression_affinity(&exprs[0], scopes, schema, ctes)
+        }
+        ast::Expr::Collate(inner, _) => view_expression_affinity(inner, scopes, schema, ctes),
+        ast::Expr::Cast { type_name, .. } => Ok(Affinity::affinity(
+            type_name.as_ref().map_or("", |type_name| &type_name.name),
+        )),
+        _ => Ok(view_referenced_column(expr, scopes, schema, ctes)?.map_or(
+            Affinity::None,
+            |column| {
+                if column.column.ty_str.is_empty() {
+                    Affinity::None
+                } else {
+                    Affinity::affinity(&column.column.ty_str)
+                }
+            },
+        )),
+    }
+}
+
+fn view_affinity_type_name(affinity: Affinity) -> &'static str {
+    match affinity {
+        Affinity::None => "",
+        Affinity::Blob => "BLOB",
+        Affinity::Integer => "INT",
+        Affinity::Real => "REAL",
+        Affinity::Text => "TEXT",
+        Affinity::Numeric => "NUM",
+    }
+}
+
+fn column_of_declared_type(ty_str: &str) -> Column {
+    let (ty, _) = type_from_name(ty_str);
+    Column::new(
+        None,
+        ty_str.to_string(),
+        None,
+        None,
+        ty,
+        None,
+        Default::default(),
+    )
+}
+
 /// Extract column information from a SELECT statement for view creation.
 ///
 /// Bare-star expansion follows the join's visible row shape: columns merged
@@ -2285,7 +2384,7 @@ pub fn extract_view_columns(
     select_stmt: &ast::Select,
     schema: &Schema,
 ) -> Result<ViewColumnSchema> {
-    extract_view_columns_inner(select_stmt, schema, &HashMap::default())
+    extract_view_columns_inner(select_stmt, schema, &HashMap::default(), &[])
 }
 
 pub fn rewrite_fk_parent_cols_if_self_ref(
