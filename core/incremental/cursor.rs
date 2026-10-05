@@ -37,6 +37,14 @@ enum SeekState {
         op: SeekOp,
     },
 
+    /// Stepping to the neighbouring btree entry while the overlay is empty:
+    /// the committed rows are then the whole view, in btree order.
+    Stepping {
+        op: SeekOp,
+        /// The btree cursor has moved; only reading the row is left.
+        moved: bool,
+    },
+
     /// Seek completed successfully
     Done,
 }
@@ -368,6 +376,9 @@ impl MaterializedViewCursor {
                 !view_guard.order_by.is_empty(),
             )
         };
+        // Stepping relies on the btree position, so peer writes and cache
+        // clears must save or invalidate it like any other cursor's.
+        btree_cursor.register_with_pager();
         Ok(Self {
             btree_cursor,
             overlay: ViewOverlay::new(view, pager, tx_state, conn),
@@ -489,6 +500,17 @@ impl MaterializedViewCursor {
     }
 
     // Read the current btree entry as a vector (empty if no current position).
+    fn read_btree_delta_entry(&mut self) -> IOResultOr<Vec<(HashableRow, isize)>> {
+        let row = return_if_io!(self.read_btree_row());
+        Ok(IOResult::Done(
+            row.map(|(rowid, values, weight)| (HashableRow::new(rowid, values), weight))
+                .into_iter()
+                .collect(),
+        ))
+    }
+
+    // The btree entry under the cursor as `(rowid, logical values, weight)`,
+    // without the row hash a `HashableRow` computes.
     //
     // For ORDER BY (index-organized) views, the on-disk record layout is
     // `[sort_v_1, ..., sort_v_N, rowid, non_sort_data..., weight]`. We MUST
@@ -496,13 +518,13 @@ impl MaterializedViewCursor {
     // `has_rowid: false` (the last record value is `weight`, not rowid). We
     // detect "no record" via `record()` returning `None` instead.
     //
-    // The returned `HashableRow.values` is always in **logical** column
+    // The returned values are always in **logical** column
     // order so that downstream merge-with-uncommitted-overlay works on
     // matching value tuples regardless of storage layout.
-    fn read_btree_delta_entry(&mut self) -> IOResultOr<Vec<(HashableRow, isize)>> {
+    fn read_btree_row(&mut self) -> IOResultOr<Option<(i64, Vec<Value>, isize)>> {
         let btree_record = return_if_io!(self.btree_cursor.record());
         let Some(btree_record) = btree_record else {
-            return Ok(IOResult::Done(Vec::new()));
+            return Ok(IOResult::Done(None));
         };
         let mut btree_values = btree_record.get_values_owned()?;
 
@@ -563,10 +585,7 @@ impl MaterializedViewCursor {
             (rowid, btree_values)
         };
 
-        Ok(IOResult::Done(vec![(
-            HashableRow::new(rowid, logical_values),
-            weight,
-        )]))
+        Ok(IOResult::Done(Some((rowid, logical_values, weight))))
     }
 
     /// Process btree changes: merge with uncommitted, build zset, and determine result.
@@ -650,7 +669,7 @@ impl MaterializedViewCursor {
     fn seek_in_progress(&self) -> bool {
         matches!(
             self.seek_state,
-            SeekState::Seek { .. } | SeekState::Advancing { .. }
+            SeekState::Seek { .. } | SeekState::Advancing { .. } | SeekState::Stepping { .. }
         )
     }
 
@@ -666,7 +685,7 @@ impl MaterializedViewCursor {
     fn continue_seek(&mut self, op: SeekOp) -> IOResultOr<SeekResult> {
         loop {
             match &mut self.seek_state {
-                SeekState::Init | SeekState::Done => {
+                SeekState::Init | SeekState::Done | SeekState::Stepping { .. } => {
                     unreachable!("continue_seek requires a seek in progress")
                 }
                 SeekState::Seek {
@@ -701,12 +720,7 @@ impl MaterializedViewCursor {
                         }
                     };
 
-                    return_if_io!(self.process_btree_changes(
-                        target,
-                        target_rowid,
-                        op,
-                        changes
-                    ));
+                    return_if_io!(self.process_btree_changes(target, target_rowid, op, changes));
 
                     // Check if we're done or need to continue seeking
                     if matches!(self.seek_state, SeekState::Done) {
@@ -741,12 +755,7 @@ impl MaterializedViewCursor {
                     // read_btree_delta_entry handles the case where cursor is at end
                     let changes = return_if_io!(self.read_btree_delta_entry());
 
-                    return_if_io!(self.process_btree_changes(
-                        target,
-                        target_rowid,
-                        op,
-                        changes
-                    ));
+                    return_if_io!(self.process_btree_changes(target, target_rowid, op, changes));
 
                     // Check if we're done or need to continue seeking
                     if matches!(self.seek_state, SeekState::Done) {
@@ -836,10 +845,37 @@ impl MaterializedViewCursor {
             let Some((current_rowid, _)) = &self.current_row else {
                 return Ok(IOResult::Done(false));
             };
-            self.start_seek(*current_rowid);
+            if self.overlay.uncommitted.is_empty()
+                && !self.overlay.full_result_mode
+                && !self.btree_cursor.is_empty()
+            {
+                self.null_row = false;
+                self.seek_state = SeekState::Stepping { op, moved: false };
+            } else {
+                self.start_seek(*current_rowid);
+            }
+        }
+        if let SeekState::Stepping { op, moved } = self.seek_state {
+            return self.continue_stepping(op, moved);
         }
         let result = return_if_io!(self.continue_seek(op));
         Ok(IOResult::Done(result == SeekResult::Found))
+    }
+
+    /// The btree cursor sits on `current_row`, so the neighbouring row is one
+    /// btree step away instead of a seek from the root.
+    fn continue_stepping(&mut self, op: SeekOp, moved: bool) -> IOResultOr<bool> {
+        if !moved {
+            match op {
+                SeekOp::GT | SeekOp::GE { .. } => return_if_io!(self.btree_cursor.next()),
+                SeekOp::LT | SeekOp::LE { .. } => return_if_io!(self.btree_cursor.prev()),
+            }
+            self.seek_state = SeekState::Stepping { op, moved: true };
+        }
+        let row = return_if_io!(self.read_btree_row());
+        self.seek_state = SeekState::Done;
+        self.current_row = row.map(|(rowid, values, _)| (rowid, values.into()));
+        Ok(IOResult::Done(self.current_row.is_some()))
     }
 
     /// Cursor advance for ORDER BY views.
@@ -856,14 +892,9 @@ impl MaterializedViewCursor {
             return Ok(IOResult::Done(true));
         }
         return_if_io!(self.btree_cursor.next());
-        let entry = return_if_io!(self.read_btree_delta_entry());
-        if let Some((row, _weight)) = entry.into_iter().next() {
-            self.current_row = Some((row.rowid, row.values));
-            Ok(IOResult::Done(true))
-        } else {
-            self.current_row = None;
-            Ok(IOResult::Done(false))
-        }
+        let row = return_if_io!(self.read_btree_row());
+        self.current_row = row.map(|(rowid, values, _)| (rowid, values.into()));
+        Ok(IOResult::Done(self.current_row.is_some()))
     }
 
     pub fn column(&mut self, col: usize) -> IOResultOr<Value> {
