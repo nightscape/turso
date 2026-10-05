@@ -2715,3 +2715,19 @@ expect {
     real|2|b
     text|2|b
 }
+
+test matview-on-the-hash-join-build-side-sees-uncommitted-rows {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t;
+    CREATE TABLE probe(id INTEGER PRIMARY KEY, kk TEXT);
+    WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300)
+    INSERT INTO t SELECT i, 'k' || i FROM n;
+    INSERT INTO probe SELECT id, k FROM t WHERE id % 2 = 0;
+    BEGIN;
+    INSERT INTO t VALUES (901, 'k2');
+    DELETE FROM t WHERE id = 4;
+    SELECT count(*), sum(X.id) FROM v X JOIN probe p ON p.kk = X.k;
+}
+expect {
+    150|23547
+}
