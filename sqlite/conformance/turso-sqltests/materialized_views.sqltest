@@ -2731,3 +2731,51 @@ test matview-on-the-hash-join-build-side-sees-uncommitted-rows {
 expect {
     150|23547
 }
+
+test matview-expression-columns-have-no-declared-type {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, st TEXT, k INTEGER);
+    CREATE MATERIALIZED VIEW agg AS SELECT st, count(*) AS n, sum(k) AS s FROM t GROUP BY st;
+    CREATE MATERIALIZED VIEW proj AS SELECT id, k + 1 AS kp, 1 AS one, CAST(k AS TEXT) AS kt FROM t;
+    SELECT 'agg', name, type FROM pragma_table_info('agg');
+    SELECT 'proj', name, type FROM pragma_table_info('proj');
+}
+expect {
+    agg|st|TEXT
+    agg|n|
+    agg|s|
+    proj|id|INTEGER
+    proj|kp|
+    proj|one|
+    proj|kt|TEXT
+}
+
+test matview-count-column-does-not-equal-a-text-key {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, st TEXT);
+    CREATE MATERIALIZED VIEW agg AS SELECT st, count(*) AS n FROM t GROUP BY st;
+    INSERT INTO t VALUES (1, 'X'), (2, 'X'), (3, 'Y');
+    SELECT 'int', st, n FROM agg WHERE n = 1;
+    SELECT 'text', st, n FROM agg WHERE n = '1';
+}
+expect {
+    int|Y|1
+}
+
+test matview-column-declared-type-follows-sqlite {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, st TEXT, k INTEGER);
+    CREATE MATERIALIZED VIEW mv AS SELECT
+        (k) AS paren, ((t.st)) AS parenqual,
+        CAST(k AS INTEGER) AS cint, CAST(k AS VARCHAR(10)) AS cvar, CAST(k AS NUMERIC) AS cnum,
+        CAST(k AS REAL) AS creal, CAST(k AS BLOB) AS cblob, CAST(k AS FOO) AS cfoo
+    FROM t;
+    SELECT name, type FROM pragma_table_info('mv');
+}
+expect {
+    paren|INTEGER
+    parenqual|TEXT
+    cint|INT
+    cvar|TEXT
+    cnum|NUM
+    creal|REAL
+    cblob|BLOB
+    cfoo|NUM
+}

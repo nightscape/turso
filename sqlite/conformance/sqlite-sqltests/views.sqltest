@@ -420,3 +420,40 @@ expect {
     id|0
     value|0
 }
+
+test view-column-declared-type-follows-the-referenced-column {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, st TEXT, k INTEGER);
+    CREATE TABLE u(uid INTEGER PRIMARY KEY, ust TEXT, uk BIGINT);
+    CREATE VIEW v1 AS SELECT k, k + 1 AS kp, CAST(k AS TEXT) AS kt FROM t;
+    CREATE VIEW pv AS SELECT
+        (k) AS paren, ((t.st)) AS parenqual, k COLLATE nocase AS kcoll,
+        CAST(k AS INTEGER) AS cint, CAST(k AS VARCHAR(10)) AS cvar, CAST(k AS NUMERIC) AS cnum,
+        CAST(k AS REAL) AS creal, CAST(k AS BLOB) AS cblob, CAST(k AS FOO) AS cfoo,
+        CASE WHEN k > 0 THEN st ELSE 'n' END AS cse,
+        (SELECT uk FROM u) AS subcol, (SELECT uk + 1 FROM u) AS subexpr, (SELECT t.k) AS corr,
+        t.rowid AS rid, u.ust AS joined
+    FROM t JOIN u ON t.id = u.uid;
+    CREATE VIEW vv AS SELECT k, kp, kt FROM v1;
+    SELECT 'pv', name, type FROM pragma_table_info('pv');
+    SELECT 'vv', name, type FROM pragma_table_info('vv');
+}
+expect {
+    pv|paren|INTEGER
+    pv|parenqual|TEXT
+    pv|kcoll|INT
+    pv|cint|INT
+    pv|cvar|TEXT
+    pv|cnum|NUM
+    pv|creal|REAL
+    pv|cblob|BLOB
+    pv|cfoo|NUM
+    pv|cse|
+    pv|subcol|BIGINT
+    pv|subexpr|
+    pv|corr|INTEGER
+    pv|rid|INTEGER
+    pv|joined|TEXT
+    vv|k|INTEGER
+    vv|kp|
+    vv|kt|TEXT
+}
