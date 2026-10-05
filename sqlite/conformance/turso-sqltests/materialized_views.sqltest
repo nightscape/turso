@@ -2695,3 +2695,23 @@ expect {
     2|b
     1|a
 }
+
+test matview-rowid-seek-applies-numeric-affinity-to-the-key {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t;
+    INSERT INTO t VALUES (1, 'a'), (2, 'b');
+    CREATE TABLE probe(id INTEGER PRIMARY KEY, vid);
+    INSERT INTO probe VALUES (1, 1), (2, 1.0), (3, '1'), (4, 'x'), (5, NULL);
+    SELECT p.id, v.rowid, v.k FROM probe p LEFT JOIN v ON v.rowid = p.vid ORDER BY p.id;
+    SELECT 'real', rowid, k FROM v WHERE rowid = (SELECT 2.0);
+    SELECT 'text', rowid, k FROM v WHERE rowid = (SELECT '2');
+}
+expect {
+    1|1|a
+    2|1|a
+    3|1|a
+    4||
+    5||
+    real|2|b
+    text|2|b
+}
