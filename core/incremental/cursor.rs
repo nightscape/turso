@@ -22,14 +22,16 @@ enum SeekState {
 
     /// Actively seeking with btree and uncommitted iterators
     Seek {
-        /// The row we are trying to find
         target: i64,
+        /// The row we are trying to find
+        target_rowid: i64,
     },
 
     /// Btree seek returned TryAdvance, now advancing with next()/prev()
     Advancing {
-        /// The row we are trying to find
         target: i64,
+        /// The row we are trying to find
+        target_rowid: i64,
         /// The seek operation (determines direction of advance)
         op: SeekOp,
     },
@@ -224,7 +226,10 @@ impl MaterializedViewCursor {
         };
 
         if let Some(target) = new_target {
-            self.seek_state = SeekState::Seek { target };
+            self.seek_state = SeekState::Seek {
+                target,
+                target_rowid,
+            };
         } else {
             self.seek_state = SeekState::Done;
         }
@@ -233,18 +238,40 @@ impl MaterializedViewCursor {
 
     /// Internal seek implementation that doesn't check preconditions
     fn do_seek(&mut self, target_rowid: i64, op: SeekOp) -> IOResultOr<SeekResult> {
+        if !self.seek_in_progress() {
+            self.start_seek(target_rowid);
+        }
+        self.continue_seek(op)
+    }
+
+    fn seek_in_progress(&self) -> bool {
+        matches!(
+            self.seek_state,
+            SeekState::Seek { .. } | SeekState::Advancing { .. }
+        )
+    }
+
+    fn start_seek(&mut self, target_rowid: i64) {
+        self.current_row = None;
+        self.null_row = false;
+        self.seek_state = SeekState::Seek {
+            target: target_rowid,
+            target_rowid,
+        };
+    }
+
+    fn continue_seek(&mut self, op: SeekOp) -> IOResultOr<SeekResult> {
         loop {
-            // Process state machine - need to handle mutable borrow carefully
             match &mut self.seek_state {
-                SeekState::Init => {
-                    self.current_row = None;
-                    self.null_row = false;
-                    self.seek_state = SeekState::Seek {
-                        target: target_rowid,
-                    };
+                SeekState::Init | SeekState::Done => {
+                    unreachable!("continue_seek requires a seek in progress")
                 }
-                SeekState::Seek { target } => {
+                SeekState::Seek {
+                    target,
+                    target_rowid,
+                } => {
                     let target = *target;
+                    let target_rowid = *target_rowid;
                     let btree_result =
                         return_if_io!(self.btree_cursor.seek(SeekKey::TableRowId(target), op));
 
@@ -254,7 +281,11 @@ impl MaterializedViewCursor {
                             // Transition to Advancing state before calling next/prev.
                             // This ensures that if next/prev returns IO, we resume in
                             // Advancing state and don't redundantly call seek again.
-                            self.seek_state = SeekState::Advancing { target, op };
+                            self.seek_state = SeekState::Advancing {
+                                target,
+                                target_rowid,
+                                op,
+                            };
                             continue;
                         }
                         SeekResult::NotFound => Vec::new(),
@@ -273,8 +304,13 @@ impl MaterializedViewCursor {
                     }
                     // Otherwise state is Seek with new target, loop continues
                 }
-                SeekState::Advancing { target, op } => {
+                SeekState::Advancing {
+                    target,
+                    target_rowid,
+                    op,
+                } => {
                     let target = *target;
+                    let target_rowid = *target_rowid;
                     let op = *op;
 
                     // Cursor is positioned at the leaf but current entry doesn't match.
@@ -303,11 +339,6 @@ impl MaterializedViewCursor {
                     }
                     // Otherwise state is Seek with new target, loop continues
                 }
-                SeekState::Done => {
-                    // We always return before setting the state to done. Meaning if we got here,
-                    // this is a new seek.
-                    self.seek_state = SeekState::Init;
-                }
             }
         }
     }
@@ -330,26 +361,21 @@ impl MaterializedViewCursor {
     }
 
     pub fn next(&mut self) -> IOResultOr<bool> {
-        // If there's a pending seek operation (due to IO), complete it first.
-        // SeekState::Seek or SeekState::Advancing means IO was interrupted mid-seek and we need to resume.
-        // SeekState::Init means cursor was never positioned - don't resume, fall through to check current_row.
-        if matches!(
-            self.seek_state,
-            SeekState::Seek { .. } | SeekState::Advancing { .. }
-        ) {
-            // target is ignored when resuming
-            let result = return_if_io!(self.do_seek(0, SeekOp::GT));
-            return Ok(IOResult::Done(result == SeekResult::Found));
+        self.step(SeekOp::GT)
+    }
+
+    pub fn prev(&mut self) -> IOResultOr<bool> {
+        self.step(SeekOp::LT)
+    }
+
+    fn step(&mut self, op: SeekOp) -> IOResultOr<bool> {
+        if !self.seek_in_progress() {
+            let Some((current_rowid, _)) = &self.current_row else {
+                return Ok(IOResult::Done(false));
+            };
+            self.start_seek(*current_rowid);
         }
-
-        // If cursor is not positioned (no current_row), return false
-        // This matches BTreeCursor behavior when valid_state == Invalid
-        let Some((current_rowid, _)) = &self.current_row else {
-            return Ok(IOResult::Done(false));
-        };
-
-        // Use GT to find the next row after current position
-        let result = return_if_io!(self.do_seek(*current_rowid, SeekOp::GT));
+        let result = return_if_io!(self.continue_seek(op));
         Ok(IOResult::Done(result == SeekResult::Found))
     }
 
@@ -377,6 +403,12 @@ impl MaterializedViewCursor {
         return_if_io!(self.ensure_tx_changes_computed());
         // Seek GT from i64::MIN to find the first row using internal do_seek
         let _result = return_if_io!(self.do_seek(i64::MIN, SeekOp::GT));
+        Ok(IOResult::Done(()))
+    }
+
+    pub fn last(&mut self) -> IOResultOr<()> {
+        return_if_io!(self.ensure_tx_changes_computed());
+        let _result = return_if_io!(self.do_seek(i64::MAX, SeekOp::LE { eq_only: false }));
         Ok(IOResult::Done(()))
     }
 
@@ -1166,6 +1198,38 @@ mod tests {
         // Next on empty table should return false
         assert!(!pager.io.block(|| cursor.next())?);
         assert!(!cursor.is_valid()?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_prev_resumed_after_io_reads_the_previous_row() -> Result<()> {
+        let conn = create_test_connection()?;
+        populate_test_table(&conn, vec![(1, 10), (2, 20), (3, 30), (4, 40)])?;
+        let (mut cursor, _tx_state, pager) = create_test_cursor(&conn)?;
+        pager.io.block(|| cursor.last())?;
+        assert_eq!(pager.io.block(|| cursor.rowid())?, Some(4));
+
+        pager.clear_page_cache(false);
+        assert!(matches!(cursor.prev()?, IOResult::IO(_)));
+        assert!(pager.io.block(|| cursor.prev())?);
+        assert_eq!(pager.io.block(|| cursor.rowid())?, Some(3));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_next_resumed_after_io_reads_the_next_negative_row() -> Result<()> {
+        let conn = create_test_connection()?;
+        populate_test_table(&conn, vec![(-4, 10), (-3, 20), (-2, 30), (-1, 40)])?;
+        let (mut cursor, _tx_state, pager) = create_test_cursor(&conn)?;
+        pager.io.block(|| cursor.rewind())?;
+        assert_eq!(pager.io.block(|| cursor.rowid())?, Some(-4));
+
+        pager.clear_page_cache(false);
+        assert!(matches!(cursor.next()?, IOResult::IO(_)));
+        assert!(pager.io.block(|| cursor.next())?);
+        assert_eq!(pager.io.block(|| cursor.rowid())?, Some(-3));
 
         Ok(())
     }
