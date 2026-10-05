@@ -17,6 +17,7 @@ mod functions;
 mod fuzz_transaction;
 mod index_method;
 mod integrity_check;
+mod matview_exists_predicate_refused;
 mod mvcc;
 mod pragma;
 mod query_processing;
