@@ -2816,16 +2816,9 @@ impl JoinedTable {
                         },
                     ))
                 } else {
-                    // Check if this is a materialized view
-                    let cursor_type =
-                        if let Some(view_mutex) = schema.get_materialized_view(&btree.name) {
-                            CursorType::MaterializedView(btree.clone(), view_mutex)
-                        } else {
-                            CursorType::BTreeTable(btree.clone())
-                        };
                     Some(program.alloc_cursor_id_keyed_if_not_exists(
                         CursorKey::table(self.internal_id),
-                        cursor_type,
+                        read_cursor_type(btree, schema),
                     ))
                 };
 
@@ -2982,6 +2975,13 @@ impl JoinedTable {
 
     pub fn column_is_used(&self, index: usize) -> bool {
         self.col_used_mask.get(index)
+    }
+}
+
+pub(crate) fn read_cursor_type(btree: &Arc<BTreeTable>, schema: &Schema) -> CursorType {
+    match schema.get_materialized_view(&btree.name) {
+        Some(view_mutex) => CursorType::MaterializedView(btree.clone(), view_mutex),
+        None => CursorType::BTreeTable(btree.clone()),
     }
 }
 
