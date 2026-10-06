@@ -1140,7 +1140,11 @@ impl DbspCircuit {
             BTreeCursor::new_table(pager.clone(), self.main_data_root, num_columns)
         };
         install_dbsp_yield_context(&mut cursor, pager);
-        Box::new(cursor)
+        let cursor = Box::new(cursor);
+        // A matview scan steps its btree cursor between rows, so its position
+        // must be saved before this cursor writes the view btree.
+        cursor.register_with_pager();
+        cursor
     }
 
     /// Execute the circuit with incremental input data (deltas).
