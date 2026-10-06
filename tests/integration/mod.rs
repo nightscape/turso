@@ -21,6 +21,7 @@ mod matview_computed_conjuncts;
 mod matview_exists_decorrelation;
 mod matview_left_join_antijoin;
 mod matview_scan_step_probes;
+mod matview_scan_step_probes2;
 mod matview_unusable_view_drop_recreate;
 mod mvcc;
 mod pragma;

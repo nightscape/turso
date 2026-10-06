@@ -474,8 +474,10 @@ pub enum CommitState {
         write_row_state: WriteRowView,
         /// State for writing individual rows (index btree, used when ORDER BY is present)
         write_row_index_state: WriteRowViewIndex,
-        /// Cursor for view data btree - created fresh for each row
-        view_cursor: Box<BTreeCursor>,
+        /// Cursor for view data btree, opened fresh at the start of each row.
+        /// None until then, so the previous row's cursor is dropped (and
+        /// unregistered from the pager) before its replacement registers.
+        view_cursor: Option<Box<BTreeCursor>>,
         /// Whether this view uses index-organized storage (ORDER BY)
         is_index_organized: bool,
         /// Number of columns in the output (including weight)
@@ -543,13 +545,14 @@ impl std::fmt::Debug for CommitState {
                 delta,
                 current_index,
                 write_row_state,
+                view_cursor,
                 ..
             } => f
                 .debug_struct("UpdateView")
                 .field("delta", delta)
                 .field("current_index", current_index)
                 .field("write_row_state", write_row_state)
-                .field("has_view_cursor", &true)
+                .field("has_view_cursor", &view_cursor.is_some())
                 .finish(),
             Self::UpdateViewIndexes {
                 current_index,
@@ -1461,23 +1464,12 @@ impl DbspCircuit {
 
                     let is_index_organized = !self.order_by.is_empty();
 
-                    // Create view cursor when entering UpdateView state.
-                    // ORDER BY views use an index btree (composite-keyed by
-                    // sort cols + rowid); plain matviews use a table btree
-                    // keyed by rowid.
-                    let view_cursor: Box<BTreeCursor> = self.new_view_cursor(
-                        &pager,
-                        is_index_organized,
-                        &self.order_by,
-                        num_columns,
-                    );
-
                     self.commit_state = CommitState::UpdateView {
                         delta,
                         current_index: 0,
                         write_row_state: WriteRowView::new(),
                         write_row_index_state: WriteRowViewIndex::new(),
-                        view_cursor,
+                        view_cursor: None,
                         is_index_organized,
                         num_columns,
                         view_order_by: self.order_by.clone(),
@@ -1539,9 +1531,14 @@ impl DbspCircuit {
                             matches!(write_row_state, WriteRowView::GetRecord)
                         };
                         if needs_fresh {
-                            *view_cursor =
-                                self.new_view_cursor(&pager, is_index, view_order_by, nc);
+                            *view_cursor = None;
                         }
+                        // ORDER BY views use an index btree (composite-keyed by
+                        // sort cols + rowid); plain matviews use a table btree
+                        // keyed by rowid.
+                        let view_cursor = view_cursor.get_or_insert_with(|| {
+                            self.new_view_cursor(&pager, is_index, view_order_by, nc)
+                        });
 
                         if is_index {
                             let (composite_seek_key, full_record) = Self::build_composite_keys(
@@ -1593,17 +1590,12 @@ impl DbspCircuit {
 
                         // Move to next row
                         let delta = std::mem::take(delta);
-                        // Take ownership of view_cursor - we'll create a new one for next row if needed.
-                        // The replacement must match the btree page format.
-                        let placeholder = self.new_view_cursor(&pager, is_index, view_order_by, nc);
-                        let view_cursor = std::mem::replace(view_cursor, placeholder);
-
                         self.commit_state = CommitState::UpdateView {
                             delta,
                             current_index: *current_index + 1,
                             write_row_state: WriteRowView::new(),
                             write_row_index_state: WriteRowViewIndex::new(),
-                            view_cursor,
+                            view_cursor: None,
                             is_index_organized: is_index,
                             num_columns: nc,
                             view_order_by: view_order_by.clone(),
@@ -1645,12 +1637,7 @@ impl DbspCircuit {
                             current_index: *current_index + 1,
                             write_row_state: WriteRowView::new(),
                             write_row_index_state: WriteRowViewIndex::new(),
-                            view_cursor: self.new_view_cursor(
-                                &pager,
-                                false,
-                                &self.order_by,
-                                *num_columns,
-                            ),
+                            view_cursor: None,
                             is_index_organized: false,
                             num_columns: *num_columns,
                             view_order_by: self.order_by.clone(),
