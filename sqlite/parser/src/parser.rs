@@ -173,6 +173,10 @@ pub struct Parser<'a> {
     /// Parser tracks that in order to properly auto-assign variable ids in correct order for anonymous parameters '?'
     last_variable_id: u32,
     named_variables: HashMap<&'a [u8], NonZeroU32>,
+    /// Every distinct parameter marker of the current command, in text
+    /// order. Rewrites may drop markers from the AST, but SQLite numbers
+    /// and binds parameters from the text, so callers take them from here.
+    variables: Vec<Variable>,
     /// Tracks STRUCT/UNION nesting depth to prevent stack overflow from deeply nested types
     type_nesting_depth: u32,
     /// Current expression recursion depth of the parser, bounded by [`MAX_EXPR_DEPTH`]
@@ -210,6 +214,7 @@ impl<'a> Parser<'a> {
             current_token: Token::new(&input[..0], TokenType::TK_NONE),
             last_variable_id: 0,
             named_variables: HashMap::new(),
+            variables: Vec::new(),
             type_nesting_depth: 0,
             expr_nesting_depth: 0,
             last_expr_height: 0,
@@ -222,7 +227,9 @@ impl<'a> Parser<'a> {
             // Rewrite anonymous variables in encounter order
             self.last_variable_id += 1;
             let index = NonZeroU32::new(self.last_variable_id).unwrap();
-            Ok(Expr::Variable(Variable::indexed(index)))
+            let variable = Variable::indexed(index);
+            self.variables.push(variable.clone());
+            Ok(Expr::Variable(variable))
         } else if token[0] == b'?' {
             let variable_str = std::str::from_utf8(&token[1..])
                 .map_err(|e| Error::Custom(format!("non-utf8 positional variable id: {e}")))?;
@@ -245,7 +252,9 @@ impl<'a> Parser<'a> {
             // spelling is its name (sqlite3_bind_parameter_name returns it,
             // bind_parameter_index resolves it), derived from the index on
             // demand rather than allocated per marker.
-            Ok(Expr::Variable(Variable::numbered(index)))
+            let variable = Variable::numbered(index);
+            self.variables.push(variable.clone());
+            Ok(Expr::Variable(variable))
         } else {
             debug_assert!(matches!(token[0], b':' | b'@' | b'$'));
             let index = if let Some(index) = self.named_variables.get(token).copied() {
@@ -254,6 +263,8 @@ impl<'a> Parser<'a> {
                 self.last_variable_id += 1;
                 let index = NonZeroU32::new(self.last_variable_id).unwrap();
                 self.named_variables.insert(token, index);
+                self.variables
+                    .push(Variable::named(from_bytes_as_str(token), index));
                 index
             };
             Ok(Expr::Variable(Variable::named(
@@ -261,6 +272,12 @@ impl<'a> Parser<'a> {
                 index,
             )))
         }
+    }
+
+    /// The distinct parameter markers of the command returned by the last
+    /// `next_cmd` call, in text order.
+    pub fn take_variables(&mut self) -> Vec<Variable> {
+        std::mem::take(&mut self.variables)
     }
 
     #[inline(always)]
@@ -278,6 +295,7 @@ impl<'a> Parser<'a> {
     pub fn next_cmd(&mut self) -> Result<Option<Cmd>> {
         self.last_variable_id = 0;
         self.named_variables.clear();
+        self.variables.clear();
 
         // consumes prefix SEMI
         while let Some(token) = self.peek()? {

@@ -18,12 +18,16 @@ pub struct TranslateResult {
     pub prereqs: Vec<ast::Stmt>,
     /// The main translated command.
     pub cmd: ast::Cmd,
+    /// The distinct `$N` parameters of the PostgreSQL text, which the
+    /// statement's parameter table is built from.
+    pub variables: Vec<ast::Variable>,
 }
 
 /// Translates a PostgreSQL query into Turso's AST
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
-    // TODO: Add schema information, type mappings, etc.
+    /// The distinct `$N` parameters seen by the translation in progress.
+    variables: std::cell::RefCell<Vec<ast::Variable>>,
 }
 
 impl PostgreSQLTranslator {
@@ -120,25 +124,24 @@ impl PostgreSQLTranslator {
         }
 
         let node = &parse_result.protobuf.nodes()[0];
+        self.variables.borrow_mut().clear();
 
         // CREATE TABLE is special: serial columns generate prerequisite CREATE SEQUENCE stmts
-        if let NodeRef::CreateStmt(create) = &node.0 {
-            let translated = self.translate_create_table_with_prereqs(create)?;
-            return Ok(TranslateResult {
-                prereqs: translated.prereqs,
-                cmd: translated.cmd,
-            });
-        }
-
-        let cmd = match node.0 {
-            NodeRef::ExplainStmt(explain) => self.translate_explain(explain)?,
-            node => ast::Cmd::Stmt(self.translate_node(node)?),
+        let mut translated = if let NodeRef::CreateStmt(create) = &node.0 {
+            self.translate_create_table_with_prereqs(create)?
+        } else {
+            let cmd = match node.0 {
+                NodeRef::ExplainStmt(explain) => self.translate_explain(explain)?,
+                node => ast::Cmd::Stmt(self.translate_node(node)?),
+            };
+            TranslateResult {
+                prereqs: vec![],
+                cmd,
+                variables: vec![],
+            }
         };
-
-        Ok(TranslateResult {
-            prereqs: vec![],
-            cmd,
-        })
+        translated.variables = self.variables.take();
+        Ok(translated)
     }
 
     fn translate_node(&self, node: NodeRef<'_>) -> Result<ast::Stmt, ParseError> {
@@ -366,6 +369,7 @@ impl PostgreSQLTranslator {
         Ok(TranslateResult {
             prereqs,
             cmd: ast::Cmd::Stmt(stmt),
+            variables: vec![],
         })
     }
 
@@ -2222,10 +2226,15 @@ impl PostgreSQLTranslator {
             }
             Some(pg_query::protobuf::node::Node::ParamRef(param_ref)) => {
                 // $1, $2, etc. — translate to Variable("$N")
-                Ok(ast::Expr::Variable(ast::Variable::indexed(
+                let variable = ast::Variable::indexed(
                     std::num::NonZeroU32::new(param_ref.number as u32)
                         .unwrap_or(std::num::NonZeroU32::new(1).unwrap()),
-                )))
+                );
+                let mut variables = self.variables.borrow_mut();
+                if !variables.contains(&variable) {
+                    variables.push(variable.clone());
+                }
+                Ok(ast::Expr::Variable(variable))
             }
             Some(pg_query::protobuf::node::Node::BooleanTest(bt)) => {
                 use pg_query::protobuf::BoolTestType;

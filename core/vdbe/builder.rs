@@ -611,18 +611,7 @@ impl ProgramBuilder {
     /// Register an `ast::Variable` in the parameter list. Returns the
     /// `NonZeroUsize` index for use in `Insn::Variable`.
     pub fn register_variable(&mut self, variable: &ast::Variable) -> NonZeroUsize {
-        let index = usize::try_from(variable.index.get())
-            .expect("u32 variable index must fit into usize")
-            .try_into()
-            .expect("variable index must be non-zero");
-        if let Some(name) = variable.name.as_deref() {
-            self.parameters.push_named_at(name, index);
-        } else if variable.numbered {
-            self.parameters.push_numbered(index);
-        } else {
-            self.parameters.push_index(index);
-        }
-        index
+        self.parameters.register(variable)
     }
 
     /// Run a nested emission scope without leaking its result-column register base

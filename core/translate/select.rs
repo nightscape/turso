@@ -390,7 +390,6 @@ fn prepare_one_select_plan(
                 estimated_output_rows: None,
                 estimated_cost: None,
                 simple_aggregate: None,
-                phantom_params: vec![],
             };
 
             let mut windows: Vec<Window> = Vec::new();
@@ -930,7 +929,6 @@ fn prepare_one_select_plan(
                 estimated_output_rows: None,
                 estimated_cost: None,
                 simple_aggregate: None,
-                phantom_params: vec![],
             };
 
             validate_expr_correct_column_counts(&plan)?;

@@ -1021,8 +1021,9 @@ impl Statement {
         // same-version reprepare still refreshes it.
         conn.refresh_schema_from_shared_for_reprepare();
         let new_program = {
-            let (cmd, _) = conn.parse_sql(&self.program.sql)?;
-            let cmd = cmd.expect("Same SQL string should be able to be parsed");
+            let (parsed, _) = conn.parse_sql(&self.program.sql)?;
+            let parsed = parsed.expect("Same SQL string should be able to be parsed");
+            let cmd = parsed.cmd;
 
             let syms = conn.syms.read();
             let mode = self.query_mode;
@@ -1034,6 +1035,7 @@ impl Statement {
             translate::translate(
                 &schema,
                 stmt,
+                crate::parameters::Parameters::from_variables(&parsed.variables),
                 self.pager.clone(),
                 conn.clone(),
                 &syms,

@@ -80,6 +80,7 @@ use update::translate_update;
 pub fn translate(
     schema: &Schema,
     stmt: ast::Stmt,
+    parameters: crate::parameters::Parameters,
     pager: Arc<Pager>,
     connection: Arc<Connection>,
     syms: &SymbolTable,
@@ -110,6 +111,7 @@ pub fn translate(
         ProgramBuilderOpts::new(1, 32, 2),
     ));
     program.set_mvcc_enabled(connection.mvcc_enabled());
+    program.parameters = parameters;
 
     program.prologue();
     let mut resolver = Resolver::new(
@@ -661,6 +663,7 @@ mod tests {
         let result = translate(
             &schema,
             stmt,
+            crate::parameters::Parameters::new(),
             pager,
             conn,
             &empty_syms,
@@ -882,6 +885,7 @@ mod tests {
         let err = translate(
             &schema,
             stmt,
+            crate::parameters::Parameters::new(),
             pager,
             conn,
             &syms,
@@ -926,6 +930,7 @@ mod tests {
         let err = translate(
             &schema,
             stmt,
+            crate::parameters::Parameters::new(),
             pager,
             conn,
             &syms,

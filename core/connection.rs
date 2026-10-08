@@ -18,6 +18,7 @@ use crate::Page;
 use crate::{
     ast, function,
     io::{MemoryIO, IO},
+    parameters::Parameters,
     progress::{ProgressHandler, ProgressHandlerCallback},
     translate,
     translate::collate::CollationSeq,
@@ -26,8 +27,8 @@ use crate::{
     BusyHandlerCallback, CaptureDataChangesInfo, CheckpointMode, CheckpointResult, CipherMode, Cmd,
     Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
     EncryptionKey, EncryptionOpts, IOResult, IndexMethod, LimboError, MvStore, OpenFlags, PageSize,
-    Pager, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
-    Trigger, Value, VirtualTable, WalAutoActions,
+    Pager, ParsedCmd, Program, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode,
+    TransactionMode, Trigger, Value, VirtualTable, WalAutoActions,
 };
 use crate::{is_memory_like, turso_assert};
 use crate::{MAIN_DB_ID, TEMP_DB_ID};
@@ -1014,7 +1015,7 @@ impl Connection {
     #[turso_macros::trace_stack]
     fn compile_cmd(
         self: &Arc<Connection>,
-        cmd: Cmd,
+        parsed: ParsedCmd,
         input: &str,
         origin: StatementOrigin,
         prepare_options: &PrepareOptions,
@@ -1023,12 +1024,14 @@ impl Connection {
 
         let syms = self.syms.read();
         let pager = self.pager.load().clone();
-        let mode = QueryMode::new(&cmd);
-        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
+        let mode = QueryMode::new(&parsed.cmd);
+        let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) =
+            parsed.cmd;
         let schema = self.schema.read().clone();
         match translate::translate(
             &schema,
             stmt,
+            Parameters::from_variables(&parsed.variables),
             pager.clone(),
             self.clone(),
             &syms,
@@ -1043,24 +1046,25 @@ impl Connection {
                 // than cloning the original AST, which can overflow the stack
                 // on deeply nested expression trees.
                 drop(syms);
-                let cmd = {
+                let parsed = {
                     crate::stack::trace_stack!("schema_retry_parse");
-                    let (cmd, _) = self.parse_sql(input)?;
-                    let Some(cmd) = cmd else {
+                    let (parsed, _) = self.parse_sql(input)?;
+                    let Some(parsed) = parsed else {
                         return Err(err);
                     };
-                    cmd
+                    parsed
                 };
                 self.maybe_update_schema();
                 let syms = self.syms.read();
                 let pager = self.pager.load().clone();
-                let mode = QueryMode::new(&cmd);
+                let mode = QueryMode::new(&parsed.cmd);
                 let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) =
-                    cmd;
+                    parsed.cmd;
                 let schema = self.schema.read().clone();
                 translate::translate(
                     &schema,
                     stmt,
+                    Parameters::from_variables(&parsed.variables),
                     pager.clone(),
                     self.clone(),
                     &syms,
@@ -1155,29 +1159,45 @@ impl Connection {
     /// A frontend that already has an engine AST can call this instead of
     /// parsing through [`Dialect::parse`](crate::Dialect::parse), while the
     /// original text remains available for schema storage, diagnostics, and
-    /// later re-preparation through the dialect.
+    /// later re-preparation through the dialect. `variables` are the
+    /// parameter markers of the original text, as [`ParsedCmd`] carries them.
     pub fn prepare_translated_stmt(
         self: &Arc<Connection>,
         stmt: ast::Stmt,
+        variables: Vec<ast::Variable>,
         input: &str,
     ) -> Result<Statement> {
-        self.prepare_translated_cmd(ast::Cmd::Stmt(stmt), input)
+        self.prepare_translated_cmd(
+            ParsedCmd {
+                cmd: ast::Cmd::Stmt(stmt),
+                variables,
+            },
+            input,
+        )
     }
 
     pub fn prepare_translated_stmt_with_options(
         self: &Arc<Connection>,
         stmt: ast::Stmt,
+        variables: Vec<ast::Variable>,
         input: &str,
         prepare_options: &PrepareOptions,
     ) -> Result<Statement> {
-        self.prepare_translated_cmd_with_options(ast::Cmd::Stmt(stmt), input, prepare_options)
+        self.prepare_translated_cmd_with_options(
+            ParsedCmd {
+                cmd: ast::Cmd::Stmt(stmt),
+                variables,
+            },
+            input,
+            prepare_options,
+        )
     }
 
     /// Prepare an already-translated command while keeping the original SQL
     /// text.
     pub fn prepare_translated_cmd(
         self: &Arc<Connection>,
-        cmd: ast::Cmd,
+        cmd: ParsedCmd,
         input: &str,
     ) -> Result<Statement> {
         self.prepare_translated_cmd_with_options(cmd, input, &PrepareOptions::default())
@@ -1185,7 +1205,7 @@ impl Connection {
 
     pub fn prepare_translated_cmd_with_options(
         self: &Arc<Connection>,
-        cmd: ast::Cmd,
+        cmd: ParsedCmd,
         input: &str,
         prepare_options: &PrepareOptions,
     ) -> Result<Statement> {
@@ -1195,7 +1215,7 @@ impl Connection {
     #[turso_macros::trace_stack]
     fn prepare_cmd_with_input_and_origin(
         self: &Arc<Connection>,
-        cmd: ast::Cmd,
+        cmd: ParsedCmd,
         input: &str,
         origin: StatementOrigin,
         prepare_options: &PrepareOptions,
@@ -1828,7 +1848,7 @@ impl Connection {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub(crate) fn run_cmd(
         self: &Arc<Connection>,
-        cmd: Cmd,
+        cmd: ParsedCmd,
         input: &str,
     ) -> Result<Option<Statement>> {
         if self.is_closed() {
@@ -1890,7 +1910,7 @@ impl Connection {
         Ok(Some((stmt, byte_offset_end)))
     }
 
-    pub(crate) fn parse_sql(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
+    pub(crate) fn parse_sql(&self, sql: &str) -> Result<(Option<ParsedCmd>, usize)> {
         self.db.dialect().parse(sql)
     }
 

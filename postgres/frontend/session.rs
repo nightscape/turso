@@ -197,15 +197,21 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
     };
     for prereq in translated.prereqs {
         let input = prereq.to_string();
-        let mut stmt = pg_conn
-            .conn
-            .prepare_translated_stmt_with_options(prereq, &input, &options)?;
+        let mut stmt =
+            pg_conn
+                .conn
+                .prepare_translated_stmt_with_options(prereq, vec![], &input, &options)?;
         stmt.run_ignore_rows()?;
     }
 
-    pg_conn
-        .conn
-        .prepare_translated_cmd_with_options(translated.cmd, sql, &options)
+    pg_conn.conn.prepare_translated_cmd_with_options(
+        turso_core::ParsedCmd {
+            cmd: translated.cmd,
+            variables: translated.variables,
+        },
+        sql,
+        &options,
+    )
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {

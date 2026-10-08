@@ -23,7 +23,7 @@ impl Dialect for PostgresDialect {
         "postgres"
     }
 
-    fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
+    fn parse(&self, sql: &str) -> Result<(Option<turso_core::ParsedCmd>, usize)> {
         // Engine-generated helper statements and pragmas are canonical SQLite
         // text that pg_query rejects, so anything the PostgreSQL parser cannot
         // handle falls back to SQLite parsing.
@@ -43,9 +43,13 @@ impl Dialect for PostgresDialect {
             None => sql.len(),
         };
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
-        match translator.translate(&parse_result) {
-            Ok(stmt) => Ok((Some(turso_parser::ast::Cmd::Stmt(stmt)), consumed)),
-            Err(_) => turso_core::dialect::sqlite::parse(sql),
+        match translator.translate_with_prereqs(&parse_result) {
+            Ok(turso_pg_parser::translator::TranslateResult {
+                cmd: cmd @ turso_parser::ast::Cmd::Stmt(_),
+                variables,
+                ..
+            }) => Ok((Some(turso_core::ParsedCmd { cmd, variables }), consumed)),
+            Ok(_) | Err(_) => turso_core::dialect::sqlite::parse(sql),
         }
     }
 

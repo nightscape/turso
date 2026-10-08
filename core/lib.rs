@@ -138,7 +138,7 @@ pub use database::{
 };
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
-pub use dialect::{Dialect, SqliteDialect};
+pub use dialect::{Dialect, ParsedCmd, SqliteDialect};
 pub use error::{io_error, CompletionError, LimboError};
 pub use function::{ContextCollationFunction, DeterministicScalarFn};
 #[cfg(feature = "io_memory_yield")]

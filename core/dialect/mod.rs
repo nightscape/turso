@@ -14,6 +14,16 @@ pub mod sqlite;
 
 pub use sqlite::SqliteDialect;
 
+/// A statement parsed by a [`Dialect`], with the distinct parameter markers
+/// of its text in text order. The statement's parameter table comes from
+/// these markers, not from the compiled program, because rewrites can drop
+/// markers from the AST and SQLite still lets callers bind them.
+#[derive(Debug)]
+pub struct ParsedCmd {
+    pub cmd: turso_parser::ast::Cmd,
+    pub variables: Vec<turso_parser::ast::Variable>,
+}
+
 /// SQL dialect layered on top of the engine.
 ///
 /// Every [`crate::Database`] carries a dialect, supplied explicitly by
@@ -31,13 +41,13 @@ pub trait Dialect: Send + Sync + 'static {
 
     /// Parse the first statement in `sql` into the engine AST.
     ///
-    /// Returns the parsed command, if any, and the number of input bytes
-    /// consumed. The engine uses the same method for initial preparation and
+    /// Returns the parsed command with its parameter markers, if any, and
+    /// the number of input bytes consumed. The engine uses the same method for initial preparation and
     /// re-preparation, so dialect-specific SQL remains valid after schema or
     /// connection compilation state changes. Implementations must accept the
     /// canonical SQLite text produced by the engine AST formatter because
     /// engine-generated and AST-only statements use that representation.
-    fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)>;
+    fn parse(&self, sql: &str) -> crate::Result<(Option<ParsedCmd>, usize)>;
 
     /// Parse a `sqlite_schema` `type='table'` row's SQL into a table
     /// definition.
@@ -183,7 +193,7 @@ mod tests {
             "test"
         }
 
-        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        fn parse(&self, sql: &str) -> crate::Result<(Option<ParsedCmd>, usize)> {
             self.statement_parse_calls.fetch_add(1, Ordering::SeqCst);
             if let Some(sql) = sql.strip_prefix("test: ") {
                 let (cmd, offset) = sqlite::parse(sql)?;
@@ -280,7 +290,7 @@ mod tests {
             "strict-test"
         }
 
-        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        fn parse(&self, sql: &str) -> crate::Result<(Option<ParsedCmd>, usize)> {
             sqlite::parse(sql)
         }
 
@@ -635,7 +645,7 @@ mod tests {
                 turso_parser::ast::Cmd::Stmt(stmt) => stmt,
                 other => panic!("unexpected command: {other:?}"),
             };
-            conn.prepare_translated_stmt(stmt, input)
+            conn.prepare_translated_stmt(stmt, vec![], input)
                 .unwrap()
                 .run_ignore_rows()
                 .unwrap();
@@ -678,7 +688,7 @@ mod tests {
             "nofuncs"
         }
 
-        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        fn parse(&self, sql: &str) -> crate::Result<(Option<ParsedCmd>, usize)> {
             sqlite::parse(sql)
         }
 
