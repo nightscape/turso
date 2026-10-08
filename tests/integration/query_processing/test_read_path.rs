@@ -1142,6 +1142,109 @@ fn test_bind_in_exists_subquery(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Runs `setup` (row inserts) with SQLite, then prepares `query` in SQLite and Turso, binds
+/// `bindings` (marker text and value) by name in both, and checks that both
+/// engines report the same parameter count and return the same single TEXT
+/// column.
+fn assert_bound_query_matches_sqlite(
+    tmp_db: &TempDatabase,
+    setup: &str,
+    query: &str,
+    bindings: &[(&str, &str)],
+) -> anyhow::Result<()> {
+    let sqlite_conn = rusqlite::Connection::open(&tmp_db.path)?;
+    sqlite_conn.execute_batch(setup)?;
+    sqlite_conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    let mut sqlite_stmt = sqlite_conn.prepare(query)?;
+    for (marker, value) in bindings {
+        let index = sqlite_stmt
+            .parameter_index(marker)?
+            .unwrap_or_else(|| panic!("SQLite has no parameter {marker}"));
+        sqlite_stmt.raw_bind_parameter(index, value)?;
+    }
+    let sqlite_count = sqlite_stmt.parameter_count();
+    let mut sqlite_rows = Vec::new();
+    let mut rows = sqlite_stmt.raw_query();
+    while let Some(row) = rows.next()? {
+        sqlite_rows.push(row.get::<_, String>(0)?);
+    }
+
+    let conn = tmp_db.connect_limbo();
+    let mut stmt = conn.prepare(query)?;
+    assert_eq!(
+        stmt.parameters_count(),
+        sqlite_count,
+        "parameter count differs from SQLite for: {query}"
+    );
+    for (marker, value) in bindings {
+        let index = stmt
+            .parameter_index(marker)
+            .unwrap_or_else(|| panic!("Turso has no parameter {marker} in: {query}"));
+        // The Rust binding refuses a bind index without a slot.
+        assert!(
+            stmt.parameters().has_slot(index),
+            "parameter {marker} has no slot in: {query}"
+        );
+        stmt.bind_at(index, Value::build_text(value.to_string()))?;
+    }
+    let mut turso_rows = Vec::new();
+    stmt.run_with_row_callback(|row| {
+        turso_rows.push(row.get::<&Value>(0).unwrap().to_string());
+        Ok(())
+    })?;
+    assert_eq!(
+        turso_rows, sqlite_rows,
+        "rows differ from SQLite for: {query}"
+    );
+    Ok(())
+}
+
+const ENTITY_ROWS: &str =
+    "INSERT INTO entity VALUES ('a', NULL, NULL), ('b', NULL, 'x'), ('c', 'a', NULL)";
+
+/// `(A AND id = ?) OR A` is simplified to `A`, which removes the only `?`
+/// from the program. Binding it must still work, as in SQLite.
+#[turso_macros::test(
+    init_sql = "CREATE TABLE entity(id TEXT PRIMARY KEY, parent_id TEXT, value TEXT)"
+)]
+fn test_bind_parameter_removed_by_or_simplification(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    assert_bound_query_matches_sqlite(
+        &tmp_db,
+        ENTITY_ROWS,
+        "SELECT id FROM entity WHERE ((value IS NULL AND id = ?1) OR value IS NULL) ORDER BY id",
+        &[("?1", "b")],
+    )
+}
+
+/// A constant false WHERE term makes the planner skip every other term,
+/// including the one with `?`.
+#[turso_macros::test(
+    init_sql = "CREATE TABLE entity(id TEXT PRIMARY KEY, parent_id TEXT, value TEXT)"
+)]
+fn test_bind_parameter_removed_by_false_where_term(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    assert_bound_query_matches_sqlite(
+        &tmp_db,
+        ENTITY_ROWS,
+        "SELECT id FROM entity WHERE id = ?1 AND 0",
+        &[("?1", "a")],
+    )
+}
+
+#[turso_macros::test(
+    init_sql = "CREATE TABLE entity(id TEXT PRIMARY KEY, parent_id TEXT, value TEXT)"
+)]
+fn test_named_bind_parameter_removed_by_or_simplification(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    assert_bound_query_matches_sqlite(
+        &tmp_db,
+        ENTITY_ROWS,
+        "SELECT id FROM entity WHERE ((value IS NULL AND id = :id) OR value IS NULL) \
+         AND parent_id IS :parent ORDER BY id",
+        &[(":id", "b"), (":parent", "a")],
+    )
+}
+
 /// Column names for bound parameters must match SQLite:
 ///   bare `?` → "?", explicit `?NNN` → "?NNN", named → verbatim text.
 #[turso_macros::test(mvcc)]

@@ -9851,7 +9851,9 @@ fn parse_schema_sql_for_alter(
         }
         return Ok(Some(ast::Cmd::Stmt(stmt)));
     }
-    dialect.parse(sql).map(|(cmd, _)| cmd)
+    dialect
+        .parse(sql)
+        .map(|(parsed, _)| parsed.map(|parsed| parsed.cmd))
 }
 
 pub fn op_function(

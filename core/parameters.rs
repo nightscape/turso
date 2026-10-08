@@ -1,5 +1,6 @@
 use rustc_hash::FxHashMap as HashMap;
 use std::num::NonZero;
+use turso_parser::ast;
 
 #[derive(Clone, Debug)]
 pub enum Parameter {
@@ -55,6 +56,32 @@ impl Parameters {
             present: HashMap::default(),
             name_to_index: HashMap::default(),
             index_to_name: HashMap::default(),
+        }
+    }
+
+    /// The parameter table of a statement, from the distinct markers its
+    /// parser saw. Taking the table from the text, as SQLite does, keeps
+    /// every marker bindable when a rewrite drops it from the program.
+    pub fn from_variables(variables: &[ast::Variable]) -> Self {
+        let mut parameters = Self::new();
+        for variable in variables {
+            parameters.register(variable);
+        }
+        parameters
+    }
+
+    /// Register a parsed parameter marker and return its bind index.
+    pub fn register(&mut self, variable: &ast::Variable) -> NonZero<usize> {
+        let index = usize::try_from(variable.index.get())
+            .expect("u32 variable index must fit into usize")
+            .try_into()
+            .expect("variable index must be non-zero");
+        if let Some(name) = variable.name.as_deref() {
+            self.push_named_at(name, index)
+        } else if variable.numbered {
+            self.push_numbered(index)
+        } else {
+            self.push_index(index)
         }
     }
 
