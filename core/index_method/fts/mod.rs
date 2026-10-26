@@ -827,7 +827,7 @@ impl FtsIndexAttachment {
             let field = if is_json {
                 let options = JsonObjectOptions::default()
                     .set_indexing_options(indexing)
-                    .set_fast(None);
+                    .set_fast(tantivy::tokenizer::RAW_TOKENIZER_NAME);
                 schema_builder.add_json_field(&col.name, options)
             } else {
                 schema_builder.add_text_field(
