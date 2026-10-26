@@ -552,6 +552,7 @@ pub(super) fn synthesize_meta_json(
         .collect();
     let meta = IndexMeta {
         index_settings: IndexSettings::default(),
+        persisted_custom_extensions: Vec::new(),
         segments: metas,
         schema: schema.clone(),
         opstamp: 0,
