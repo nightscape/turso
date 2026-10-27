@@ -135,7 +135,21 @@ fn emit_group_aggregate_rows(
         .iter()
         .map(|agg| ivm_payload_width(&agg.func))
         .collect();
-    let total_payload: usize = payload_widths.iter().flatten().sum();
+    let main_payload: usize = payload_widths.iter().flatten().sum();
+    // SUM/TOTAL/AVG infinity counts follow every aggregate's main slots, so
+    // state rows written without them keep every main slot where it was.
+    let mut next_inf_counts_offset = main_payload;
+    let inf_counts_offsets: Vec<Option<usize>> = aggregates
+        .iter()
+        .map(|agg| {
+            ivm_sum_kind(&agg.func).map(|_| {
+                let this = next_inf_counts_offset;
+                next_inf_counts_offset += IVM_SUM_INF_COUNTS_WIDTH;
+                this
+            })
+        })
+        .collect();
+    let total_payload = next_inf_counts_offset;
     // Offset of each payload aggregate's slots within the payload block.
     let payload_offsets: Vec<Option<usize>> = payload_widths
         .iter()
@@ -263,6 +277,12 @@ fn emit_group_aggregate_rows(
     let incoming_group_start = program.alloc_registers(k);
     let persisted_value_start = state_rec_start + k;
     let payload_start = persisted_value_start + aggregates.len();
+    let payload_regs = |i: usize| {
+        payload_offsets[i].map(|offset| PayloadRegs {
+            main: payload_start + offset,
+            inf_counts: inf_counts_offsets[i].map(|offset| payload_start + offset),
+        })
+    };
     // Index key image: [g.., state_rowid], contiguous for IdxInsert/IdxDelete.
     // The state rowid doubles as the group's view-btree rowid (see
     // aggregate_state_table_sql).
@@ -382,8 +402,8 @@ fn emit_group_aggregate_rows(
     });
     // A fresh group's payloads start at "no rows seen yet".
     for (i, agg) in aggregates.iter().enumerate() {
-        if let Some(offset) = payload_offsets[i] {
-            emit_payload_zero_init(program, agg, payload_start + offset);
+        if let Some(regs) = payload_regs(i) {
+            emit_payload_zero_init(program, agg, regs);
         }
     }
     program.emit_insn(Insn::NewRowid {
@@ -553,8 +573,8 @@ fn emit_group_aggregate_rows(
         if !(is_minmax || is_distinct) {
             // Every remaining aggregate is linear: a row of weight w changes
             // its state by w times the row's contribution, in one step.
-            let offset = payload_offsets[i].expect("Count/Sum/Total/Avg have a payload");
-            emit_weighted_apply(program, agg, col_reg, weight_reg, payload_start + offset);
+            let regs = payload_regs(i).expect("Count/Sum/Total/Avg have a payload");
+            emit_weighted_apply(program, agg, col_reg, weight_reg, regs);
             program.preassign_label_to_next_insn(aggregate_done_label);
             continue;
         }
@@ -610,7 +630,7 @@ fn emit_group_aggregate_rows(
 
         // A DISTINCT aggregate sees one value per class: the value the class
         // shows. Retract the old one and add the new one when it changes.
-        let offset = payload_offsets[i].expect("DISTINCT aggregates have a payload");
+        let regs = payload_regs(i).expect("DISTINCT aggregates have a payload");
         if ambiguous_distinct {
             emit_shown_value(
                 program,
@@ -640,26 +660,14 @@ fn emit_group_aggregate_rows(
                 collation: None,
             });
             program.preassign_label_to_next_insn(retract_label);
-            emit_weighted_apply(
-                program,
-                agg,
-                Some(shown_before_start),
-                minus_one_reg,
-                payload_start + offset,
-            );
+            emit_weighted_apply(program, agg, Some(shown_before_start), minus_one_reg, regs);
             program.preassign_label_to_next_insn(no_before_label);
             program.emit_insn(Insn::IfNot {
                 reg: has_after_reg,
                 target_pc: aggregate_done_label,
                 jump_if_null: false,
             });
-            emit_weighted_apply(
-                program,
-                agg,
-                Some(shown_after_start),
-                plus_one_reg,
-                payload_start + offset,
-            );
+            emit_weighted_apply(program, agg, Some(shown_after_start), plus_one_reg, regs);
         } else {
             // The class has one exact value: it enters when its count leaves
             // zero and leaves when the count returns to zero.
@@ -671,13 +679,7 @@ fn emit_group_aggregate_rows(
                 flags: CmpInsFlags::default(),
                 collation: None,
             });
-            emit_weighted_apply(
-                program,
-                agg,
-                Some(col_reg),
-                plus_one_reg,
-                payload_start + offset,
-            );
+            emit_weighted_apply(program, agg, Some(col_reg), plus_one_reg, regs);
             program.preassign_label_to_next_insn(not_entering_label);
             program.emit_insn(Insn::Ne {
                 lhs: new_count_reg,
@@ -686,13 +688,7 @@ fn emit_group_aggregate_rows(
                 flags: CmpInsFlags::default(),
                 collation: None,
             });
-            emit_weighted_apply(
-                program,
-                agg,
-                Some(col_reg),
-                minus_one_reg,
-                payload_start + offset,
-            );
+            emit_weighted_apply(program, agg, Some(col_reg), minus_one_reg, regs);
         }
         program.preassign_label_to_next_insn(aggregate_done_label);
     }
@@ -866,16 +862,19 @@ fn emit_group_aggregate_rows(
                 });
                 program.preassign_label_to_next_insn(have_label);
             } else if let Some(kind) = ivm_sum_kind(&agg.func) {
-                let offset = payload_offsets[i].expect("Sum/Total/Avg have a payload");
+                let regs = payload_regs(i).expect("Sum/Total/Avg have a payload");
+                let inf_counts = regs.inf_counts.expect("Sum/Total/Avg have infinity counts");
                 program.emit_insn(Insn::IvmSumFinalize {
                     data: Box::new(IvmSumFinalizeData {
                         kind,
-                        int_wrapped_reg: payload_start + offset,
-                        int_wrap_count_reg: payload_start + offset + 1,
-                        float_sum_reg: payload_start + offset + 2,
-                        float_err_reg: payload_start + offset + 3,
-                        non_int_count_reg: payload_start + offset + 4,
-                        non_null_count_reg: payload_start + offset + 5,
+                        int_wrapped_reg: regs.main,
+                        int_wrap_count_reg: regs.main + 1,
+                        float_sum_reg: regs.main + 2,
+                        float_err_reg: regs.main + 3,
+                        non_int_count_reg: regs.main + 4,
+                        non_null_count_reg: regs.main + 5,
+                        pos_inf_count_reg: inf_counts,
+                        neg_inf_count_reg: inf_counts + 1,
                         dest_reg: value_reg,
                     }),
                 });
@@ -884,9 +883,9 @@ fn emit_group_aggregate_rows(
                     matches!(agg.func, AggFunc::Count | AggFunc::Count0),
                     "only COUNT keeps its result directly in its payload"
                 );
-                let offset = payload_offsets[i].expect("COUNT has a payload");
+                let regs = payload_regs(i).expect("COUNT has a payload");
                 program.emit_insn(Insn::Copy {
-                    src_reg: payload_start + offset,
+                    src_reg: regs.main,
                     dst_reg: value_reg,
                     extra_amount: 0,
                 });
@@ -1075,8 +1074,8 @@ fn emit_group_aggregate_rows(
             num_regs: k,
         });
         for (i, agg) in aggregates.iter().enumerate() {
-            if let Some(offset) = payload_offsets[i] {
-                emit_payload_zero_init(program, agg, payload_start + offset);
+            if let Some(regs) = payload_regs(i) {
+                emit_payload_zero_init(program, agg, regs);
             }
         }
         program.emit_insn(Insn::Null {
@@ -1159,6 +1158,28 @@ fn ivm_sum_kind(func: &AggFunc) -> Option<IvmSumKind> {
 /// float_sum, float_err, non_int_count, non_null_count (see `IvmSumData`).
 const IVM_SUM_PAYLOAD_WIDTH: usize = 6;
 
+/// Registers SUM/TOTAL/AVG's +Infinity and -Infinity counts occupy, stored
+/// after every aggregate's `ivm_payload_width` slots.
+const IVM_SUM_INF_COUNTS_WIDTH: usize = 2;
+
+/// Slot numbers, within one aggregate's own numbering, of the infinity counts
+/// named in the state table's columns; empty for aggregates without them.
+pub(super) fn ivm_inf_count_slots(func: &AggFunc) -> std::ops::Range<usize> {
+    if ivm_sum_kind(func).is_some() {
+        IVM_SUM_PAYLOAD_WIDTH..IVM_SUM_PAYLOAD_WIDTH + IVM_SUM_INF_COUNTS_WIDTH
+    } else {
+        0..0
+    }
+}
+
+/// Where one aggregate's payload slots are: its main slots, and for
+/// SUM/TOTAL/AVG its two infinity counts.
+#[derive(Clone, Copy)]
+struct PayloadRegs {
+    main: usize,
+    inf_counts: Option<usize>,
+}
+
 /// Payload width of `func`'s state in a materialized view's state table.
 /// SUM/TOTAL/AVG get IVM's own linear state instead of the width the shared
 /// window-function/regular-aggregate accumulator (`agg_payload_width`) uses,
@@ -1174,7 +1195,8 @@ pub(super) fn ivm_payload_width(func: &AggFunc) -> Option<usize> {
 /// Set `agg`'s payload registers, starting at `base`, to "no rows seen
 /// yet": a zero COUNT, or SUM/TOTAL/AVG's all-zero state (see `IvmSumData`
 /// for the field order).
-fn emit_payload_zero_init(program: &mut ProgramBuilder, agg: &Aggregate, base: usize) {
+fn emit_payload_zero_init(program: &mut ProgramBuilder, agg: &Aggregate, regs: PayloadRegs) {
+    let base = regs.main;
     if ivm_sum_kind(&agg.func).is_none() {
         turso_assert!(
             matches!(agg.func, AggFunc::Count | AggFunc::Count0),
@@ -1195,6 +1217,9 @@ fn emit_payload_zero_init(program: &mut ProgramBuilder, agg: &Aggregate, base: u
     });
     program.emit_int(0, base + 4); // non_int_count
     program.emit_int(0, base + 5); // non_null_count
+    let inf_counts = regs.inf_counts.expect("SUM/TOTAL/AVG have infinity counts");
+    program.emit_int(0, inf_counts); // pos_inf_count
+    program.emit_int(0, inf_counts + 1); // neg_inf_count
 }
 
 /// Read every payload column of the current state row into consecutive
@@ -1225,9 +1250,11 @@ fn emit_weighted_apply(
     agg: &Aggregate,
     arg_reg: Option<usize>,
     weight_reg: usize,
-    payload_start: usize,
+    regs: PayloadRegs,
 ) {
+    let payload_start = regs.main;
     if ivm_sum_kind(&agg.func).is_some() {
+        let inf_counts = regs.inf_counts.expect("SUM/TOTAL/AVG have infinity counts");
         program.emit_insn(Insn::IvmSumStep {
             data: Box::new(IvmSumData {
                 arg_reg: arg_reg.expect("SUM/TOTAL/AVG have an argument"),
@@ -1238,6 +1265,8 @@ fn emit_weighted_apply(
                 float_err_reg: payload_start + 3,
                 non_int_count_reg: payload_start + 4,
                 non_null_count_reg: payload_start + 5,
+                pos_inf_count_reg: inf_counts,
+                neg_inf_count_reg: inf_counts + 1,
             }),
         });
         return;

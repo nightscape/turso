@@ -403,6 +403,10 @@ pub enum IvmSumKind {
 ///   whether SUM's result is INTEGER or REAL.
 /// - `non_null_count`: count of live non-NULL contributions; decides the
 ///   empty-group result and AVG's divisor.
+/// - `pos_inf_count`/`neg_inf_count`: count of live +Infinity and -Infinity
+///   contributions, kept out of `float_sum` so that retracting one of them
+///   restores the sum. They are stored after every aggregate's other slots, so
+///   state rows written without them read as NULL, which means zero.
 #[derive(Debug, Clone)]
 pub struct IvmSumData {
     pub arg_reg: usize,
@@ -414,6 +418,8 @@ pub struct IvmSumData {
     pub float_err_reg: usize,
     pub non_int_count_reg: usize,
     pub non_null_count_reg: usize,
+    pub pos_inf_count_reg: usize,
+    pub neg_inf_count_reg: usize,
 }
 
 /// Data for the `IvmSumFinalize` instruction (boxed to keep Insn small): the
@@ -428,6 +434,8 @@ pub struct IvmSumFinalizeData {
     pub float_err_reg: usize,
     pub non_int_count_reg: usize,
     pub non_null_count_reg: usize,
+    pub pos_inf_count_reg: usize,
+    pub neg_inf_count_reg: usize,
     pub dest_reg: usize,
 }
 

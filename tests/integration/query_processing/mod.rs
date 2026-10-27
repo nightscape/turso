@@ -5,6 +5,8 @@ mod test_eqp_json;
 mod test_hash_join_materialization;
 mod test_in_seek;
 mod test_is_seek;
+mod test_ivm_aggregate_differential;
+mod test_ivm_sum_state_compat;
 mod test_materialized_view_commit;
 mod test_multi_index_scan;
 mod test_read_path;
