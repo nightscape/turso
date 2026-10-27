@@ -294,7 +294,8 @@ fn emit_group_aggregate_rows(
     // [g.., val, member columns..] for an ambiguous one. Also the seek
     // prefix.
     let value_member_width = 1 + member_columns_width(1);
-    let value_key_start = program.alloc_registers(k + value_member_width);
+    let value_key_start = program.alloc_registers(k + value_member_width + 1);
+    let subtype_column = k + value_member_width;
     // For a DISTINCT aggregate over an ambiguous value: the class's shown
     // member [val, member columns..] before and after the change, and whether
     // the class had a member. The member's exact record is its last column.
@@ -306,6 +307,7 @@ fn emit_group_aggregate_rows(
     let touched_group_record_reg = program.alloc_register();
     // A member's value and count while recomputing a group's result.
     let member_value_reg = program.alloc_register();
+    let member_subtype_reg = program.alloc_register();
     let member_count_reg = program.alloc_register();
 
     program.emit_int(0, zero_reg);
@@ -592,6 +594,12 @@ fn emit_group_aggregate_rows(
         });
         if value_key.ambiguous {
             emit_member_columns(program, col_reg, 1, value_key_start + k + 1);
+        }
+        if is_recomputed {
+            program.emit_insn(Insn::GetSubtype {
+                src_reg: col_reg,
+                dest_reg: value_key_start + subtype_column,
+            });
         }
         let ambiguous_distinct = is_distinct && value_key.ambiguous;
         if ambiguous_distinct {
@@ -888,6 +896,8 @@ fn emit_group_aggregate_rows(
                         group_width: k,
                         seek_start: value_key_start,
                         member_value: member_value_reg,
+                        member_subtype: member_subtype_reg,
+                        subtype_column,
                         member_count: member_count_reg,
                         result: value_reg,
                     },
@@ -1148,6 +1158,8 @@ struct RecomputeRegisters {
     group_width: usize,
     seek_start: usize,
     member_value: usize,
+    member_subtype: usize,
+    subtype_column: usize,
     member_count: usize,
     result: usize,
 }
@@ -1199,6 +1211,16 @@ fn emit_recompute_from_members(
         column: k,
         dest: registers.member_value,
         default: None,
+    });
+    program.emit_insn(Insn::Column {
+        cursor_id: index_cursor_id,
+        column: registers.subtype_column,
+        dest: registers.member_subtype,
+        default: None,
+    });
+    program.emit_insn(Insn::SetSubtype {
+        subtype_reg: registers.member_subtype,
+        dest_reg: registers.member_value,
     });
     multiset.emit_load_count(program, registers.member_count, corrupt_label);
     program.preassign_label_to_next_insn(step_loop_label);
