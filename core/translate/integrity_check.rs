@@ -718,6 +718,15 @@ fn resolved_root_pages(schema: &Schema, mv_store: Option<&crate::MvStore>) -> Ve
             root_pages.push(view_root);
         }
     }
+    for root_page in schema
+        .namespace_ids()
+        .flat_map(|namespace| schema.incompatible_materialized_view_all_index_roots(namespace))
+    {
+        let index_root = resolve_root(root_page);
+        if index_root > 0 {
+            root_pages.push(index_root);
+        }
+    }
 
     root_pages
 }
