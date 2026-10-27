@@ -9,11 +9,14 @@ use crate::schema::BTreeTable;
 use crate::sync::Arc;
 use crate::translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
 use crate::translate::emitter::Resolver;
-use crate::translate::expr::{expr_contains_nondeterministic_scalar_function, WalkControl};
+use crate::translate::expr::{
+    expr_contains_nondeterministic_scalar_function, expr_references_any_subquery, WalkControl,
+};
 use crate::translate::optimizer::unnest::rewrite_correlated_subqueries;
 use crate::translate::optimizer::{optimize_plan, Optimizable};
 use crate::translate::plan::{
-    Aggregate, JoinType, Plan, QueryDestination, SelectPlan, SubqueryState, TableReferences,
+    Aggregate, JoinType, NonFromClauseSubquery, Plan, QueryDestination, SelectPlan, SubqueryState,
+    TableReferences, WhereTerm,
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::select::prepare_select_plan;
@@ -59,7 +62,13 @@ fn validate_stream_expr(
                 .is_some_and(|published| crate::util::exprs_are_equivalent(published, e))
         });
         match e {
-            ast::Expr::Subquery(_) | ast::Expr::Exists(_) | ast::Expr::InSelect { .. } => {
+            ast::Expr::SubqueryResult { .. } if published_value => {
+                return Ok(WalkControl::SkipChildren);
+            }
+            ast::Expr::SubqueryResult { .. }
+            | ast::Expr::Subquery(_)
+            | ast::Expr::Exists(_)
+            | ast::Expr::InSelect { .. } => {
                 return Err(LimboError::ParseError(
                     "materialized views with subqueries are not yet supported".to_string(),
                 ));
@@ -245,180 +254,10 @@ fn build_select_plan_dag(
     plan: &SelectPlan,
     resolver: &Resolver,
 ) -> Result<dag::NodeId> {
-    if !plan.order_by.is_empty() {
-        return unsupported("ORDER BY");
-    }
     if plan.limit.is_some() || plan.offset.is_some() {
         return unsupported("LIMIT or OFFSET");
     }
-    if !plan.values.is_empty() {
-        return unsupported("VALUES");
-    }
-    if plan.window.is_some() {
-        return unsupported("window functions");
-    }
-    if !plan.non_from_clause_subqueries.is_empty() {
-        return unsupported("subqueries");
-    }
-
-    let joined_tables = plan.table_references.joined_tables();
-    if joined_tables.is_empty() {
-        return unsupported("SELECT without a FROM clause");
-    }
-    // The first table has no join; it behaves as the left side of the rest.
-    let join_types = joined_tables
-        .iter()
-        .map(|table| {
-            table
-                .join_info
-                .as_ref()
-                .map_or(JoinType::Inner, |join| join.join_type)
-        })
-        .collect::<Vec<_>>();
-
-    let mut inputs = Vec::with_capacity(joined_tables.len());
-    for joined in joined_tables {
-        let input = match &joined.table {
-            crate::schema::Table::BTree(table) => builder.push(dag::OpNode::Scan {
-                table: table.clone(),
-                identifier: joined.identifier.clone(),
-                logical_id: joined.internal_id,
-            })?,
-            crate::schema::Table::FromClauseSubquery(subquery) => {
-                let input = build_plan_dag_node(builder, &subquery.plan, resolver)?;
-                let table = Arc::new(synthesized_derived_table(
-                    &subquery.name,
-                    subquery.columns.clone(),
-                ));
-                builder.push(dag::OpNode::Alias {
-                    input,
-                    table,
-                    identifier: joined.identifier.clone(),
-                    logical_id: joined.internal_id,
-                })?
-            }
-            crate::schema::Table::Virtual(_) => return unsupported("virtual-table FROM sources"),
-            crate::schema::Table::RecursiveCteInput(_) => {
-                return unsupported("recursive CTE inputs")
-            }
-        };
-        inputs.push(input);
-    }
-
-    let binding_positions = joined_tables
-        .iter()
-        .enumerate()
-        .map(|(position, table)| (table.internal_id, position))
-        .collect::<FxHashMap<_, _>>();
-    // The tables whose columns the join at `step` fills with NULLs.
-    let nulls_filled_by = |step: usize| match join_types[step] {
-        JoinType::LeftOuter => step..step + 1,
-        JoinType::RightOuter => 0..step,
-        JoinType::FullOuter => 0..step + 1,
-        JoinType::Inner | JoinType::Semi | JoinType::Anti => 0..0,
-    };
-    // ON and USING terms belong to their join. A WHERE term may run below a
-    // join only if no join from there on fills one of its tables with NULLs:
-    // in `a RIGHT JOIN b ... WHERE a.x > b.y`, running the term on `a`
-    // first would let `b` rows find no match and be padded instead of
-    // being removed. Otherwise it runs after the last such join. On an inner
-    // join, running a term after it and adding it to ON are the same.
-    //
-    // The table of a semi or anti join is invisible after its join, so every
-    // term that reads it is part of that join's ON. The planner puts the
-    // EXISTS subquery's WHERE terms there when it turns the subquery into a
-    // join.
-    let mut on_by_step = vec![Vec::new(); inputs.len()];
-    let mut filters_by_step = vec![Vec::new(); inputs.len()];
-    for term in &plan.where_clause {
-        if let Some(origin) = term.origin.join_origin() {
-            let step = *binding_positions
-                .get(&origin.right_table())
-                .ok_or_else(|| {
-                    LimboError::InternalError(
-                        "join predicate belongs to a table outside the FROM clause".to_string(),
-                    )
-                })?;
-            let outer_join = matches!(
-                join_types[step],
-                JoinType::LeftOuter | JoinType::RightOuter | JoinType::FullOuter
-            );
-            if step == 0 || origin.is_outer() != outer_join {
-                return Err(LimboError::InternalError(
-                    "join predicate does not match the join that owns it".to_string(),
-                ));
-            }
-            on_by_step[step].push(term.expr.clone());
-            continue;
-        }
-        let positions = referenced_binding_positions(&term.expr, &binding_positions)?;
-        let mut step = positions.iter().copied().max().unwrap_or(0);
-        let reads_hidden_table =
-            |position: usize| matches!(join_types[position], JoinType::Semi | JoinType::Anti);
-        if positions
-            .iter()
-            .any(|position| reads_hidden_table(*position))
-        {
-            // Its table must be the last one the term reads, or a later join
-            // would need a column that is already gone.
-            if positions
-                .iter()
-                .any(|position| *position != step && reads_hidden_table(*position))
-                || !reads_hidden_table(step)
-            {
-                return Err(LimboError::InternalError(
-                    "a predicate reads a semi or anti join table outside that join".to_string(),
-                ));
-            }
-            on_by_step[step].push(term.expr.clone());
-            continue;
-        }
-        for later in step + 1..inputs.len() {
-            let nulls = nulls_filled_by(later);
-            if positions.iter().any(|position| nulls.contains(position)) {
-                step = later;
-            }
-        }
-        if step > 0 && join_types[step] == JoinType::Inner {
-            on_by_step[step].push(term.expr.clone());
-        } else {
-            filters_by_step[step].push(term.expr.clone());
-        }
-    }
-
-    let mut node = inputs[0];
-    for step in 0..inputs.len() {
-        if step > 0 {
-            let pair = [node, inputs[step]];
-            let on = std::mem::take(&mut on_by_step[step]);
-            node = match join_types[step] {
-                JoinType::Inner => builder.push(dag::OpNode::Join {
-                    inputs: pair,
-                    on,
-                    kind: dag::JoinKind::Inner,
-                })?,
-                JoinType::LeftOuter => push_outer_join(builder, pair, on, true, false)?,
-                JoinType::RightOuter => push_outer_join(builder, pair, on, false, true)?,
-                JoinType::FullOuter => push_outer_join(builder, pair, on, true, true)?,
-                JoinType::Semi => builder.push(dag::OpNode::Join {
-                    inputs: pair,
-                    on,
-                    kind: dag::JoinKind::Semi,
-                })?,
-                JoinType::Anti => builder.push(dag::OpNode::Join {
-                    inputs: pair,
-                    on,
-                    kind: dag::JoinKind::Anti,
-                })?,
-            };
-        }
-        if let Some(predicate) = combine_predicates(std::mem::take(&mut filters_by_step[step])) {
-            node = builder.push(dag::OpNode::Filter {
-                input: node,
-                predicate,
-            })?;
-        }
-    }
+    let mut node = build_joined_rows_dag(builder, plan, &plan.where_clause, resolver)?;
 
     if plan.group_by.is_some() || !plan.aggregates.is_empty() {
         let (group_exprs, group_keys, scalar) = if plan
@@ -521,6 +360,281 @@ fn build_select_plan_dag(
     }
 
     Ok(node)
+}
+
+fn build_joined_rows_dag(
+    builder: &mut dag::DagBuilder,
+    plan: &SelectPlan,
+    where_clause: &[WhereTerm],
+    resolver: &Resolver,
+) -> Result<dag::NodeId> {
+    if !plan.order_by.is_empty() {
+        return unsupported("ORDER BY");
+    }
+    if !plan.values.is_empty() {
+        return unsupported("VALUES");
+    }
+    if plan.window.is_some() {
+        return unsupported("window functions");
+    }
+
+    let joined_tables = plan.table_references.joined_tables();
+    if joined_tables.is_empty() {
+        return unsupported("SELECT without a FROM clause");
+    }
+    // The first table has no join; it behaves as the left side of the rest.
+    let join_types = joined_tables
+        .iter()
+        .map(|table| {
+            table
+                .join_info
+                .as_ref()
+                .map_or(JoinType::Inner, |join| join.join_type)
+        })
+        .collect::<Vec<_>>();
+
+    let mut inputs = Vec::with_capacity(joined_tables.len());
+    for joined in joined_tables {
+        let input = match &joined.table {
+            crate::schema::Table::BTree(table) => builder.push(dag::OpNode::Scan {
+                table: table.clone(),
+                identifier: joined.identifier.clone(),
+                logical_id: joined.internal_id,
+            })?,
+            crate::schema::Table::FromClauseSubquery(subquery) => {
+                let input = build_plan_dag_node(builder, &subquery.plan, resolver)?;
+                let table = Arc::new(synthesized_derived_table(
+                    &subquery.name,
+                    subquery.columns.clone(),
+                ));
+                builder.push(dag::OpNode::Alias {
+                    input,
+                    table,
+                    identifier: joined.identifier.clone(),
+                    logical_id: joined.internal_id,
+                })?
+            }
+            crate::schema::Table::Virtual(_) => return unsupported("virtual-table FROM sources"),
+            crate::schema::Table::RecursiveCteInput(_) => {
+                return unsupported("recursive CTE inputs")
+            }
+        };
+        inputs.push(input);
+    }
+
+    let binding_positions = joined_tables
+        .iter()
+        .enumerate()
+        .map(|(position, table)| (table.internal_id, position))
+        .collect::<FxHashMap<_, _>>();
+    // The tables whose columns the join at `step` fills with NULLs.
+    let nulls_filled_by = |step: usize| match join_types[step] {
+        JoinType::LeftOuter => step..step + 1,
+        JoinType::RightOuter => 0..step,
+        JoinType::FullOuter => 0..step + 1,
+        JoinType::Inner | JoinType::Semi | JoinType::Anti => 0..0,
+    };
+    // ON and USING terms belong to their join. A WHERE term may run below a
+    // join only if no join from there on fills one of its tables with NULLs:
+    // in `a RIGHT JOIN b ... WHERE a.x > b.y`, running the term on `a`
+    // first would let `b` rows find no match and be padded instead of
+    // being removed. Otherwise it runs after the last such join. On an inner
+    // join, running a term after it and adding it to ON are the same.
+    //
+    // The table of a semi or anti join is invisible after its join, so every
+    // term that reads it is part of that join's ON. The planner puts the
+    // EXISTS subquery's WHERE terms there when it turns the subquery into a
+    // join.
+    let mut on_by_step = vec![Vec::new(); inputs.len()];
+    let mut filters_by_step = vec![Vec::new(); inputs.len()];
+    let mut subquery_terms = Vec::new();
+    for term in where_clause {
+        if expr_references_any_subquery(&term.expr) {
+            if term.origin.join_origin().is_some() || plan.table_references.has_right_or_full_join()
+            {
+                return unsupported("subqueries in join conditions or beside RIGHT or FULL joins");
+            }
+            subquery_terms.push(term.expr.clone());
+            continue;
+        }
+        if let Some(origin) = term.origin.join_origin() {
+            let step = *binding_positions
+                .get(&origin.right_table())
+                .ok_or_else(|| {
+                    LimboError::InternalError(
+                        "join predicate belongs to a table outside the FROM clause".to_string(),
+                    )
+                })?;
+            let outer_join = matches!(
+                join_types[step],
+                JoinType::LeftOuter | JoinType::RightOuter | JoinType::FullOuter
+            );
+            if step == 0 || origin.is_outer() != outer_join {
+                return Err(LimboError::InternalError(
+                    "join predicate does not match the join that owns it".to_string(),
+                ));
+            }
+            on_by_step[step].push(term.expr.clone());
+            continue;
+        }
+        let positions = referenced_binding_positions(&term.expr, &binding_positions)?;
+        let mut step = positions.iter().copied().max().unwrap_or(0);
+        let reads_hidden_table =
+            |position: usize| matches!(join_types[position], JoinType::Semi | JoinType::Anti);
+        if positions
+            .iter()
+            .any(|position| reads_hidden_table(*position))
+        {
+            // Its table must be the last one the term reads, or a later join
+            // would need a column that is already gone.
+            if positions
+                .iter()
+                .any(|position| *position != step && reads_hidden_table(*position))
+                || !reads_hidden_table(step)
+            {
+                return Err(LimboError::InternalError(
+                    "a predicate reads a semi or anti join table outside that join".to_string(),
+                ));
+            }
+            on_by_step[step].push(term.expr.clone());
+            continue;
+        }
+        for later in step + 1..inputs.len() {
+            let nulls = nulls_filled_by(later);
+            if positions.iter().any(|position| nulls.contains(position)) {
+                step = later;
+            }
+        }
+        if step > 0 && join_types[step] == JoinType::Inner {
+            on_by_step[step].push(term.expr.clone());
+        } else {
+            filters_by_step[step].push(term.expr.clone());
+        }
+    }
+
+    let mut node = inputs[0];
+    for step in 0..inputs.len() {
+        if step > 0 {
+            let pair = [node, inputs[step]];
+            let on = std::mem::take(&mut on_by_step[step]);
+            node = match join_types[step] {
+                JoinType::Inner => builder.push(dag::OpNode::Join {
+                    inputs: pair,
+                    on,
+                    kind: dag::JoinKind::Inner,
+                })?,
+                JoinType::LeftOuter => push_outer_join(builder, pair, on, true, false)?,
+                JoinType::RightOuter => push_outer_join(builder, pair, on, false, true)?,
+                JoinType::FullOuter => push_outer_join(builder, pair, on, true, true)?,
+                JoinType::Semi => builder.push(dag::OpNode::Join {
+                    inputs: pair,
+                    on,
+                    kind: dag::JoinKind::Semi,
+                })?,
+                JoinType::Anti => builder.push(dag::OpNode::Join {
+                    inputs: pair,
+                    on,
+                    kind: dag::JoinKind::Anti,
+                })?,
+            };
+        }
+        if let Some(predicate) = combine_predicates(std::mem::take(&mut filters_by_step[step])) {
+            node = builder.push(dag::OpNode::Filter {
+                input: node,
+                predicate,
+            })?;
+        }
+    }
+
+    for subquery in &plan.non_from_clause_subqueries {
+        node = push_exists_mark(builder, node, subquery, resolver)?;
+    }
+    if let Some(predicate) = combine_predicates(subquery_terms) {
+        node = builder.push(dag::OpNode::Filter {
+            input: node,
+            predicate,
+        })?;
+    }
+    Ok(node)
+}
+
+fn push_exists_mark(
+    builder: &mut dag::DagBuilder,
+    outer: dag::NodeId,
+    subquery: &NonFromClauseSubquery,
+    resolver: &Resolver,
+) -> Result<dag::NodeId> {
+    let ast::SubqueryType::Exists { result_reg } = subquery.query_type else {
+        return unsupported("subqueries");
+    };
+    let SubqueryState::Unevaluated { plan: Some(inner) } = &subquery.state else {
+        return Err(LimboError::InternalError(
+            "a subquery was translated before the materialized view planned it".to_string(),
+        ));
+    };
+    let Plan::Select(inner) = inner.as_ref() else {
+        return unsupported("subqueries");
+    };
+    if inner.group_by.is_some() || !inner.aggregates.is_empty() {
+        return unsupported("aggregates in subqueries");
+    }
+    let stops_at_first_row = matches!(
+        inner.limit.as_deref(),
+        Some(ast::Expr::Literal(ast::Literal::Numeric(limit))) if limit == "1"
+    );
+    if !stops_at_first_row || inner.offset.is_some() {
+        return unsupported("LIMIT or OFFSET in subqueries");
+    }
+    let outer_ids = builder
+        .output_schema(outer)
+        .bindings
+        .iter()
+        .map(|binding| binding.logical_id)
+        .collect::<FxHashSet<_>>();
+    let inner_ids = inner
+        .table_references
+        .joined_tables()
+        .iter()
+        .map(|table| table.internal_id)
+        .collect::<FxHashSet<_>>();
+
+    let mut on = Vec::new();
+    let mut inner_terms = Vec::new();
+    for term in &inner.where_clause {
+        let mut reads_outer = false;
+        walk_expr_with_subqueries(&term.expr, &mut |node| {
+            if let ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } = node {
+                if !inner_ids.contains(table) {
+                    if !outer_ids.contains(table) {
+                        return unsupported(
+                            "subqueries inside subqueries that read more than the query directly around them",
+                        );
+                    }
+                    reads_outer = true;
+                }
+            }
+            Ok(WalkControl::Continue)
+        })?;
+        if !reads_outer {
+            inner_terms.push(term.clone());
+            continue;
+        }
+        if expr_references_any_subquery(&term.expr) || term.origin.is_outer_join() {
+            return unsupported(
+                "subqueries that read the outer query beside another subquery or an outer join",
+            );
+        }
+        on.push(term.expr.clone());
+    }
+    let rows = build_joined_rows_dag(builder, inner, &inner_terms, resolver)?;
+    builder.push(dag::OpNode::Join {
+        inputs: [outer, rows],
+        on,
+        kind: dag::JoinKind::Mark {
+            subquery_id: subquery.internal_id,
+            result_reg,
+        },
+    })
 }
 
 /// Build an outer join from simpler operators: the inner join, plus the
@@ -1473,7 +1587,7 @@ fn plan_node_output(
         // they keep that input's identity.
         dag::OpNode::Join {
             inputs,
-            kind: dag::JoinKind::Semi | dag::JoinKind::Anti,
+            kind: dag::JoinKind::Semi | dag::JoinKind::Anti | dag::JoinKind::Mark { .. },
             ..
         } => {
             let rows = prior_output(inputs[0])?;
@@ -1571,7 +1685,7 @@ fn node_rows_are_looked_up_by_rowid(dag: &dag::MaintenanceDag, node_id: dag::Nod
             node,
             dag::OpNode::Join {
                 inputs,
-                kind: dag::JoinKind::Semi | dag::JoinKind::Anti,
+                kind: dag::JoinKind::Semi | dag::JoinKind::Anti | dag::JoinKind::Mark { .. },
                 ..
             } if inputs[0] == node_id
         )
@@ -1763,7 +1877,7 @@ fn plan_auxiliary_tables(
             tables
         }
         dag::OpNode::Join {
-            kind: dag::JoinKind::Semi | dag::JoinKind::Anti,
+            kind: dag::JoinKind::Semi | dag::JoinKind::Anti | dag::JoinKind::Mark { .. },
             ..
         } => {
             let table_name = table_name("");

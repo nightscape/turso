@@ -739,9 +739,10 @@ pub(super) fn emit_semi_or_anti_join(
     schema: &Schema,
     connection: &Arc<Connection>,
 ) -> Result<EmittedNodeOutput> {
+    let marks_matches = kind.mark_expr().is_some();
     let keeps_matched_rows = match kind {
         dag::JoinKind::Semi => true,
-        dag::JoinKind::Anti => false,
+        dag::JoinKind::Anti | dag::JoinKind::Mark { .. } => false,
         dag::JoinKind::Inner => {
             return Err(LimboError::InternalError(
                 "an inner join has no per-row match state".to_string(),
@@ -756,7 +757,7 @@ pub(super) fn emit_semi_or_anti_join(
         output_contract.emitted_identity,
         output_contract.binding_rowids.clone(),
     )?;
-    if output.width != rows.schema.len()
+    if output.width != rows.schema.len() + usize::from(marks_matches)
         || output.identity_width() != 1
         || !matches!(
             rows.arrangement.identity_columns(),
@@ -1076,25 +1077,42 @@ pub(super) fn emit_semi_or_anti_join(
     });
     program.preassign_label_to_next_insn(has_rows);
     program.emit_int(0, new_weight_reg);
-    if keeps_matched_rows {
+    let new_flag_reg = program.alloc_register();
+    if marks_matches {
+        program.emit_int(0, new_flag_reg);
         program.emit_insn(Insn::IfNot {
             reg: matches_reg,
             target_pc: decided,
             jump_if_null: false,
         });
-    } else {
-        program.emit_insn(Insn::If {
-            reg: matches_reg,
-            target_pc: decided,
-            jump_if_null: false,
+        program.emit_int(1, new_flag_reg);
+        program.preassign_label_to_next_insn(decided);
+        program.emit_insn(Insn::Copy {
+            src_reg: present_reg,
+            dst_reg: new_weight_reg,
+            extra_amount: 0,
         });
+    } else {
+        if keeps_matched_rows {
+            program.emit_insn(Insn::IfNot {
+                reg: matches_reg,
+                target_pc: decided,
+                jump_if_null: false,
+            });
+        } else {
+            program.emit_insn(Insn::If {
+                reg: matches_reg,
+                target_pc: decided,
+                jump_if_null: false,
+            });
+        }
+        program.emit_insn(Insn::Copy {
+            src_reg: present_reg,
+            dst_reg: new_weight_reg,
+            extra_amount: 0,
+        });
+        program.preassign_label_to_next_insn(decided);
     }
-    program.emit_insn(Insn::Copy {
-        src_reg: present_reg,
-        dst_reg: new_weight_reg,
-        extra_amount: 0,
-    });
-    program.preassign_label_to_next_insn(decided);
     // Republish when the weight changes, or when the row's own delta may have
     // changed its values while it stays in the output.
     program.emit_insn(Insn::Ne {
@@ -1104,6 +1122,20 @@ pub(super) fn emit_semi_or_anti_join(
         flags: CmpInsFlags::default(),
         collation: None,
     });
+    if marks_matches {
+        program.emit_insn(Insn::IfNot {
+            reg: new_weight_reg,
+            target_pc: store,
+            jump_if_null: false,
+        });
+        program.emit_insn(Insn::Ne {
+            lhs: new_flag_reg,
+            rhs: image_start + rows.schema.len(),
+            target_pc: publish,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+    }
     program.emit_insn(Insn::IfNot {
         reg: own_delta_reg,
         target_pc: store,
@@ -1147,6 +1179,13 @@ pub(super) fn emit_semi_or_anti_join(
     });
     for (column, physical_column) in rows.arrangement.value_columns().iter().enumerate() {
         program.emit_column_or_rowid(rows_cursor, *physical_column, image_start + column);
+    }
+    if marks_matches {
+        program.emit_insn(Insn::Copy {
+            src_reg: new_flag_reg,
+            dst_reg: image_start + rows.schema.len(),
+            extra_amount: 0,
+        });
     }
     for (binding, reg) in image_binding_rowid_regs.iter().enumerate() {
         if let Some(reg) = reg {

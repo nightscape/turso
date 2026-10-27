@@ -1742,15 +1742,6 @@ expect error {
     materialized views with subqueries are not yet supported
 }
 
-test matview-vdbe-exists-under-or-rejected {
-    CREATE TABLE so(id INTEGER PRIMARY KEY, k INTEGER);
-    CREATE TABLE si(id INTEGER PRIMARY KEY, k INTEGER);
-    CREATE MATERIALIZED VIEW r AS SELECT id FROM so WHERE EXISTS (SELECT 1 FROM si WHERE si.k = so.k) OR id = 3;
-}
-expect error {
-    materialized views with subqueries are not yet supported
-}
-
 test matview-vdbe-join-right-using {
     CREATE TABLE jl6u(x INTEGER);
     CREATE TABLE jr6u(x INTEGER);
