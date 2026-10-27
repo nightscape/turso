@@ -30,6 +30,7 @@ dist/
 .tmp/
 
 *.db
+!tests/integration/**/fixtures/*.db
 **/*.db-wal
 **/*.db-shm
 **/*-wal
