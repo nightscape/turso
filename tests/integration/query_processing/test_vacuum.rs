@@ -5043,6 +5043,44 @@ fn test_vacuum_into_preserves_materialized_views(tmp_db: TempDatabase) -> anyhow
     Ok(())
 }
 
+/// An index on a materialized view is replayed after its view, and reads
+/// through it still equal reads that scan the view.
+#[turso_macros::test(views)]
+fn test_vacuum_keeps_an_index_on_a_materialized_view(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    create_materialized_view_fixture(&conn)?;
+    conn.execute("CREATE INDEX idx_vg_n ON vg(n)")?;
+    conn.execute("CREATE INDEX idx_v_b ON v(b)")?;
+    conn.execute("VACUUM")?;
+
+    assert_eq!(run_integrity_check(&conn), "ok");
+    let indexes: Vec<(String,)> = conn.exec_rows(
+        "SELECT name FROM sqlite_schema WHERE type = 'index' AND name LIKE 'idx_%' ORDER BY name",
+    );
+    assert_eq!(
+        indexes,
+        vec![("idx_v_b".to_string(),), ("idx_vg_n".to_string(),)]
+    );
+    conn.execute("INSERT INTO t VALUES (1000, 2, 999)")?;
+    for (indexed, scanned) in [
+        (
+            "SELECT g, n FROM vg WHERE n > 40 ORDER BY g",
+            "SELECT g, n FROM vg NOT INDEXED WHERE n > 40 ORDER BY g",
+        ),
+        (
+            "SELECT a, b FROM v WHERE b = 999",
+            "SELECT a, b FROM v NOT INDEXED WHERE b = 999",
+        ),
+    ] {
+        let via_index: Vec<(i64, i64)> = conn.exec_rows(indexed);
+        let via_scan: Vec<(i64, i64)> = conn.exec_rows(scanned);
+        assert!(!via_scan.is_empty());
+        assert_eq!(via_index, via_scan);
+    }
+    assert_eq!(run_integrity_check(&conn), "ok");
+    Ok(())
+}
+
 fn create_materialized_view_fixture(conn: &Arc<Connection>) -> anyhow::Result<()> {
     conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, g INTEGER, b INTEGER)")?;
     conn.execute("CREATE TABLE u(k INTEGER PRIMARY KEY, n INTEGER)")?;
