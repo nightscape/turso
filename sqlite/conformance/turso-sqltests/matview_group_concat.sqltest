@@ -1,0 +1,159 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
+
+# group_concat has no inverse, so a view keeps every value of each group and
+# builds the text again after a change, in value order. A fresh SELECT lists
+# the parts in the order of its scan, so the verifier compares these columns
+# by their parts only.
+
+test matview-group-concat-default-separator {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, v);
+    CREATE MATERIALIZED VIEW mv AS SELECT g, group_concat(v) AS c FROM t GROUP BY g;
+    INSERT INTO t VALUES (1,1,'b'),(2,1,'a'),(3,1,'b'),(4,2,'z');
+    SELECT * FROM mv ORDER BY g;
+    DELETE FROM t WHERE id = 1;
+    SELECT * FROM mv ORDER BY g;
+    UPDATE t SET g = 2 WHERE id = 2;
+    SELECT * FROM mv ORDER BY g;
+}
+expect {
+    1|a,b,b
+    2|z
+    1|a,b
+    2|z
+    1|b
+    2|a,z
+}
+
+test matview-group-concat-separator {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, v);
+    CREATE MATERIALIZED VIEW mv AS
+      SELECT g, group_concat(v, ' | ') AS spaced FROM t GROUP BY g;
+    INSERT INTO t VALUES (1,1,'b'),(2,1,'a'),(3,1,'c');
+    SELECT * FROM mv;
+    DELETE FROM t WHERE id = 2;
+    SELECT * FROM mv;
+}
+expect {
+    1|a | b | c
+    1|b | c
+}
+
+test matview-group-concat-separator-from-a-constant-expression {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, v);
+    CREATE MATERIALIZED VIEW mv AS
+      SELECT g, group_concat(v, 'x' || 'y') AS c FROM t GROUP BY g;
+    INSERT INTO t VALUES (1,1,'a'),(2,1,'b'),(3,1,'c');
+    SELECT * FROM mv;
+    DELETE FROM t WHERE id = 2;
+    SELECT * FROM mv;
+}
+expect {
+    1|axybxyc
+    1|axyc
+}
+
+test matview-group-concat-skips-null {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, v);
+    CREATE MATERIALIZED VIEW mv AS SELECT g, group_concat(v) AS c FROM t GROUP BY g;
+    INSERT INTO t VALUES (1,1,NULL),(2,1,'a'),(3,1,NULL),(4,2,NULL);
+    SELECT g, c IS NULL, c FROM mv ORDER BY g;
+    DELETE FROM t WHERE id = 2;
+    SELECT g, c IS NULL, c FROM mv ORDER BY g;
+}
+expect {
+    1|0|a
+    2|1|
+    1|1|
+    2|1|
+}
+
+test matview-group-concat-integer-and-real-are-two-parts {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, v);
+    CREATE MATERIALIZED VIEW mv AS SELECT g, group_concat(v, ';') AS c FROM t GROUP BY g;
+    INSERT INTO t VALUES (1,1,1),(2,1,1.0),(3,1,2);
+    SELECT c FROM mv;
+    DELETE FROM t WHERE id = 1;
+    SELECT c FROM mv;
+}
+expect {
+    1;1.0;2
+    1.0;2
+}
+
+test matview-group-concat-filter-leaves-group-empty {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, v INTEGER);
+    CREATE MATERIALIZED VIEW mv AS
+      SELECT g, group_concat(v) FILTER (WHERE v > 5) AS big, count(*) AS n FROM t GROUP BY g;
+    INSERT INTO t VALUES (1,1,3),(2,1,9),(3,2,4);
+    SELECT g, big, n FROM mv ORDER BY g;
+    DELETE FROM t WHERE id = 2;
+    SELECT g, big IS NULL, n FROM mv ORDER BY g;
+}
+expect {
+    1|9|2
+    2||1
+    1|1|1
+    2|1|1
+}
+
+test matview-group-concat-scalar {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v);
+    CREATE MATERIALIZED VIEW mv AS SELECT group_concat(v, ';') AS c FROM t;
+    SELECT c IS NULL FROM mv;
+    INSERT INTO t VALUES (1,'b'),(2,'a');
+    SELECT c FROM mv;
+    DELETE FROM t;
+    SELECT c IS NULL FROM mv;
+}
+expect {
+    1
+    a;b
+    1
+}
+
+test matview-group-concat-distinct {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, v);
+    CREATE MATERIALIZED VIEW mv AS
+      SELECT g, group_concat(DISTINCT v) AS c FROM t GROUP BY g;
+    INSERT INTO t VALUES (1,1,'b'),(2,1,'a'),(3,1,'b'),(4,2,1),(5,2,1.0),(6,2,2);
+    SELECT * FROM mv ORDER BY g;
+    DELETE FROM t WHERE id = 1;
+    SELECT * FROM mv ORDER BY g;
+    DELETE FROM t WHERE id = 3;
+    SELECT * FROM mv ORDER BY g;
+}
+expect {
+    1|a,b
+    2|1,2
+    1|a,b
+    2|1,2
+    1|a
+    2|1,2
+}
+
+test matview-group-concat-refuses-separator-from-a-column {
+    CREATE TABLE t(g INTEGER, v TEXT, sep TEXT);
+    CREATE MATERIALIZED VIEW mv AS SELECT g, group_concat(v, sep) FROM t GROUP BY g;
+}
+expect error {
+    materialized views with a group_concat separator that is not constant are not yet supported
+}
+
+test matview-group-concat-refuses-changing-separator {
+    CREATE TABLE t(g INTEGER, v TEXT);
+    CREATE MATERIALIZED VIEW mv AS SELECT g, group_concat(v, CURRENT_TIMESTAMP) FROM t GROUP BY g;
+}
+expect error {
+    materialized views with a group_concat separator that is not constant are not yet supported
+}
+
+test matview-string-agg-stays-refused {
+    CREATE TABLE t(g INTEGER, v TEXT);
+    CREATE MATERIALIZED VIEW mv AS SELECT g, string_agg(v, ',') FROM t GROUP BY g;
+}
+expect error {
+    materialized views with the string_agg aggregate are not yet supported
+}
