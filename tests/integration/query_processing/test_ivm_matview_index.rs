@@ -498,3 +498,55 @@ fn dropping_a_view_index_leaves_the_view_maintained(tmp_db: TempDatabase) -> any
     );
     Ok(())
 }
+
+/// A view whose storage version is not this build's is kept out of the schema,
+/// and its index must not make the database fail to open. DROP VIEW frees the
+/// index with the rest.
+#[test]
+fn an_index_on_an_incompatible_view_does_not_block_open() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::builder().with_views(true).build();
+    let path = tmp_db.path.clone();
+    {
+        let conn = tmp_db.connect_limbo();
+        setup(&conn)?;
+    }
+    drop(tmp_db);
+
+    let sqlite = rusqlite::Connection::open(&path)?;
+    sqlite.pragma_update(None, "writable_schema", "ON")?;
+    let renamed = sqlite.execute(
+        "UPDATE sqlite_schema SET name = replace(name, 'metadata_v2_', 'metadata_v1_'), \
+         tbl_name = replace(tbl_name, 'metadata_v2_', 'metadata_v1_'), \
+         sql = replace(sql, 'metadata_v2_', 'metadata_v1_') \
+         WHERE name LIKE '%dbsp_metadata_v2_v'",
+        [],
+    )?;
+    assert_eq!(renamed, 1, "the fixture must have one version marker");
+    drop(sqlite);
+
+    let reopened = TempDatabase::builder()
+        .with_db_path(&path)
+        .with_views(true)
+        .build();
+    let conn = reopened.connect_limbo();
+    let err = conn.execute("SELECT * FROM v").unwrap_err();
+    assert!(err.to_string().contains("incompatible"), "{err}");
+    assert_eq!(
+        limbo_exec_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::Text("ok".to_string())]]
+    );
+
+    conn.execute("DROP VIEW v")?;
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT count(*) FROM sqlite_schema WHERE name = 'idx_v_id'"
+        ),
+        vec![vec![Value::Integer(0)]]
+    );
+    assert_eq!(
+        limbo_exec_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::Text("ok".to_string())]]
+    );
+    Ok(())
+}
