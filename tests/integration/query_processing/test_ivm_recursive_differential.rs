@@ -49,6 +49,44 @@ const SHAPES: &[Shape] = &[
              FROM subtree JOIN node d ON d.id = subtree.node_id",
     },
     Shape {
+        name: "focus",
+        select: "WITH RECURSIVE subtree(watch_key, node_id, depth, visited) AS ( \
+             SELECT wc.watch_key, b.id, 0, CAST(b.id AS TEXT) \
+             FROM focus wc JOIN node b ON b.id = wc.context_id \
+             WHERE wc.kind = 'root' \
+             UNION ALL \
+             SELECT subtree.watch_key, child.id, subtree.depth + 1, \
+                    subtree.visited || ',' || CAST(child.id AS TEXT) \
+             FROM subtree JOIN node child ON child.parent = subtree.node_id \
+             LEFT JOIN tag pt ON pt.block_id = subtree.node_id AND pt.tag = 'Page' \
+             WHERE subtree.depth < 20 \
+               AND ',' || subtree.visited || ',' NOT LIKE '%,' || CAST(child.id AS TEXT) || ',%' \
+               AND (subtree.depth = 0 OR pt.block_id IS NULL)) \
+             SELECT d.*, subtree.watch_key AS watch_key, subtree.depth AS depth \
+             FROM subtree JOIN node d ON d.id = subtree.node_id",
+    },
+    Shape {
+        name: "page_stop",
+        select: "WITH RECURSIVE fd AS ( \
+             SELECT b.*, 0 AS _depth FROM focus fr JOIN node b ON b.id = fr.context_id \
+             WHERE fr.kind = 'root' \
+             UNION ALL \
+             SELECT child.*, fd._depth + 1 FROM fd JOIN node child ON child.parent = fd.id \
+             LEFT JOIN tag bt ON bt.block_id = fd.id AND bt.tag = 'Page' \
+             WHERE fd._depth < 20 AND (fd._depth = 0 OR bt.block_id IS NULL)) \
+             SELECT * FROM fd",
+    },
+    Shape {
+        name: "not_exists",
+        select: "WITH RECURSIVE s(id, depth) AS ( \
+             SELECT context_id, 0 FROM focus WHERE kind = 'root' \
+             UNION ALL \
+             SELECT n.id, s.depth + 1 FROM s JOIN node n ON n.parent = s.id \
+             WHERE s.depth < 20 \
+               AND NOT EXISTS (SELECT 1 FROM tag t WHERE t.block_id = n.id AND t.tag = 'Page')) \
+             SELECT * FROM s",
+    },
+    Shape {
         name: "undirected",
         select: "WITH RECURSIVE w(src, node_id, depth, visited) AS ( \
              SELECT id, id, 0, ',' || id || ',' FROM node WHERE label = 'a' \
