@@ -1783,6 +1783,11 @@ fn state_table_sql(state_table_name: &str, node: &dag::OpNode) -> Result<String>
                     }
                 }
             }
+            for (i, agg) in aggregates.iter().enumerate() {
+                for j in super::aggregate::ivm_inf_count_slots(&agg.func) {
+                    columns.push(format!("a{i}_{j}"));
+                }
+            }
             let key: Vec<String> = (0..group_exprs.len()).map(|i| format!("g{i}")).collect();
             Ok(format!(
                 "CREATE TABLE {state_table_ident} ({}, PRIMARY KEY ({}))",
