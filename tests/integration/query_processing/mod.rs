@@ -33,8 +33,18 @@ mod test_schema_updated;
 mod test_subquery_unnesting;
 mod test_transactions;
 
+mod test_ivm_agg_matview_stale_group_on_delete;
+mod test_ivm_aggregate_filter;
+mod test_ivm_array_aggregation;
+mod test_ivm_block_matview_drift;
+mod test_ivm_chained_agg_reopen_reseed_dup;
 mod test_ivm_chained_population_in_transaction;
+mod test_ivm_json_group_array_multiset_negative;
+mod test_ivm_left_join;
+mod test_ivm_left_join_aggregate_duplicate;
+mod test_ivm_matview_first_open_partial;
 mod test_ivm_refresh;
 mod test_ivm_refresh_dependent_matview;
 mod test_ivm_refresh_in_transaction;
 mod test_ivm_refresh_state_index_orphan;
+mod test_match_counter_uninitialized_repro;
