@@ -39,6 +39,7 @@ mod test_ivm_matview_index_overlay_fork;
 mod test_ivm_matview_index_reads;
 mod test_ivm_matview_index_txn;
 mod test_ivm_matview_index_types;
+mod test_ivm_recursive_antijoin_reparent_dup;
 mod test_ivm_recursive_bulk_insert;
 mod test_ivm_recursive_differential;
 mod test_ivm_recursive_nonconvergence;

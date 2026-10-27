@@ -85,16 +85,127 @@ expect error {
     materialized views with recursive CTEs that use UNION are not yet supported
 }
 
-test matview-recursive-cte-with-left-join-is-refused {
-    CREATE TABLE node (id TEXT PRIMARY KEY, pid TEXT);
-    CREATE TABLE tag (id TEXT, tag TEXT);
-    CREATE MATERIALIZED VIEW v_tagged AS
-      WITH RECURSIVE tree AS (
-        SELECT id, NULL AS tag FROM node WHERE pid = 'root'
+test matview-recursive-cte-on-the-null-side-of-a-left-join-is-refused {
+    CREATE TABLE node (id INTEGER PRIMARY KEY, parent INTEGER);
+    INSERT INTO node VALUES (1, NULL), (2, 1), (3, 2), (4, 1);
+    CREATE MATERIALIZED VIEW v AS
+      WITH RECURSIVE t(id) AS (
+        SELECT id FROM node WHERE parent IS NULL
         UNION ALL
-        SELECT c.id, t.tag FROM tree p JOIN node c ON c.pid = p.id LEFT JOIN tag t ON t.id = c.id
-      ) SELECT id, tag FROM tree;
+        SELECT n.id FROM node n LEFT JOIN t ON n.parent = t.id
+        WHERE t.id IS NOT NULL AND n.id > 0
+      ) SELECT id FROM t;
 }
 expect error {
-    materialized views with outer joins or subqueries in a recursive CTE are not yet supported
+    materialized views with recursive CTEs on the NULL side of a LEFT JOIN or inside EXISTS or NOT EXISTS are not yet supported
+}
+
+test matview-recursive-cte-focus-subtree-stops-below-page-tags {
+    CREATE TABLE block (id TEXT PRIMARY KEY, parent_id TEXT);
+    CREATE TABLE block_tags (block_id TEXT, tag TEXT);
+    CREATE TABLE watch_context (watch_key TEXT, context_id TEXT, kind TEXT);
+    INSERT INTO block VALUES ('r', NULL), ('a', 'r'), ('b', 'a'), ('c', 'b');
+    INSERT INTO watch_context VALUES ('k', 'r', 'root');
+    CREATE MATERIALIZED VIEW v_focus AS
+      WITH RECURSIVE subtree(watch_key, node_id, depth, visited) AS (
+        SELECT wc.watch_key, b.id, 0, CAST(b.id AS TEXT)
+        FROM watch_context wc JOIN block b ON b.id = wc.context_id
+        WHERE wc.kind = 'root'
+        UNION ALL
+        SELECT subtree.watch_key, child.id, subtree.depth + 1,
+               subtree.visited || ',' || CAST(child.id AS TEXT)
+        FROM subtree
+        JOIN block child ON child.parent_id = subtree.node_id
+        LEFT JOIN block_tags pt ON pt.block_id = subtree.node_id AND pt.tag = 'Page'
+        WHERE subtree.depth < 20
+          AND ',' || subtree.visited || ',' NOT LIKE '%,' || CAST(child.id AS TEXT) || ',%'
+          AND (subtree.depth = 0 OR pt.block_id IS NULL)
+      ) SELECT node_id, depth FROM subtree;
+    INSERT INTO block_tags VALUES ('r', 'Page');
+    SELECT 'root page', node_id, depth FROM v_focus ORDER BY 2;
+    INSERT INTO block_tags VALUES ('a', 'Page');
+    SELECT 'depth 1 page', node_id, depth FROM v_focus ORDER BY 2;
+    DELETE FROM block_tags WHERE block_id = 'a';
+    INSERT INTO block_tags VALUES ('b', 'Page');
+    SELECT 'depth 2 page', node_id, depth FROM v_focus ORDER BY 2;
+    DELETE FROM block_tags WHERE block_id = 'b';
+    SELECT 'no page below root', node_id, depth FROM v_focus ORDER BY 2;
+}
+expect {
+    root page|a|1
+    root page|b|2
+    root page|c|3
+    root page|r|0
+    depth 1 page|a|1
+    depth 1 page|r|0
+    depth 2 page|a|1
+    depth 2 page|b|2
+    depth 2 page|r|0
+    no page below root|a|1
+    no page below root|b|2
+    no page below root|c|3
+    no page below root|r|0
+}
+
+test matview-recursive-cte-focus-descendants-stop-below-page-tags {
+    CREATE TABLE block (id TEXT PRIMARY KEY, parent_id TEXT, sort_key TEXT);
+    CREATE TABLE block_tags (block_id TEXT, tag TEXT);
+    CREATE TABLE focus_roots (region TEXT, root_id TEXT);
+    INSERT INTO block VALUES ('r', NULL, 'a0'), ('a', 'r', 'a1'), ('b', 'a', 'a2'), ('c', 'b', 'a3');
+    INSERT INTO focus_roots VALUES ('main', 'r');
+    CREATE MATERIALIZED VIEW v_desc AS
+      WITH RECURSIVE focus_descendants AS (
+        SELECT b.*, 0 AS _depth
+        FROM focus_roots fr
+        JOIN block b ON b.id = fr.root_id
+        WHERE fr.region = 'main'
+        UNION ALL
+        SELECT child.*, fd._depth + 1
+        FROM focus_descendants fd
+        JOIN block child ON child.parent_id = fd.id
+        LEFT JOIN block_tags bt ON bt.block_id = fd.id AND bt.tag = 'Page'
+        WHERE fd._depth = 0 OR bt.block_id IS NULL
+      ) SELECT * FROM focus_descendants;
+    INSERT INTO block_tags VALUES ('a', 'Page');
+    SELECT 'depth 1 page', id, _depth FROM v_desc ORDER BY 2;
+    INSERT INTO block_tags VALUES ('b', 'Page');
+    DELETE FROM block_tags WHERE block_id = 'a';
+    SELECT 'depth 2 page', id, _depth FROM v_desc ORDER BY 2;
+    DELETE FROM block_tags WHERE block_id = 'b';
+    SELECT 'no page', id, _depth FROM v_desc ORDER BY 2;
+}
+expect {
+    depth 1 page|a|1
+    depth 1 page|r|0
+    depth 2 page|a|1
+    depth 2 page|b|2
+    depth 2 page|r|0
+    no page|a|1
+    no page|b|2
+    no page|c|3
+    no page|r|0
+}
+
+test matview-recursive-cte-left-join-breaks-a-cycle-at-the-root {
+    CREATE TABLE node (id INTEGER PRIMARY KEY, parent INTEGER, label TEXT);
+    CREATE TABLE tag (block_id INTEGER, tag TEXT);
+    CREATE TABLE focus (watch_key TEXT, context_id INTEGER, kind TEXT);
+    INSERT INTO node VALUES (5, 1, 'b'), (1, 5, 'b');
+    INSERT INTO focus VALUES ('k', 5, 'root');
+    CREATE MATERIALIZED VIEW v AS
+      WITH RECURSIVE fd AS (
+        SELECT b.*, 0 AS _depth FROM focus fr JOIN node b ON b.id = fr.context_id
+        UNION ALL
+        SELECT child.*, fd._depth + 1
+        FROM fd
+        JOIN node child ON child.parent = fd.id
+        LEFT JOIN tag bt ON bt.block_id = fd.id
+        WHERE fd._depth < 2 AND (fd._depth = 0 OR bt.block_id IS NULL)
+      ) SELECT * FROM fd;
+    UPDATE node SET parent = 2 WHERE id = 5;
+    SELECT id, parent, _depth FROM v ORDER BY 3;
+}
+expect {
+    5|2|0
+    1|5|1
 }
