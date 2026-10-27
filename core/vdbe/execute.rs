@@ -5766,6 +5766,7 @@ pub fn op_savepoint(
                         temp_schema_snapshot,
                         staged_schema_snapshot,
                         hooks_memo: conn.hooks().map(|hooks| hooks.savepoint_created(&conn)),
+                        staged_row_changes_len: conn.staged_row_changes_len(),
                     };
                     // Mirror onto attached/temp pagers. If any pager fails
                     // mid-flight, earlier ones already opened a savepoint
@@ -5892,6 +5893,7 @@ pub fn op_savepoint(
             // consistent across tables / indexes / sequences without any
             // I/O.
             if let Some(info) = frame_info {
+                conn.truncate_staged_row_changes(info.staged_row_changes_len);
                 *conn.schema.write() = info.main_schema_snapshot;
                 if let Some(temp_db) = conn.temp.database.read().as_ref() {
                     match info.temp_schema_snapshot {

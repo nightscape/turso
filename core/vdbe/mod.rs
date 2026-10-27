@@ -153,12 +153,12 @@ pub(crate) fn step_view_delta_batch(
     loop {
         match state {
             ViewDeltaApplyState::NotStarted => {
-                if connection.transaction_changes.is_empty() {
+                if rollback {
+                    connection.discard_transaction_changes();
                     return Ok(IOResult::Done(()));
                 }
 
-                if rollback {
-                    connection.transaction_changes.clear();
+                if connection.transaction_changes.is_empty() {
                     return Ok(IOResult::Done(()));
                 }
 
@@ -3625,9 +3625,7 @@ impl Program {
                 // writer's view changes too, so the change log stays empty
                 // while no write statement runs (see
                 // `maintain_views_for_kept_changes`).
-                if !self.connection.transaction_changes.is_empty() {
-                    self.connection.transaction_changes.clear();
-                }
+                self.connection.discard_transaction_changes();
             }
 
             let can_autocommit_now = state.can_autocommit_now(&self.connection, self_counted);
