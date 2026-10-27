@@ -2521,7 +2521,7 @@ fn extract_view_columns_inner(
                     .map(|alias| alias.name().as_str().to_string())
                     .or_else(|| extract_column_name_from_expr(expr))
                     .unwrap_or_else(|| expr.to_string());
-                let mut column = view_result_column(expr, &sources);
+                let mut column = view_result_column(expr, &sources, schema, &ctes)?;
                 column.column.name = Some(name);
                 deduplicate_view_column_name(&mut column, &mut column_name_counts);
                 columns.push(column);
@@ -2598,13 +2598,18 @@ pub(crate) fn select_table_column_names(
         .collect())
 }
 
-fn view_result_column(expr: &ast::Expr, sources: &[ViewSource]) -> ViewColumn {
-    if let Some(column) = view_referenced_column(expr, sources) {
-        return column;
+fn view_result_column(
+    expr: &ast::Expr,
+    sources: &[ViewSource],
+    schema: &Schema,
+    ctes: &HashMap<String, ViewColumnSchema>,
+) -> Result<ViewColumn> {
+    if let Some(column) = view_referenced_column(expr, sources, schema, ctes)? {
+        return Ok(column);
     }
-    let ty_str = view_affinity_type_name(view_expression_affinity(expr, sources));
+    let ty_str = view_affinity_type_name(view_expression_affinity(expr, sources, schema, ctes)?);
     let (ty, _) = type_from_name(ty_str);
-    ViewColumn {
+    Ok(ViewColumn {
         table_index: usize::MAX,
         column: Column::new(
             None,
@@ -2615,15 +2620,21 @@ fn view_result_column(expr: &ast::Expr, sources: &[ViewSource]) -> ViewColumn {
             None,
             ColDef::default(),
         ),
-    }
+    })
 }
 
-fn view_referenced_column(expr: &ast::Expr, sources: &[ViewSource]) -> Option<ViewColumn> {
-    match expr {
+fn view_referenced_column(
+    expr: &ast::Expr,
+    sources: &[ViewSource],
+    schema: &Schema,
+    ctes: &HashMap<String, ViewColumnSchema>,
+) -> Result<Option<ViewColumn>> {
+    Ok(match expr {
         ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            view_referenced_column(&exprs[0], sources)
+            view_referenced_column(&exprs[0], sources, schema, ctes)?
         }
-        ast::Expr::Id(column_name) => resolve_view_column(sources, column_name.as_str()),
+        ast::Expr::Id(column_name) => resolve_view_column(sources, column_name.as_str())
+            .or_else(|| view_rowid_column(column_name.as_str())),
         ast::Expr::Qualified(qualifier, column_name) => sources
             .iter()
             .find(|source| {
@@ -2633,30 +2644,90 @@ fn view_referenced_column(expr: &ast::Expr, sources: &[ViewSource]) -> Option<Vi
                     .any(|candidate| candidate.eq_ignore_ascii_case(qualifier.as_str()))
             })
             .and_then(|source| {
-                source.columns.iter().find(|column| {
-                    view_column_name(column).is_some_and(|candidate| {
-                        candidate.eq_ignore_ascii_case(column_name.as_str())
+                source
+                    .columns
+                    .iter()
+                    .find(|column| {
+                        view_column_name(column).is_some_and(|candidate| {
+                            candidate.eq_ignore_ascii_case(column_name.as_str())
+                        })
                     })
-                })
-            })
-            .map(view_output_column),
+                    .map(view_output_column)
+                    .or_else(|| view_rowid_column(column_name.as_str()))
+            }),
+        ast::Expr::Subquery(select) => view_subquery_column(select, sources, schema, ctes)?,
         _ => None,
-    }
+    })
 }
 
-fn view_expression_affinity(expr: &ast::Expr, sources: &[ViewSource]) -> Affinity {
-    match expr {
+fn view_rowid_column(column_name: &str) -> Option<ViewColumn> {
+    ["rowid", "_rowid_", "oid"]
+        .iter()
+        .any(|rowid_name| rowid_name.eq_ignore_ascii_case(column_name))
+        .then(|| ViewColumn {
+            table_index: usize::MAX,
+            column: Column::new(
+                None,
+                "INTEGER".to_string(),
+                None,
+                None,
+                Type::Integer,
+                None,
+                ColDef::default(),
+            ),
+        })
+}
+
+fn view_subquery_column(
+    select: &ast::Select,
+    outer_sources: &[ViewSource],
+    schema: &Schema,
+    outer_ctes: &HashMap<String, ViewColumnSchema>,
+) -> Result<Option<ViewColumn>> {
+    let ctes = extract_cte_columns(&select.with, schema, outer_ctes)?;
+    let ast::OneSelect::Select {
+        from,
+        columns: select_columns,
+        ..
+    } = &select.body.select
+    else {
+        return Ok(None);
+    };
+    let Some(ast::ResultColumn::Expr(expr, _)) = select_columns.first() else {
+        return Ok(None);
+    };
+    let mut sources = match from {
+        Some(from) => view_sources_from_clause(from, schema, &ctes, &mut Vec::new())?,
+        None => Vec::new(),
+    };
+    sources.extend_from_slice(outer_sources);
+    Ok(
+        view_referenced_column(expr, &sources, schema, &ctes)?.map(|column| ViewColumn {
+            table_index: usize::MAX,
+            ..column
+        }),
+    )
+}
+
+fn view_expression_affinity(
+    expr: &ast::Expr,
+    sources: &[ViewSource],
+    schema: &Schema,
+    ctes: &HashMap<String, ViewColumnSchema>,
+) -> Result<Affinity> {
+    Ok(match expr {
         ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            view_expression_affinity(&exprs[0], sources)
+            view_expression_affinity(&exprs[0], sources, schema, ctes)?
         }
-        ast::Expr::Collate(inner, _) => view_expression_affinity(inner, sources),
+        ast::Expr::Collate(inner, _) => view_expression_affinity(inner, sources, schema, ctes)?,
         ast::Expr::Cast { type_name, .. } => {
             Affinity::affinity(type_name.as_ref().map_or("", |type_name| &type_name.name))
         }
-        _ => view_referenced_column(expr, sources).map_or(Affinity::None, |column| {
-            Affinity::affinity(&column.column.ty_str)
-        }),
-    }
+        _ => view_referenced_column(expr, sources, schema, ctes)?
+            .map_or(Affinity::None, |column| {
+                Affinity::affinity(&column.column.ty_str)
+            }),
+    })
 }
 
 fn view_affinity_type_name(affinity: Affinity) -> &'static str {
