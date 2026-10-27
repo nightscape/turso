@@ -1639,6 +1639,7 @@ impl Schema {
                 .try_collect()?;
             // Remove from tables
             self.remove_table(namespace, &name);
+            self.remove_indices_for_table(namespace, &name);
             for table in hidden_tables {
                 self.remove_table(namespace, &table);
                 self.remove_indices_for_table(namespace, &table);
