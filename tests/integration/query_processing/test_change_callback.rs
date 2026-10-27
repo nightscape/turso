@@ -18,8 +18,7 @@ fn a_commit_on_another_connection_reaches_the_callback(tmp_db: TempDatabase) -> 
             sink.lock()
                 .unwrap()
                 .push((event.relation_name.clone(), event.changes.len()));
-        })
-        .unwrap();
+        }).unwrap();
 
     writer.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")?;
 

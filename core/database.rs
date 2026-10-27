@@ -711,7 +711,7 @@ pub struct Database<
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
     page_codec_id: Option<PageCodecId>,
-    pub(crate) change_callbacks: parking_lot::RwLock<Vec<types::ChangeCallbackEntry>>,
+    pub(crate) change_callbacks: crate::change_callbacks::ChangeCallbacks,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -878,7 +878,7 @@ impl Database {
                 encryption_cipher_mode.unwrap_or(CipherMode::None),
             ),
             page_codec_id,
-            change_callbacks: parking_lot::RwLock::new(Vec::new()),
+            change_callbacks: crate::change_callbacks::ChangeCallbacks::new(),
 
             durable_storage: None,
         };
@@ -2715,6 +2715,7 @@ impl Database {
             #[cfg(any(test, injected_yields))]
             yield_instance_id_counter: AtomicU64::new(1),
             transaction_changes: TransactionChanges::with_io(self.io.clone()),
+            staged_row_changes: parking_lot::Mutex::new(Vec::new()),
             maintenance_program_cache:
                 crate::incremental::vdbe_maintenance::MaintenanceProgramCache::new(),
             metrics: RwLock::new(ConnectionMetrics::new()),

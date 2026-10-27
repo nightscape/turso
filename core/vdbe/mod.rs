@@ -37,7 +37,7 @@ pub mod insn;
 pub mod metrics;
 #[cfg(test)]
 mod native_extension_tests;
-mod row_change;
+pub(crate) mod row_change;
 pub mod rowset;
 pub mod sorter;
 #[cfg(test)]
@@ -3117,6 +3117,7 @@ impl Program {
                     self.connection.rollback_temp_schema();
                 } else {
                     self.connection.commit_temp_schema();
+                    self.connection.dispatch_staged_row_changes();
                 }
             }
         }
