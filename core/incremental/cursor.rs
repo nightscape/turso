@@ -11,7 +11,8 @@ use crate::{
     LimboError, Pager, Register,
 };
 
-/// Read cursor for a transactionally maintained materialized-view btree.
+/// Read cursor for a transactionally maintained materialized-view btree or
+/// one of its indexes.
 ///
 /// The view btree is an ordinary table btree whose records hold the view's
 /// columns followed by the row's weight, so every read goes straight to the
@@ -121,15 +122,19 @@ impl CursorTrait for MaterializedViewCursor {
     }
 
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
-        if matches!(key, SeekKey::IndexKey(_)) {
+        if matches!(key, SeekKey::IndexKey(_)) && self.btree_cursor.index_info().is_none() {
             return Err(index_seek_error());
         }
         return_if_io!(self.ensure_tx_changes_computed());
         self.btree_cursor.seek(key, op)
     }
 
-    fn seek_unpacked(&mut self, _registers: &[Register], _op: SeekOp) -> IOResultOr<SeekResult> {
-        Err(index_seek_error())
+    fn seek_unpacked(&mut self, registers: &[Register], op: SeekOp) -> IOResultOr<SeekResult> {
+        if self.btree_cursor.index_info().is_none() {
+            return Err(index_seek_error());
+        }
+        return_if_io!(self.ensure_tx_changes_computed());
+        self.btree_cursor.seek_unpacked(registers, op)
     }
 
     fn insert(&mut self, _key: &BTreeKey) -> IOResultOr<()> {
