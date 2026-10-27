@@ -1,6 +1,6 @@
 use crate::namespace::NamespaceId;
 use crate::types::IOResultOr;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::{atomic::Ordering, Arc};
 
 use crate::error::LimboError;
@@ -126,6 +126,11 @@ pub(crate) fn classify_schema_entries(
     let mut indexes_to_create: Vec<usize> = Vec::new();
     let mut post_data_entries: Vec<usize> = Vec::new();
     let mut counter_tables_to_copy: Vec<usize> = Vec::new();
+    let view_names: FxHashSet<&str> = entries
+        .iter()
+        .filter(|entry| matches!(entry.entry_type, SchemaEntryType::View))
+        .map(|entry| entry.name.as_str())
+        .collect();
 
     for (idx, entry) in entries.iter().enumerate() {
         match entry.entry_type {
@@ -157,6 +162,9 @@ pub(crate) fn classify_schema_entries(
                     tables_to_create.push(idx);
                     tables_to_copy.push(idx);
                 }
+            }
+            SchemaEntryType::Index if view_names.contains(entry.tbl_name.as_str()) => {
+                post_data_entries.push(idx);
             }
             SchemaEntryType::Index if entry.is_storage_backed() => {
                 // Storage-backed index (rootpage != 0). Includes both normal
