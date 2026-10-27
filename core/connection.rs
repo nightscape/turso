@@ -2966,6 +2966,15 @@ impl Connection {
         Ok(name)
     }
 
+    pub fn register_foreign_table(
+        &self,
+        name: &str,
+        fdw: Arc<dyn crate::foreign::ForeignDataWrapper>,
+    ) -> Result<()> {
+        self.register_virtual_table(crate::VirtualTable::new_foreign(name, fdw)?)?;
+        Ok(())
+    }
+
     pub fn current_schema(&self) -> Arc<Schema> {
         self.schema.read().clone()
     }

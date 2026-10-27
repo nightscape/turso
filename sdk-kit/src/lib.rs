@@ -8,6 +8,13 @@ use crate::rsapi::TursoError;
 pub mod capi;
 pub mod rsapi;
 
+pub mod foreign {
+    pub use turso_core::foreign::{
+        FdwChange, ForeignCursor, ForeignDataWrapper, KeyColumn, PushedConstraint,
+        StreamingForeignData,
+    };
+}
+
 #[macro_export]
 macro_rules! assert_send {
     ($($ty:ty),+ $(,)?) => {

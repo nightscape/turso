@@ -1316,6 +1316,16 @@ impl TursoConnection {
             .map_err(TursoError::from)
     }
 
+    pub fn register_foreign_table(
+        &self,
+        name: &str,
+        fdw: std::sync::Arc<dyn turso_core::foreign::ForeignDataWrapper>,
+    ) -> Result<(), TursoError> {
+        self.connection
+            .register_foreign_table(name, fdw)
+            .map_err(|e| TursoError::Error(e.to_string()))
+    }
+
     /// prepares single SQL statement
     pub fn prepare_single(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
         if self.sync_operation_active() {
