@@ -601,6 +601,8 @@ pub(super) fn add_implied_column_equalities(
         if representative == member
             || columns[representative].table == columns[member].table
             || direct_pairs.contains(&ordered_pair(representative, member))
+            || (table_is_semi_joined(table_references, columns[representative].table)
+                && table_is_semi_joined(table_references, columns[member].table))
             || both_columns_are_rowid_aliases(&columns[representative].expr, &columns[member].expr)
         {
             continue;
@@ -649,6 +651,13 @@ fn plain_column(expr: &ast::Expr) -> Option<(TableInternalId, usize)> {
         return None;
     };
     Some((*table, *column))
+}
+
+fn table_is_semi_joined(table_references: &TableReferences, table: TableInternalId) -> bool {
+    table_references
+        .find_joined_table_by_internal_id(table)
+        .and_then(|table| table.join_info.as_ref())
+        .is_some_and(JoinInfo::is_semi)
 }
 
 fn table_is_anti_joined(table_references: &TableReferences, table: TableInternalId) -> bool {
