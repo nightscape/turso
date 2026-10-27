@@ -643,3 +643,41 @@ fn two_exists_on_one_outer_column_maintain() {
          AND EXISTS (SELECT 1 FROM block_tags bt WHERE bt.block_id = b.id AND bt.tag = 'later')",
     );
 }
+
+/// The readiness query's shape: an OR of EXISTS beside a LEFT JOIN, GROUP BY and HAVING.
+#[test]
+fn exists_under_or_beside_a_left_join_and_group_by_maintains() {
+    let db = TempDatabase::builder().with_views(true).build();
+    let conn = db.connect_limbo();
+    seed_holon(&conn);
+    const VIEW_SQL: &str = "SELECT b.id, count(bl.required_id) AS requirements FROM block b \
+         LEFT JOIN block_requires bl ON bl.block_id = b.id \
+         WHERE EXISTS (SELECT 1 FROM block_tags bt WHERE bt.block_id = b.id AND bt.tag = 'urgent') \
+            OR NOT EXISTS (SELECT 1 FROM block_tags bt WHERE bt.block_id = b.id AND bt.tag = 'later') \
+         GROUP BY b.id HAVING count(bl.required_id) < 3";
+
+    limbo_exec_rows(
+        &conn,
+        &format!("CREATE MATERIALIZED VIEW grouped AS {VIEW_SQL}"),
+    );
+    let check = |stage: &str| {
+        assert_eq!(
+            rows_sorted(&conn, "SELECT * FROM grouped"),
+            rows_sorted(&conn, VIEW_SQL),
+            "matview grouped disagrees with a fresh recompute after {stage}"
+        );
+    };
+    check("materializing over existing rows");
+
+    limbo_exec_rows(&conn, "INSERT INTO block_requires VALUES (1,4),(1,5),(1,6)");
+    check("a group crossing the HAVING bound");
+
+    limbo_exec_rows(&conn, "INSERT INTO block_tags VALUES (3,'urgent')");
+    check("a flag turning true for a row with requirements");
+
+    limbo_exec_rows(&conn, "DELETE FROM block_tags WHERE tag = 'later'");
+    check("a flag turning false for NOT EXISTS");
+
+    limbo_exec_rows(&conn, "DELETE FROM block_requires WHERE block_id = 3");
+    check("a group losing every joined row");
+}
