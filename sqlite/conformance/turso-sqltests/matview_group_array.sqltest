@@ -1,0 +1,191 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
+
+# json_group_array has no inverse, so a view keeps every value of each group
+# and builds the array again after a change. The array lists its elements in
+# value order; a fresh SELECT lists them in the order of its scan, so the
+# verifier compares these columns by their elements only.
+
+test matview-group-array-maintain {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g TEXT, v);
+    CREATE MATERIALIZED VIEW mv AS
+      SELECT g, json_group_array(v) AS a, count(*) AS n FROM t GROUP BY g;
+    INSERT INTO t VALUES (1,'x',3),(2,'x',1),(3,'y',NULL),(4,'x',9),(5,'x',1.0),(6,'x','b'),(7,'x','a');
+    SELECT * FROM mv ORDER BY g;
+    UPDATE t SET g = 'y' WHERE id = 4;
+    SELECT * FROM mv ORDER BY g;
+    DELETE FROM t WHERE id IN (1, 2);
+    SELECT * FROM mv ORDER BY g;
+    DELETE FROM t WHERE g = 'x';
+    SELECT * FROM mv ORDER BY g;
+    INSERT INTO t VALUES (8,'x',5);
+    SELECT * FROM mv ORDER BY g;
+}
+expect {
+    x|[1,1.0,3,9,"a","b"]|6
+    y|[null]|1
+    x|[1,1.0,3,"a","b"]|5
+    y|[null,9]|2
+    x|[1.0,"a","b"]|3
+    y|[null,9]|2
+    y|[null,9]|2
+    x|[5]|1
+    y|[null,9]|2
+}
+
+test matview-group-array-equal-values-are-counted {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, v TEXT);
+    CREATE MATERIALIZED VIEW mv AS SELECT g, json_group_array(v) AS a FROM t GROUP BY g;
+    INSERT INTO t VALUES (1,1,'a'),(2,1,'a'),(3,1,'a'),(4,1,'b');
+    SELECT a FROM mv;
+    DELETE FROM t WHERE id = 1;
+    SELECT a FROM mv;
+    DELETE FROM t WHERE id IN (2, 3);
+    SELECT a FROM mv;
+}
+expect {
+    ["a","a","a","b"]
+    ["a","a","b"]
+    ["b"]
+}
+
+test matview-group-array-null-elements {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, v);
+    CREATE MATERIALIZED VIEW mv AS SELECT g, json_group_array(v) AS a FROM t GROUP BY g;
+    INSERT INTO t VALUES (1,1,NULL),(2,1,NULL),(3,1,'x');
+    SELECT a FROM mv;
+    DELETE FROM t WHERE id = 1;
+    SELECT a FROM mv;
+    DELETE FROM t WHERE id = 2;
+    SELECT a FROM mv;
+}
+expect {
+    [null,null,"x"]
+    [null,"x"]
+    ["x"]
+}
+
+test matview-group-array-filter-leaves-group-empty {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, v INTEGER);
+    CREATE MATERIALIZED VIEW mv AS
+      SELECT g,
+             COALESCE(json_group_array(v) FILTER (WHERE v > 5), '[]') AS big,
+             json_group_array(v) AS every
+        FROM t GROUP BY g;
+    INSERT INTO t VALUES (1,1,3),(2,1,9),(3,2,4);
+    SELECT * FROM mv ORDER BY g;
+    DELETE FROM t WHERE id = 2;
+    SELECT * FROM mv ORDER BY g;
+}
+expect {
+    1|[9]|[3,9]
+    2|[]|[4]
+    1|[]|[3]
+    2|[]|[4]
+}
+
+test matview-group-array-scalar {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE MATERIALIZED VIEW mv AS SELECT json_group_array(v) AS a FROM t;
+    SELECT a FROM mv;
+    INSERT INTO t VALUES (1,5),(2,2);
+    SELECT a FROM mv;
+    DELETE FROM t;
+    SELECT a FROM mv;
+}
+expect {
+    []
+    [2,5]
+    []
+}
+
+test matview-group-array-in-any-insert-order {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, v INTEGER);
+    CREATE MATERIALIZED VIEW mv AS SELECT g, json_group_array(v) AS a FROM t GROUP BY g;
+    INSERT INTO t VALUES (1,1,30),(2,1,10),(3,1,20);
+    SELECT a FROM mv;
+}
+expect {
+    [10,20,30]
+}
+
+test matview-group-array-dual-left-join {
+    CREATE TABLE blocks(id INTEGER PRIMARY KEY);
+    CREATE TABLE tags(block_id INTEGER, tag TEXT, PRIMARY KEY (block_id, tag));
+    CREATE TABLE links(block_id INTEGER, target TEXT, PRIMARY KEY (block_id, target));
+    CREATE MATERIALIZED VIEW mv AS
+      SELECT b.id,
+             COALESCE(json_group_array(t.tag) FILTER (WHERE t.tag IS NOT NULL), '[]') AS tags,
+             COALESCE(json_group_array(l.target) FILTER (WHERE l.target IS NOT NULL), '[]') AS links
+        FROM blocks b
+        LEFT JOIN tags t ON t.block_id = b.id
+        LEFT JOIN links l ON l.block_id = b.id
+       GROUP BY b.id;
+    INSERT INTO blocks VALUES (1),(2);
+    INSERT INTO tags VALUES (1,'urgent'),(1,'review');
+    INSERT INTO links VALUES (1,'a'),(1,'b'),(1,'c');
+    SELECT * FROM mv ORDER BY id;
+    DELETE FROM links WHERE target = 'b';
+    DELETE FROM tags WHERE tag = 'urgent';
+    SELECT * FROM mv ORDER BY id;
+    DELETE FROM tags;
+    DELETE FROM links;
+    SELECT * FROM mv ORDER BY id;
+}
+expect {
+    1|["review","review","review","urgent","urgent","urgent"]|["a","a","b","b","c","c"]
+    2|[]|[]
+    1|["review","review"]|["a","c"]
+    2|[]|[]
+    1|[]|[]
+    2|[]|[]
+}
+
+test matview-group-array-chained-view {
+    CREATE TABLE tags(block_id INTEGER, tag TEXT, PRIMARY KEY (block_id, tag));
+    CREATE TABLE blocks(id INTEGER PRIMARY KEY, title TEXT);
+    CREATE MATERIALIZED VIEW tags_agg AS
+      SELECT block_id, json_group_array(tag) AS tags FROM tags GROUP BY block_id;
+    CREATE MATERIALIZED VIEW block AS
+      SELECT b.id, b.title, COALESCE(a.tags, '[]') AS tags
+        FROM blocks b LEFT JOIN tags_agg a ON a.block_id = b.id;
+    INSERT INTO blocks VALUES (1,'one'),(2,'two');
+    INSERT INTO tags VALUES (1,'b'),(1,'a'),(2,'z');
+    SELECT * FROM block ORDER BY id;
+    DELETE FROM tags WHERE tag = 'z';
+    INSERT INTO tags VALUES (1,'c');
+    SELECT * FROM block ORDER BY id;
+}
+expect {
+    1|one|["a","b"]
+    2|two|["z"]
+    1|one|["a","b","c"]
+    2|two|[]
+}
+
+test matview-group-array-refuses-blob {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, v);
+    CREATE MATERIALIZED VIEW mv AS SELECT g, json_group_array(v) AS a FROM t GROUP BY g;
+    INSERT INTO t VALUES (1, 1, x'ffff');
+}
+expect error {
+    JSON cannot hold BLOB values
+}
+
+test matview-group-array-refuses-order-by-argument {
+    CREATE TABLE t(g INTEGER, v INTEGER);
+    CREATE MATERIALIZED VIEW mv AS SELECT g, json_group_array(v ORDER BY v) FROM t GROUP BY g;
+}
+expect error {
+    materialized views with ORDER BY in aggregates are not yet supported
+}
+
+test matview-json-group-object-stays-refused {
+    CREATE TABLE t(g INTEGER, k TEXT, v INTEGER);
+    CREATE MATERIALIZED VIEW mv AS SELECT g, json_group_object(k, v) FROM t GROUP BY g;
+}
+expect error {
+    materialized views with the json_group_object aggregate are not yet supported
+}
