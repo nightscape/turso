@@ -1671,6 +1671,7 @@ fn plan_auxiliary_tables(
     match node {
         dag::OpNode::Aggregate {
             group_keys,
+            aggregates,
             multiset_keys,
             ..
         } => {
@@ -1680,8 +1681,12 @@ fn plan_auxiliary_tables(
                 .filter_map(|(aggregate_index, value_key)| {
                     value_key.map(|value_key| {
                         let table_name = table_name(&format!("__a{aggregate_index}"));
-                        let create_sql =
-                            aggregate_multiset_table_sql(&table_name, group_keys, value_key);
+                        let create_sql = aggregate_multiset_table_sql(
+                            &table_name,
+                            group_keys,
+                            value_key,
+                            recomputes_from_members(&aggregates[aggregate_index]),
+                        );
                         table(
                             AuxiliaryStatePurpose::AggregateMultiset { aggregate_index },
                             table_name,
@@ -1897,10 +1902,13 @@ pub(super) fn recomputes_from_members(agg: &Aggregate) -> bool {
 /// A value whose class can hold several exact values (see
 /// [`dag::KeyColumn::ambiguous`]) is keyed by its exact value: the `val`
 /// class column is followed by the member columns (`member_column_names`).
+/// The values of an aggregate built again from its members are also keyed by
+/// their JSON subtype, `sub`, which a table record does not store.
 fn aggregate_multiset_table_sql(
     multiset_table_name: &str,
     group_keys: &[dag::KeyColumn],
     value_key: dag::KeyColumn,
+    keeps_subtype: bool,
 ) -> String {
     let multiset_table_ident = crate::util::quote_identifier(multiset_table_name);
     let mut key = Vec::with_capacity(group_keys.len() + 4);
@@ -1915,6 +1923,10 @@ fn aggregate_multiset_table_sql(
         let members = member_column_names(1);
         columns.extend(members.iter().cloned());
         key.extend(members);
+    }
+    if keeps_subtype {
+        columns.push("sub".to_string());
+        key.push("sub".to_string());
     }
     columns.push("mult".to_string());
     format!(
