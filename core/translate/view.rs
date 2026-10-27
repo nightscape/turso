@@ -688,15 +688,23 @@ pub fn translate_drop_view(
     };
 
     if is_materialized_view {
-        let view_indexes: Vec<_> = resolver.with_schema(database_id, |s| {
+        let view_index_roots: Vec<i64> = resolver.with_schema(database_id, |s| {
             s.get_indices(namespace.id, &normalized_view_name)
-                .cloned()
+                .map(|index| index.root_page)
+                .chain(
+                    s.incompatible_materialized_view_index_roots(
+                        namespace.id,
+                        &normalized_view_name,
+                    )
+                    .iter()
+                    .copied(),
+                )
                 .collect()
         });
-        for index in &view_indexes {
+        for root in view_index_roots {
             program.emit_insn(Insn::Destroy {
                 db: database_id,
-                root: index.root_page,
+                root,
                 former_root_reg: 0, // No autovacuum
                 is_temp: 0,
             });

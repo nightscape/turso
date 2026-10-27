@@ -818,6 +818,8 @@ pub struct NamespaceSchema {
     /// descriptors cannot be loaded, but DROP VIEW must still destroy their
     /// storage so the documented recreate path remains possible.
     incompatible_materialized_view_roots: HashMap<String, i64>,
+    /// Index btree roots of incompatible materialized views, by view name.
+    incompatible_materialized_view_index_roots: HashMap<String, Vec<i64>>,
 
     /// View rows in sqlite_schema whose stored SQL failed to parse (e.g.
     /// older versions wrote view column lists without identifier quoting).
@@ -1071,6 +1073,19 @@ impl Schema {
         self.namespace(namespace)
             .incompatible_materialized_view_roots
             .values()
+            .copied()
+    }
+
+    /// The root pages of the indexes of the incompatible materialized views
+    /// of the namespace.
+    pub fn incompatible_materialized_view_all_index_roots(
+        &self,
+        namespace: NamespaceId,
+    ) -> impl Iterator<Item = i64> + '_ {
+        self.namespace(namespace)
+            .incompatible_materialized_view_index_roots
+            .values()
+            .flatten()
             .copied()
     }
 
@@ -1585,6 +1600,17 @@ impl Schema {
             .copied()
     }
 
+    pub fn incompatible_materialized_view_index_roots(
+        &self,
+        namespace: NamespaceId,
+        name: &str,
+    ) -> &[i64] {
+        self.namespace(namespace)
+            .incompatible_materialized_view_index_roots
+            .get(&normalize_ident(name))
+            .map_or(&[], Vec::as_slice)
+    }
+
     pub fn materialized_view_exists(&self, namespace: NamespaceId, name: &str) -> bool {
         self.is_materialized_view(namespace, name)
             || self
@@ -1652,6 +1678,9 @@ impl Schema {
             objects.incremental_views.remove(&name);
             objects.incompatible_views.remove(&name);
             objects.incompatible_materialized_view_roots.remove(&name);
+            objects
+                .incompatible_materialized_view_index_roots
+                .remove(&name);
 
             // Remove from table_to_materialized_views dependencies
             for views in objects.table_to_materialized_views.values_mut() {
@@ -2439,6 +2468,18 @@ impl Schema {
         mvcc_enabled: bool,
     ) -> Result<()> {
         for unparsed_sql_from_index in from_sql_indexes {
+            let view_name = normalize_ident(&unparsed_sql_from_index.table_name);
+            if self
+                .incompatible_materialized_view_root(NamespaceId::ROOT, &view_name)
+                .is_some()
+            {
+                self.namespace_mut(NamespaceId::ROOT)
+                    .incompatible_materialized_view_index_roots
+                    .entry(view_name)
+                    .or_default()
+                    .push(unparsed_sql_from_index.root_page);
+                continue;
+            }
             let table = self
                 .get_btree_table(NamespaceId::ROOT, &unparsed_sql_from_index.table_name)
                 .ok_or_else(|| {
@@ -3812,6 +3853,11 @@ impl TryClone for NamespaceSchema {
         let incompatible_views = self.incompatible_views.try_clone()?;
         let incompatible_materialized_view_roots =
             self.incompatible_materialized_view_roots.try_clone()?;
+        let incompatible_materialized_view_index_roots = self
+            .incompatible_materialized_view_index_roots
+            .iter()
+            .map(|(name, roots)| Ok::<_, TryReserveError>((name.clone(), roots.try_clone()?)))
+            .try_collect::<Result<_, TryReserveError>>()??;
         Ok(Self {
             tables,
             materialized_view_names,
@@ -3824,6 +3870,7 @@ impl TryClone for NamespaceSchema {
             table_to_materialized_views: self.table_to_materialized_views.try_clone()?,
             incompatible_views,
             incompatible_materialized_view_roots,
+            incompatible_materialized_view_index_roots,
             broken_views: self.broken_views.try_clone()?,
             sequences: self.sequences.try_clone()?,
         })
