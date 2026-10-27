@@ -50,6 +50,7 @@ pub(crate) mod sync;
 pub(crate) mod thread;
 
 mod assert;
+mod change_callbacks;
 mod connection;
 mod connection_hooks;
 mod database;

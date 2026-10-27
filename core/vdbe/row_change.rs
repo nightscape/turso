@@ -17,6 +17,7 @@ pub(crate) struct ChangeLogRoute {
     pub(crate) table: Arc<BTreeTable>,
     dependent_views: crate::alloc::Vec<String>,
     is_materialized_view: bool,
+    report_to_callbacks: bool,
 }
 
 /// Resolve change-log routing from the btree being written, never from the
@@ -47,7 +48,9 @@ pub(crate) fn change_log_route(
     // schema-owned table descriptor and the is_materialized_view check below.
     let dependent_views =
         schema.get_dependent_materialized_views(NamespaceId::ROOT, &cursor_table.name);
-    if dependent_views.is_empty() {
+    let report_to_callbacks = program.connection.db.change_callbacks.any()
+        && schema.is_materialized_view(NamespaceId::ROOT, &cursor_table.name);
+    if dependent_views.is_empty() && !report_to_callbacks {
         return Ok(None);
     }
     // Maintenance write cursors intentionally use a synthetic physical
@@ -79,6 +82,7 @@ pub(crate) fn change_log_route(
         table,
         dependent_views,
         is_materialized_view,
+        report_to_callbacks,
     }))
 }
 
@@ -108,14 +112,14 @@ pub(crate) enum RowImages {
 }
 
 impl RowImages {
-    fn before(&self) -> Option<&ImmutableRecord> {
+    pub(crate) fn before(&self) -> Option<&ImmutableRecord> {
         match self {
             RowImages::Insert { .. } => None,
             RowImages::Update { before, .. } | RowImages::Delete { before } => Some(before),
         }
     }
 
-    fn after(&self) -> Option<&ImmutableRecord> {
+    pub(crate) fn after(&self) -> Option<&ImmutableRecord> {
         match self {
             RowImages::Insert { after } | RowImages::Update { after, .. } => Some(after),
             RowImages::Delete { .. } => None,
@@ -265,6 +269,23 @@ pub(crate) enum ViewLogStep {
 /// this is reached, so `row_change` is always set here.
 #[cold]
 pub(crate) fn log_row_change_for_views(
+    connection: &Connection,
+    view_change: &mut ViewChange,
+) -> Result<IOResult<()>> {
+    if !view_change.route.dependent_views.is_empty() {
+        crate::return_if_io!(log_to_view_change_log(connection, view_change));
+    }
+    if view_change.route.report_to_callbacks {
+        let change = view_change
+            .row_change
+            .take()
+            .expect("CaptureRowChange always runs before a routed write reaches the change log");
+        connection.stage_row_change(change);
+    }
+    Ok(IOResult::Done(()))
+}
+
+fn log_to_view_change_log(
     connection: &Connection,
     view_change: &mut ViewChange,
 ) -> Result<IOResult<()>> {

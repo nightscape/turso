@@ -472,6 +472,8 @@ pub struct Connection {
     /// Ordered row changes captured once per connection transaction, with
     /// consumer indexes for materialized-view maintenance.
     pub(crate) transaction_changes: crate::incremental::view::TransactionChanges,
+    /// Row changes of the open transaction that change callbacks will see once it commits.
+    pub(crate) staged_row_changes: parking_lot::Mutex<Vec<crate::vdbe::row_change::RowChange>>,
     /// Prepared IVM bytecode keyed by schema epoch and physical view layout.
     pub(crate) maintenance_program_cache:
         crate::incremental::vdbe_maintenance::MaintenanceProgramCache,
@@ -4430,14 +4432,11 @@ impl Connection {
     }
 
     pub fn clear_change_callback(&self, id: crate::types::CallbackId) {
-        self.db
-            .change_callbacks
-            .write()
-            .retain(|(callback_id, _, _)| *callback_id != id);
+        self.db.change_callbacks.remove(id);
     }
 
     pub fn clear_all_change_callbacks(&self) {
-        self.db.change_callbacks.write().clear();
+        self.db.change_callbacks.clear();
     }
 
     fn add_change_callback<F>(
@@ -4448,12 +4447,20 @@ impl Connection {
     where
         F: Fn(&crate::types::RelationChangeEvent) + Send + Sync + 'static,
     {
-        let id = crate::types::CallbackId::next();
-        self.db
-            .change_callbacks
-            .write()
-            .push((id, filter, Arc::new(callback)));
-        Ok(id)
+        Ok(self.db.change_callbacks.add(filter, Arc::new(callback)))
+    }
+
+    pub(crate) fn stage_row_change(&self, change: crate::vdbe::row_change::RowChange) {
+        self.staged_row_changes.lock().push(change);
+    }
+
+    pub(crate) fn clear_staged_row_changes(&self) {
+        self.staged_row_changes.lock().clear();
+    }
+
+    pub(crate) fn dispatch_staged_row_changes(&self) {
+        let staged = std::mem::take(&mut *self.staged_row_changes.lock());
+        crate::change_callbacks::dispatch(&self.db.change_callbacks, staged);
     }
 
     /// Sets maximum total accumulated timeout. If the duration is Zero, we unset the busy handler.
@@ -4931,6 +4938,7 @@ impl Connection {
         // view delta captured within it is void. Leaving them behind would
         // apply phantom changes to the views at the next successful commit.
         self.transaction_changes.clear();
+        self.clear_staged_row_changes();
     }
 
     /// Roll back transaction state for helpers that start a manual `BEGIN`

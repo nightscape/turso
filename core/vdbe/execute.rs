@@ -12935,7 +12935,9 @@ pub fn op_insert(
     loop {
         match state.active_op_state.insert().sub_state {
             OpInsertSubState::ResolveViewRoute => {
-                let route = if program.prepared().has_materialized_views {
+                let route = if program.prepared().has_materialized_views
+                    || program.connection.db.change_callbacks.any()
+                {
                     change_log_route(program, state, *cursor_id)?
                 } else {
                     None
@@ -13236,7 +13238,9 @@ pub fn op_delete(
     loop {
         match state.active_op_state.delete().sub_state {
             OpDeleteSubState::ResolveViewRoute => {
-                let route = if program.prepared().has_materialized_views {
+                let route = if program.prepared().has_materialized_views
+                    || program.connection.db.change_callbacks.any()
+                {
                     change_log_route(program, state, *cursor_id)?
                 } else {
                     None
