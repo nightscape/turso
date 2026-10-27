@@ -518,3 +518,43 @@ fn a_nested_exists_that_reads_two_levels_out_is_refused() {
         "directly around",
     );
 }
+
+#[test]
+fn uncorrelated_exists_maintains() {
+    let db = TempDatabase::builder().with_views(true).build();
+    let conn = db.connect_limbo();
+    seed(&conn);
+    const EXISTS_SQL: &str = "SELECT b.id FROM block b \
+         WHERE EXISTS (SELECT 1 FROM block_requires br WHERE br.required_id = 1)";
+    const NOT_EXISTS_SQL: &str = "SELECT b.id FROM block b \
+         WHERE NOT EXISTS (SELECT 1 FROM block_requires br WHERE br.required_id = 1) OR b.id = 3";
+
+    limbo_exec_rows(
+        &conn,
+        &format!("CREATE MATERIALIZED VIEW has_one AS {EXISTS_SQL}"),
+    );
+    limbo_exec_rows(
+        &conn,
+        &format!("CREATE MATERIALIZED VIEW lacks_one AS {NOT_EXISTS_SQL}"),
+    );
+    let check = |stage: &str| {
+        assert_view_matches(&conn, "has_one", EXISTS_SQL, stage);
+        assert_view_matches(&conn, "lacks_one", NOT_EXISTS_SQL, stage);
+    };
+    check("materializing over existing rows");
+
+    limbo_exec_rows(&conn, "DELETE FROM block_requires WHERE required_id = 1");
+    check("the only matching row leaving");
+
+    limbo_exec_rows(&conn, "INSERT INTO block_requires VALUES (3,1),(4,1)");
+    check("two matching rows arriving");
+
+    limbo_exec_rows(&conn, "DELETE FROM block_requires WHERE block_id = 3");
+    check("one of two matching rows leaving");
+
+    limbo_exec_rows(&conn, "INSERT INTO block VALUES (7,'g')");
+    check("inserting an outer row");
+
+    limbo_exec_rows(&conn, "DELETE FROM block_requires");
+    check("emptying the subquery table");
+}
