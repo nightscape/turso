@@ -92,45 +92,108 @@ fn next_commit_id() -> u64 {
 }
 
 fn build_events(staged: Vec<RowChange>) -> Vec<RelationChangeEvent> {
-    let mut events: Vec<RelationChangeEvent> = Vec::new();
-    let mut event_of_relation: HashMap<String, usize> = HashMap::new();
+    let mut relations: Vec<RelationRows> = Vec::new();
+    let mut relation_of_name: HashMap<String, usize> = HashMap::new();
     for row in staged {
-        let index = *event_of_relation
+        let relation = *relation_of_name
             .entry(row.table.name.clone())
             .or_insert_with(|| {
-                events.push(RelationChangeEvent {
-                    relation_name: row.table.name.clone(),
-                    columns: row
-                        .table
-                        .columns()
-                        .iter()
-                        .map(|column| column.name.clone().expect("view column has a name"))
-                        .collect(),
-                    changes: Vec::new(),
-                    commit_id: 0,
-                    commit_index: 0,
-                    commit_len: 0,
+                relations.push(RelationRows {
+                    table: row.table.clone(),
+                    rows: Vec::new(),
+                    row_of_rowid: HashMap::new(),
                 });
-                events.len() - 1
+                relations.len() - 1
             });
-        let event = &mut events[index];
-        let deleted = row.images.before().map(|image| DatabaseChangeType::Delete {
-            bin_record: view_image(image),
-        });
-        let inserted = row.images.after().map(|image| DatabaseChangeType::Insert {
-            bin_record: view_image(image),
-        });
-        for change in deleted.into_iter().chain(inserted) {
-            event.changes.push(DatabaseChange {
-                change_id: event.changes.len() as i64 + 1,
-                change_time: 0,
-                change,
-                table_name: event.relation_name.clone(),
-                id: row.rowid,
-            });
+        let relation = &mut relations[relation];
+        let before = row.images.before().map(view_image);
+        let after = row.images.after().map(view_image);
+        match relation.row_of_rowid.get(&row.rowid) {
+            Some(&index) => relation.rows[index].after = after,
+            None => {
+                relation.row_of_rowid.insert(row.rowid, relation.rows.len());
+                relation.rows.push(NetRow {
+                    rowid: row.rowid,
+                    before,
+                    after,
+                });
+            }
         }
     }
-    events
+    relations
+        .into_iter()
+        .filter_map(RelationRows::into_event)
+        .collect()
+}
+
+struct RelationRows {
+    table: std::sync::Arc<crate::schema::BTreeTable>,
+    rows: Vec<NetRow>,
+    row_of_rowid: HashMap<i64, usize>,
+}
+
+struct NetRow {
+    rowid: i64,
+    before: Option<Vec<u8>>,
+    after: Option<Vec<u8>>,
+}
+
+impl RelationRows {
+    fn into_event(self) -> Option<RelationChangeEvent> {
+        let changed: Vec<NetRow> = self
+            .rows
+            .into_iter()
+            .filter(|row| row.before != row.after)
+            .collect();
+        let mut changes = Vec::new();
+        for row in &changed {
+            if let Some(bin_record) = &row.before {
+                changes.push((
+                    row.rowid,
+                    DatabaseChangeType::Delete {
+                        bin_record: bin_record.clone(),
+                    },
+                ));
+            }
+        }
+        for row in &changed {
+            if let Some(bin_record) = &row.after {
+                changes.push((
+                    row.rowid,
+                    DatabaseChangeType::Insert {
+                        bin_record: bin_record.clone(),
+                    },
+                ));
+            }
+        }
+        if changes.is_empty() {
+            return None;
+        }
+        let relation_name = self.table.name.clone();
+        Some(RelationChangeEvent {
+            columns: self
+                .table
+                .columns()
+                .iter()
+                .map(|column| column.name.clone().expect("view column has a name"))
+                .collect(),
+            changes: changes
+                .into_iter()
+                .enumerate()
+                .map(|(index, (id, change))| DatabaseChange {
+                    change_id: index as i64 + 1,
+                    change_time: 0,
+                    change,
+                    table_name: relation_name.clone(),
+                    id,
+                })
+                .collect(),
+            relation_name,
+            commit_id: 0,
+            commit_index: 0,
+            commit_len: 0,
+        })
+    }
 }
 
 pub(crate) fn view_image(record: &ImmutableRecord) -> Vec<u8> {
