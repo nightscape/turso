@@ -1,10 +1,14 @@
 mod test_alter_table_reopen;
 mod test_btree;
+mod test_change_callback;
 mod test_ddl;
 mod test_eqp_json;
 mod test_hash_join_materialization;
 mod test_in_seek;
 mod test_is_seek;
+mod test_ivm_cdc_callback_after_ddl;
+mod test_ivm_cdc_update;
+mod test_ivm_json_set;
 mod test_materialized_view_commit;
 mod test_multi_index_scan;
 mod test_read_path;
