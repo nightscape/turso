@@ -279,25 +279,50 @@ pub enum ChosenValueCollation {
     Binary,
     NoCase,
     RTrim,
-    /// A `json_group_array` result: its elements are in no defined order.
-    JsonArray,
-    /// A `group_concat` result with this separator: its parts are in no
-    /// defined order.
-    Concat(String),
+    /// A `json_group_array` result: its elements are in no defined order,
+    /// and match when equal under the inner collation.
+    JsonArray(Box<ChosenValueCollation>),
+    /// A `group_concat` result: its parts are in no defined order, and match
+    /// when equal under the inner collation.
+    Concat {
+        separator: String,
+        part: Box<ChosenValueCollation>,
+    },
 }
 
 impl ChosenValueCollation {
-    /// Parse a built-in collation name, ignoring case, `json_group_array`, or
-    /// `group_concat:<separator>`.
+    /// Parse a built-in collation name, ignoring case; `json_group_array` or
+    /// `json_group_array/<collation>`; or `group_concat:<separator>` or
+    /// `group_concat/<collation>:<separator>`.
     pub fn from_name(name: &str) -> Option<Self> {
-        if let Some(separator) = name.strip_prefix("group_concat:") {
-            return Some(Self::Concat(separator.to_string()));
+        if let Some(rest) = name.strip_prefix("group_concat") {
+            let (collation, separator) = rest.split_once(':')?;
+            return Some(Self::Concat {
+                separator: separator.to_string(),
+                part: Box::new(Self::from_aggregate_collation(collation)?),
+            });
         }
+        if let Some(rest) = name.strip_prefix("json_group_array") {
+            return Some(Self::JsonArray(Box::new(Self::from_aggregate_collation(
+                rest,
+            )?)));
+        }
+        Self::from_collation_name(name)
+    }
+
+    fn from_aggregate_collation(suffix: &str) -> Option<Self> {
+        match suffix.strip_prefix('/') {
+            Some(name) => Self::from_collation_name(name),
+            None if suffix.is_empty() => Some(Self::Binary),
+            None => None,
+        }
+    }
+
+    fn from_collation_name(name: &str) -> Option<Self> {
         match name.to_ascii_uppercase().as_str() {
             "BINARY" => Some(Self::Binary),
             "NOCASE" => Some(Self::NoCase),
             "RTRIM" => Some(Self::RTrim),
-            "JSON_GROUP_ARRAY" => Some(Self::JsonArray),
             _ => None,
         }
     }
@@ -318,9 +343,19 @@ impl ChosenValueCollation {
                 Self::Binary => text.clone(),
                 Self::NoCase => text.to_ascii_lowercase(),
                 Self::RTrim => text.trim_end_matches(' ').to_string(),
-                Self::JsonArray => sorted_json_array_elements(text).join(","),
-                Self::Concat(separator) => {
-                    let mut parts: Vec<&str> = text.split(separator.as_str()).collect();
+                Self::JsonArray(element) => {
+                    let mut elements = json_array_elements(text)
+                        .into_iter()
+                        .map(|json| element.json_element_member(json))
+                        .collect::<Vec<_>>();
+                    elements.sort_unstable();
+                    elements.join(",")
+                }
+                Self::Concat { separator, part } => {
+                    let mut parts = text
+                        .split(separator.as_str())
+                        .map(|text| part.text_member(text))
+                        .collect::<Vec<_>>();
                     parts.sort_unstable();
                     parts.join(separator)
                 }
@@ -328,11 +363,30 @@ impl ChosenValueCollation {
             Value::Null | Value::Integer(_) | Value::Blob(_) => value.clone(),
         }
     }
+
+    fn text_member(&self, text: &str) -> String {
+        match self.class_member(&Value::Text(text.to_string())) {
+            Value::Text(member) => member,
+            _ => unreachable!("the class member of text is text"),
+        }
+    }
+
+    /// The class member of one JSON array element: a JSON string is
+    /// compared by its contents, anything else exactly.
+    fn json_element_member(&self, json: &str) -> String {
+        match json
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+        {
+            Some(contents) => format!("\"{}\"", self.text_member(contents)),
+            None => json.to_string(),
+        }
+    }
 }
 
-/// The top-level elements of the JSON array text `array`, sorted. Splits at
-/// the commas outside strings, objects and arrays.
-fn sorted_json_array_elements(array: &str) -> Vec<&str> {
+/// The top-level elements of the JSON array text `array`. Splits at the
+/// commas outside strings, objects and arrays.
+fn json_array_elements(array: &str) -> Vec<&str> {
     let inner = array
         .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))
@@ -363,7 +417,6 @@ fn sorted_json_array_elements(array: &str) -> Vec<&str> {
     if !inner.is_empty() {
         elements.push(&inner[start..]);
     }
-    elements.sort_unstable();
     elements
 }
 
