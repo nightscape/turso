@@ -626,3 +626,20 @@ fn exists_in_the_select_list_of_a_grouped_query_is_refused() {
         "subqueries",
     );
 }
+
+/// Two EXISTS terms that match the outer row on the same column. Each becomes
+/// a semi join, and the planner must not add a term that compares their tables.
+#[test]
+fn two_exists_on_one_outer_column_maintain() {
+    let db = TempDatabase::builder().with_views(true).build();
+    let conn = db.connect_limbo();
+    seed_holon(&conn);
+
+    maintain_through_holon_writes(
+        &conn,
+        "v",
+        "SELECT b.id FROM block b \
+         WHERE EXISTS (SELECT 1 FROM block_tags bt WHERE bt.block_id = b.id AND bt.tag = 'urgent') \
+         AND EXISTS (SELECT 1 FROM block_tags bt WHERE bt.block_id = b.id AND bt.tag = 'later')",
+    );
+}

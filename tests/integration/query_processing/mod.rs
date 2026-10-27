@@ -14,6 +14,7 @@ mod test_ivm_cdc_callback_after_ddl;
 mod test_ivm_cdc_stuck_transaction;
 mod test_ivm_cdc_update;
 mod test_ivm_empty_cdc_batches;
+mod test_ivm_exists_differential;
 mod test_ivm_join_rowid_identity;
 mod test_ivm_json_set;
 mod test_ivm_nested_join;
