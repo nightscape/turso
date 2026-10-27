@@ -17,6 +17,7 @@ pub mod busy;
 pub mod cdc;
 #[cfg(feature = "cli_only")]
 pub mod dbpage;
+pub mod foreign;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod functions;
 pub mod index_method;
