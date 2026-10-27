@@ -22,3 +22,9 @@ mod test_non_utf8_text;
 mod test_schema_updated;
 mod test_subquery_unnesting;
 mod test_transactions;
+
+mod test_ivm_chained_population_in_transaction;
+mod test_ivm_refresh;
+mod test_ivm_refresh_dependent_matview;
+mod test_ivm_refresh_in_transaction;
+mod test_ivm_refresh_state_index_orphan;
