@@ -429,3 +429,48 @@ fn a_temp_table_write_is_reported_with_the_temp_prefix(tmp_db: TempDatabase) -> 
     assert!(seen[0].starts_with("temp.tt insert"), "got {seen:?}");
     Ok(())
 }
+
+#[turso_macros::test(views)]
+fn creating_a_view_over_existing_rows_reports_nothing(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")?;
+    let seen = record_all(&conn);
+
+    conn.execute("CREATE MATERIALIZED VIEW mv AS SELECT id, v FROM t")?;
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "got {:?}",
+        seen.lock().unwrap()
+    );
+
+    conn.execute("INSERT INTO t VALUES (3, 'c')")?;
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "got {seen:?}");
+    Ok(())
+}
+
+#[test]
+fn registering_a_change_callback_on_an_mvcc_database_is_refused() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+
+    let error = conn.set_change_callback(|_| {}).unwrap_err();
+
+    assert!(error.to_string().contains("MVCC"), "got {error}");
+}
+
+#[test]
+fn switching_to_mvcc_while_a_change_callback_is_registered_is_refused() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    conn.set_change_callback(|_| {}).unwrap();
+
+    let error = conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap_err();
+
+    assert!(
+        error.to_string().contains("change callbacks"),
+        "got {error}"
+    );
+}
