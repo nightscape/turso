@@ -581,6 +581,22 @@ pub fn translate_drop_view(
         Vec::new()
     };
 
+    if is_materialized_view {
+        let view_indexes: Vec<_> = resolver.with_schema(database_id, |s| {
+            s.get_indices(namespace.id, &normalized_view_name)
+                .cloned()
+                .collect()
+        });
+        for index in &view_indexes {
+            program.emit_insn(Insn::Destroy {
+                db: database_id,
+                root: index.root_page,
+                former_root_reg: 0, // No autovacuum
+                is_temp: 0,
+            });
+        }
+    }
+
     // Destroy the internal tables' btrees and indexes (those that exist).
     for internal_table_name in &internal_table_names {
         let internal_indexes: Vec<_> = resolver.with_schema(database_id, |s| {
@@ -659,11 +675,20 @@ pub fn translate_drop_view(
     // Check if this row matches the view, DBSP table, or DBSP index
     let skip_delete_label = program.allocate_label();
 
-    // Check if this is the view entry (type='view' and name=view_name)
+    // Check if this is the view entry (type='view' and name=view_name) or one
+    // of its indexes (type='index' and tbl_name=view_name)
+    let not_a_view_row_label = program.allocate_label();
+    let delete_row_label = program.allocate_label();
+    let index_type_reg = program.alloc_register();
+    let col2_reg = program.alloc_register();
+    program.emit_insn(Insn::String8 {
+        dest: index_type_reg,
+        value: "index".to_string(),
+    });
     program.emit_insn(Insn::Ne {
         lhs: col0_reg,
         rhs: type_reg,
-        target_pc: skip_delete_label,
+        target_pc: not_a_view_row_label,
         flags: CmpInsFlags::default(),
         collation: program.curr_collation(),
     });
@@ -674,7 +699,26 @@ pub fn translate_drop_view(
         flags: CmpInsFlags::default(),
         collation: program.curr_collation(),
     });
-    // Matches view - delete it
+    program.emit_insn(Insn::Goto {
+        target_pc: delete_row_label,
+    });
+    program.preassign_label_to_next_insn(not_a_view_row_label);
+    program.emit_insn(Insn::Ne {
+        lhs: col0_reg,
+        rhs: index_type_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
+    });
+    program.emit_column_or_rowid(sqlite_schema_cursor_id, 2, col2_reg);
+    program.emit_insn(Insn::Ne {
+        lhs: col2_reg,
+        rhs: view_name_reg,
+        target_pc: skip_delete_label,
+        flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
+    });
+    program.preassign_label_to_next_insn(delete_row_label);
     program.emit_insn(Insn::RowId {
         cursor_id: sqlite_schema_cursor_id,
         dest: rowid_reg,
