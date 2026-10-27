@@ -189,3 +189,70 @@ test matview-json-group-object-stays-refused {
 expect error {
     materialized views with the json_group_object aggregate are not yet supported
 }
+
+# A table record does not keep the JSON subtype of a value, so the view keeps
+# it next to each value. Without it, the array would list a json_object
+# result as a quoted string.
+test matview-group-array-keeps-json-subtype {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, v INTEGER);
+    CREATE MATERIALIZED VIEW mv AS
+      SELECT g, json_group_array(json_object('k', v)) AS objects,
+                json_group_array(json_array(v, v)) AS pairs
+        FROM t GROUP BY g;
+    INSERT INTO t VALUES (1,1,5),(2,1,3);
+    SELECT * FROM mv;
+    DELETE FROM t WHERE id = 1;
+    SELECT * FROM mv;
+    INSERT INTO t VALUES (3,1,7);
+    SELECT * FROM mv;
+}
+expect {
+    1|[{"k":3},{"k":5}]|[[3,3],[5,5]]
+    1|[{"k":3}]|[[3,3]]
+    1|[{"k":3},{"k":7}]|[[3,3],[7,7]]
+}
+
+test matview-group-array-keeps-json-text-and-plain-text-apart {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER);
+    CREATE MATERIALIZED VIEW mv AS
+      SELECT g, json_group_array(iif(id = 1, '{"k":3}', json('{"k":3}'))) AS a
+        FROM t GROUP BY g;
+    INSERT INTO t VALUES (1,1),(2,1);
+    SELECT a FROM mv;
+    DELETE FROM t WHERE id = 1;
+    SELECT a FROM mv;
+    INSERT INTO t VALUES (1,1);
+    SELECT a FROM mv;
+}
+expect {
+    ["{\"k\":3}",{"k":3}]
+    [{"k":3}]
+    ["{\"k\":3}",{"k":3}]
+}
+
+test matview-group-array-chained-over-json-objects {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, v INTEGER);
+    CREATE MATERIALIZED VIEW objects AS
+      SELECT g, json_group_array(json_object('k', v)) AS a FROM t GROUP BY g;
+    CREATE MATERIALIZED VIEW outer_view AS SELECT g, a FROM objects;
+    CREATE MATERIALIZED VIEW group_count AS SELECT count(*) AS n FROM objects;
+    INSERT INTO t VALUES (1,1,5),(2,2,3),(3,1,4);
+    SELECT * FROM outer_view ORDER BY g;
+    SELECT n FROM group_count;
+    DELETE FROM t WHERE id = 1;
+    SELECT * FROM outer_view ORDER BY g;
+    SELECT n FROM group_count;
+    DELETE FROM t WHERE g = 2;
+    SELECT * FROM outer_view ORDER BY g;
+    SELECT n FROM group_count;
+}
+expect {
+    1|[{"k":4},{"k":5}]
+    2|[{"k":3}]
+    2
+    1|[{"k":4}]
+    2|[{"k":3}]
+    2
+    1|[{"k":4}]
+    1
+}
