@@ -1,15 +1,19 @@
 use super::consolidate::ConsolidatedDelta;
 use super::stream::{synthesized_view_table, DeltaIdentity};
+use crate::schema::Index;
 use crate::sync::Arc;
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral};
+use crate::vdbe::insn::{
+    to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral,
+};
 use crate::Result;
 
 /// Persistent materialized-view table at the root of a maintenance circuit.
 pub(super) struct ViewSink {
     pub(super) root_page: i64,
     pub(super) num_columns: usize,
+    pub(super) indexes: Vec<Arc<Index>>,
 }
 
 /// Consume a fully evaluated one-identity delta stream at the maintenance
@@ -79,6 +83,8 @@ pub(super) fn emit_terminal_delta(
     let zero_reg = program.alloc_register();
     let record_reg = program.alloc_register();
     program.emit_int(0, zero_reg);
+    let is_new_reg = program.alloc_register();
+    let view_indexes = ViewIndexWriters::open(program, &sink.indexes, identity_reg, values_start);
 
     // 1 while applying insertions, 0 while applying retractions.
     let insertion_pass_reg = program.alloc_register();
@@ -137,6 +143,7 @@ pub(super) fn emit_terminal_delta(
         });
     }
 
+    program.emit_int(0, is_new_reg);
     program.emit_insn(Insn::SeekRowid {
         cursor_id: view_cursor_id,
         src_reg: identity_reg,
@@ -177,6 +184,7 @@ pub(super) fn emit_terminal_delta(
         target_pc: merge_label,
     });
     program.preassign_label_to_next_insn(not_found_label);
+    program.emit_int(1, is_new_reg);
     program.emit_int(0, current_weight_reg);
 
     program.preassign_label_to_next_insn(merge_label);
@@ -201,6 +209,7 @@ pub(super) fn emit_terminal_delta(
     });
     // The weight dropped to zero. A consolidated delta has no zero weights,
     // so the row was found in the view.
+    view_indexes.emit_delete_entries(program);
     program.emit_insn(Insn::Delete {
         cursor_id: view_cursor_id,
         table_name: view_name.to_string(),
@@ -234,6 +243,12 @@ pub(super) fn emit_terminal_delta(
         ),
         table_name: view_name.to_string(),
     });
+    program.emit_insn(Insn::IfNot {
+        reg: is_new_reg,
+        target_pc: next_label,
+        jump_if_null: false,
+    });
+    view_indexes.emit_insert_entries(program);
 
     program.preassign_label_to_next_insn(next_label);
     program.emit_insn(Insn::Next {
@@ -274,4 +289,107 @@ pub(super) fn emit_terminal_delta(
     });
     program.preassign_label_to_next_insn(end_label);
     Ok(())
+}
+
+/// A row's values never change under one rowid: a change is a delete plus an
+/// insert. So an index entry is added when the row is new and removed when
+/// the row goes.
+struct ViewIndexWriters {
+    writers: Vec<ViewIndexWriter>,
+}
+
+struct ViewIndexWriter {
+    index: Arc<Index>,
+    cursor_id: usize,
+    key_start: usize,
+    values_start: usize,
+    identity_reg: usize,
+    record_reg: usize,
+}
+
+impl ViewIndexWriters {
+    fn open(
+        program: &mut ProgramBuilder,
+        indexes: &[Arc<Index>],
+        identity_reg: usize,
+        values_start: usize,
+    ) -> Self {
+        let writers = indexes
+            .iter()
+            .map(|index| {
+                turso_assert!(
+                    index.has_rowid
+                        && index.where_clause.is_none()
+                        && index.index_method.is_none()
+                        && index.columns.iter().all(|column| column.expr.is_none()),
+                    "an index on a materialized view must be a plain index over its columns"
+                );
+                let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+                program.emit_insn(Insn::OpenWrite {
+                    cursor_id,
+                    root_page: RegisterOrLiteral::Literal(index.root_page),
+                    db: 0,
+                });
+                ViewIndexWriter {
+                    index: index.clone(),
+                    cursor_id,
+                    key_start: program.alloc_registers(index.columns.len() + 1),
+                    values_start,
+                    identity_reg,
+                    record_reg: program.alloc_register(),
+                }
+            })
+            .collect();
+        Self { writers }
+    }
+
+    fn emit_delete_entries(&self, program: &mut ProgramBuilder) {
+        for writer in &self.writers {
+            writer.emit_copy_key(program);
+            program.emit_insn(Insn::IdxDelete {
+                start_reg: writer.key_start,
+                num_regs: writer.index.columns.len() + 1,
+                cursor_id: writer.cursor_id,
+                raise_error_if_no_matching_entry: true,
+            });
+        }
+    }
+
+    fn emit_insert_entries(&self, program: &mut ProgramBuilder) {
+        for writer in &self.writers {
+            let key_width = writer.index.columns.len() + 1;
+            writer.emit_copy_key(program);
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: to_u32(writer.key_start),
+                count: to_u32(key_width),
+                dest_reg: to_u32(writer.record_reg),
+                index_name: Some(writer.index.name.clone()),
+                affinity_str: None,
+            });
+            program.emit_insn(Insn::IdxInsert {
+                cursor_id: writer.cursor_id,
+                record_reg: writer.record_reg,
+                unpacked_start: Some(writer.key_start),
+                unpacked_count: Some(to_u32(key_width)),
+                flags: IdxInsertFlags::new(),
+            });
+        }
+    }
+}
+
+impl ViewIndexWriter {
+    fn emit_copy_key(&self, program: &mut ProgramBuilder) {
+        for (slot, column) in self.index.columns.iter().enumerate() {
+            program.emit_insn(Insn::Copy {
+                src_reg: self.values_start + column.pos_in_table,
+                dst_reg: self.key_start + slot,
+                extra_amount: 0,
+            });
+        }
+        program.emit_insn(Insn::Copy {
+            src_reg: self.identity_reg,
+            dst_reg: self.key_start + self.index.columns.len(),
+            extra_amount: 0,
+        });
+    }
 }
