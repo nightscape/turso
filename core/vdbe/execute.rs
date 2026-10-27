@@ -1566,7 +1566,7 @@ pub fn op_open_read(
         }
         CursorType::BTreeIndex(index) => {
             let btree_cursor = BTreeCursor::new_index_boxed(
-                pager,
+                pager.clone(),
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                 index.as_ref(),
                 num_columns,
@@ -1583,10 +1583,24 @@ pub fn op_open_read(
             };
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
+            let indexes_a_view = program.connection.with_schema(*db, |schema| {
+                schema.is_materialized_view(NamespaceId::ROOT, &index.table_name)
+            });
+            let cursor = if indexes_a_view {
+                Cursor::new_btree_dyn(Box::new(
+                    crate::incremental::cursor::MaterializedViewCursor::new(
+                        cursor.into_dyn(),
+                        pager,
+                        program.connection.clone(),
+                    ),
+                ))
+            } else {
+                cursor.into_cursor()
+            };
             cursors
                 .get_mut(*cursor_id)
                 .expect("cursor_id should be valid")
-                .replace(cursor.into_cursor());
+                .replace(cursor);
         }
         CursorType::Pseudo(_) => {
             panic!("OpenRead on pseudo cursor");
