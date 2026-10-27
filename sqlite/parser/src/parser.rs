@@ -5644,6 +5644,31 @@ mod tests {
     }
 
     #[test]
+    fn test_refresh_materialized_view_round_trips() {
+        for sql in [
+            "REFRESH MATERIALIZED VIEW v",
+            "REFRESH MATERIALIZED VIEW main.v",
+        ] {
+            let cmd = Parser::new(sql.as_bytes()).next_cmd().unwrap().unwrap();
+            assert_eq!(cmd.to_string(), format!("{sql};"));
+        }
+    }
+
+    #[test]
+    fn test_refresh_is_a_name() {
+        for sql in [
+            "CREATE TABLE refresh (refresh)",
+            "SELECT refresh FROM refresh",
+            "SELECT * FROM t1 AS refresh",
+        ] {
+            let cmd = Parser::new(sql.as_bytes()).next_cmd().unwrap().unwrap();
+            let printed = cmd.to_string();
+            let reparsed = Parser::new(printed.as_bytes()).next_cmd().unwrap().unwrap();
+            assert_eq!(reparsed.to_string(), printed);
+        }
+    }
+
+    #[test]
     fn test_variable_index_bounds() {
         for sql in ["SELECT ?0", "SELECT ?250001"] {
             let mut p = Parser::new(sql.as_bytes());
