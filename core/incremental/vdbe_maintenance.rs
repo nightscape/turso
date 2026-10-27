@@ -230,7 +230,7 @@ impl Connection {
         Ok(plan
             .chosen_value_collations()
             .into_iter()
-            .map(|collation| collation.map(|collation| collation.name()))
+            .map(|chosen| chosen.map(|chosen| chosen.name()))
             .collect())
     }
 }

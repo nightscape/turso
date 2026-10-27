@@ -5,13 +5,15 @@ use super::members::{
     emit_member_key, member_columns_width, MemberTable,
 };
 use super::output::{DeltaSource, EmittedNodeOutput, NodeOutputContract};
-use super::plan::{tracks_distinct_values, uses_multiset, OperatorStateDef};
+use super::plan::{
+    recomputes_from_members, tracks_distinct_values, uses_multiset, OperatorStateDef,
+};
 use super::stream::{
     btree_arrangement, emit_operator_rowid_delta, open_ephemeral_delta, synthesized_view_table,
     ArrangementIdentityColumn, DeltaIdentity, EphemeralDelta,
 };
 use super::MaintenanceInput;
-use crate::function::AggFunc;
+use crate::function::{AccumulatorFunc, AggFunc};
 use crate::incremental::dag;
 use crate::namespace::NamespaceId;
 use crate::schema::Schema;
@@ -25,9 +27,10 @@ use crate::translate::plan::Aggregate;
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
-    to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, IvmSumData, IvmSumFinalizeData,
-    IvmSumKind, RegisterOrLiteral,
+    to_u32, AggStepData, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, IvmSumData,
+    IvmSumFinalizeData, IvmSumKind, RegisterOrLiteral,
 };
+use crate::vdbe::BranchOffset;
 use crate::{Connection, LimboError, Result};
 use turso_parser::ast;
 
@@ -301,6 +304,9 @@ fn emit_group_aggregate_rows(
     let has_before_reg = program.alloc_register();
     let has_after_reg = program.alloc_register();
     let touched_group_record_reg = program.alloc_register();
+    // A member's value and count while recomputing a group's result.
+    let member_value_reg = program.alloc_register();
+    let member_count_reg = program.alloc_register();
 
     program.emit_int(0, zero_reg);
     program.emit_int(1, plus_one_reg);
@@ -516,6 +522,7 @@ fn emit_group_aggregate_rows(
     for (i, agg) in aggregates.iter().enumerate() {
         let is_minmax = matches!(agg.func, AggFunc::Min | AggFunc::Max);
         let is_distinct = tracks_distinct_values(agg);
+        let is_recomputed = recomputes_from_members(agg);
         let aggregate_done_label = program.allocate_label();
         if let Some(filter_expr) = &agg.filter_expr {
             let apply_aggregate_label = program.allocate_label();
@@ -550,7 +557,7 @@ fn emit_group_aggregate_rows(
             None => None,
         };
 
-        if !(is_minmax || is_distinct) {
+        if !(is_minmax || is_distinct || is_recomputed) {
             // Every remaining aggregate is linear: a row of weight w changes
             // its state by w times the row's contribution, in one step.
             let offset = payload_offsets[i].expect("Count/Sum/Total/Avg have a payload");
@@ -560,16 +567,19 @@ fn emit_group_aggregate_rows(
         }
 
         // Add the weight to the value's count in the aggregate's multiset.
-        // NULLs are ignored, matching aggregate NULL semantics.
-        let col_reg = col_reg.expect("MIN/MAX and DISTINCT aggregates have an argument");
+        // NULLs are ignored, matching aggregate NULL semantics, except by
+        // json_group_array, which lists them.
+        let col_reg = col_reg.expect("a multiset aggregate has an argument");
         let multiset = multisets[i]
             .as_ref()
             .expect("DAG validation guarantees one multiset per multiset aggregate");
         let value_key = multiset_keys[i].expect("a multiset aggregate has a value key");
-        program.emit_insn(Insn::IsNull {
-            reg: col_reg,
-            target_pc: aggregate_done_label,
-        });
+        if !matches!(agg.func, AggFunc::JsonGroupArray) {
+            program.emit_insn(Insn::IsNull {
+                reg: col_reg,
+                target_pc: aggregate_done_label,
+            });
+        }
         program.emit_insn(Insn::Copy {
             src_reg: incoming_group_start,
             dst_reg: value_key_start,
@@ -865,6 +875,24 @@ fn emit_group_aggregate_rows(
                     dest_end: None,
                 });
                 program.preassign_label_to_next_insn(have_label);
+            } else if recomputes_from_members(agg) {
+                let multiset = multisets[i]
+                    .as_ref()
+                    .expect("a recomputed aggregate owns a multiset table");
+                emit_recompute_from_members(
+                    program,
+                    agg,
+                    multiset,
+                    RecomputeRegisters {
+                        group_start,
+                        group_width: k,
+                        seek_start: value_key_start,
+                        member_value: member_value_reg,
+                        member_count: member_count_reg,
+                        result: value_reg,
+                    },
+                    corrupt_label,
+                );
             } else if let Some(kind) = ivm_sum_kind(&agg.func) {
                 let offset = payload_offsets[i].expect("Sum/Total/Avg have a payload");
                 program.emit_insn(Insn::IvmSumFinalize {
@@ -1113,6 +1141,96 @@ fn emit_group_aggregate_rows(
 
     drop(syms);
     Ok(())
+}
+
+struct RecomputeRegisters {
+    group_start: usize,
+    group_width: usize,
+    seek_start: usize,
+    member_value: usize,
+    member_count: usize,
+    result: usize,
+}
+
+/// Compute the result of `agg` for the group at `registers.group_start` from
+/// the members of its multiset table, in index order, into `registers.result`.
+fn emit_recompute_from_members(
+    program: &mut ProgramBuilder,
+    agg: &Aggregate,
+    multiset: &MemberTable,
+    registers: RecomputeRegisters,
+    corrupt_label: BranchOffset,
+) {
+    let k = registers.group_width;
+    let index_cursor_id = multiset.index_cursor_id();
+    let func = AccumulatorFunc::Agg(agg.func.clone());
+    let done_label = program.allocate_label();
+    let member_loop_label = program.allocate_label();
+    let step_loop_label = program.allocate_label();
+    let next_member_label = program.allocate_label();
+
+    program.emit_insn(Insn::Copy {
+        src_reg: registers.group_start,
+        dst_reg: registers.seek_start,
+        extra_amount: k.saturating_sub(1),
+    });
+    program.emit_insn(Insn::Null {
+        dest: registers.result,
+        dest_end: None,
+    });
+    program.emit_insn(Insn::SeekGE {
+        is_index: true,
+        cursor_id: index_cursor_id,
+        start_reg: registers.seek_start,
+        num_regs: k,
+        target_pc: done_label,
+        eq_only: false,
+        null_matching_mask: Default::default(),
+    });
+    program.preassign_label_to_next_insn(member_loop_label);
+    program.emit_insn(Insn::IdxGT {
+        cursor_id: index_cursor_id,
+        start_reg: registers.seek_start,
+        num_regs: k,
+        target_pc: done_label,
+    });
+    program.emit_insn(Insn::Column {
+        cursor_id: index_cursor_id,
+        column: k,
+        dest: registers.member_value,
+        default: None,
+    });
+    multiset.emit_load_count(program, registers.member_count, corrupt_label);
+    program.preassign_label_to_next_insn(step_loop_label);
+    program.emit_insn(Insn::AggStep {
+        data: Box::new(AggStepData {
+            acc_reg: registers.result,
+            col: registers.member_value,
+            delimiter: 0,
+            func: func.clone(),
+            comparator: None,
+            collation: None,
+        }),
+    });
+    program.emit_insn(Insn::DecrJumpZero {
+        reg: registers.member_count,
+        target_pc: next_member_label,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: step_loop_label,
+    });
+    program.preassign_label_to_next_insn(next_member_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: index_cursor_id,
+        pc_if_next: member_loop_label,
+        fullscan: false,
+        is_index: true,
+    });
+    program.preassign_label_to_next_insn(done_label);
+    program.emit_insn(Insn::AggFinal {
+        register: registers.result,
+        func,
+    });
 }
 
 /// Read the member that the class of the value key at

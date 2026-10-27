@@ -27,7 +27,9 @@ use crate::{Connection, LimboError, QueryMode, Result};
 /// value once by definition, so DISTINCT changes nothing for them — their
 /// multiset participation is about extremes, not distinctness.
 pub(super) fn tracks_distinct_values(agg: &Aggregate) -> bool {
-    agg.distinctness.is_distinct() && !matches!(agg.func, AggFunc::Min | AggFunc::Max)
+    agg.distinctness.is_distinct()
+        && !matches!(agg.func, AggFunc::Min | AggFunc::Max)
+        && !recomputes_from_members(agg)
 }
 
 fn unsupported<T>(what: &str) -> Result<T> {
@@ -141,9 +143,8 @@ fn validate_supported_aggregate(agg: &Aggregate) -> Result<()> {
         | AggFunc::Total
         | AggFunc::Avg
         | AggFunc::Min
-        | AggFunc::Max => {}
-        // GROUP_CONCAT and friends have no inverse and no multiset-based
-        // retraction strategy.
+        | AggFunc::Max
+        | AggFunc::JsonGroupArray => {}
         ref other => return unsupported(&format!("the {} aggregate", other.as_str())),
     }
     if agg.args.len() > 1 {
@@ -454,11 +455,9 @@ fn build_select_plan_dag(
                     "a MIN/MAX or DISTINCT aggregate has no argument".to_string(),
                 )
             })?;
-            multiset_keys.push(Some(key_column(
-                argument,
-                &plan.table_references,
-                resolver,
-            )?));
+            let mut value_key = key_column(argument, &plan.table_references, resolver)?;
+            value_key.ambiguous |= recomputes_from_members(aggregate);
+            multiset_keys.push(Some(value_key));
         }
         node = builder.push(dag::OpNode::Aggregate {
             input: node,
@@ -874,21 +873,38 @@ impl MaintenancePlan {
     /// that pass the value on unchanged. A value computed from a chosen
     /// value is not reported.
     #[cfg(feature = "test_helper")]
-    pub(crate) fn chosen_value_collations(&self) -> Vec<Option<CollationSeq>> {
+    pub(crate) fn chosen_value_collations(&self) -> Vec<Option<ChosenValue>> {
         let dag = &self.dag;
-        let mut chosen: Vec<Vec<Option<CollationSeq>>> = Vec::with_capacity(dag.nodes.len());
-        // The collation of input column `expr` when it passes on a chosen
-        // value unchanged.
-        let passed_on = |chosen: &[Vec<Option<CollationSeq>>], input: dag::NodeId, expr| {
-            dag.output_schema(input)
-                .columns
-                .iter()
-                .position(|column| {
-                    column
-                        .as_ref()
-                        .is_some_and(|column| crate::util::exprs_are_equivalent(column, expr))
-                })
-                .and_then(|position| chosen[input][position])
+        let mut chosen: Vec<Vec<Option<ChosenValue>>> = Vec::with_capacity(dag.nodes.len());
+        // The chosen value of input column `expr` when it passes on a chosen
+        // value unchanged, or, for an aggregate with unordered elements, with
+        // a default for NULL: `COALESCE(column, literal)`.
+        let passed_on = |chosen: &[Vec<Option<ChosenValue>>], input: dag::NodeId, expr| {
+            let chosen_input_column = |expr: &ast::Expr| {
+                dag.output_schema(input)
+                    .columns
+                    .iter()
+                    .position(|column| {
+                        column
+                            .as_ref()
+                            .is_some_and(|column| crate::util::exprs_are_equivalent(column, expr))
+                    })
+                    .and_then(|position| chosen[input][position].clone())
+            };
+            chosen_input_column(expr).or_else(|| {
+                let ast::Expr::FunctionCall { name, args, .. } = expr else {
+                    return None;
+                };
+                match args.as_slice() {
+                    [column, default]
+                        if name.as_str().eq_ignore_ascii_case("coalesce")
+                            && matches!(**default, ast::Expr::Literal(_)) =>
+                    {
+                        chosen_input_column(column).filter(ChosenValue::has_unordered_elements)
+                    }
+                    _ => None,
+                }
+            })
         };
         for (node_id, node) in dag.nodes.iter().enumerate() {
             let width = dag.output_schema(node_id).len();
@@ -908,7 +924,7 @@ impl MaintenancePlan {
                 } => [&chosen[inputs[0]], &chosen[inputs[1]]]
                     .into_iter()
                     .flatten()
-                    .copied()
+                    .cloned()
                     .collect(),
                 dag::OpNode::Join { inputs, .. } => chosen[inputs[0]].clone(),
                 dag::OpNode::Pad {
@@ -916,7 +932,7 @@ impl MaintenancePlan {
                     before,
                     after,
                 } => std::iter::repeat_n(None, before.len())
-                    .chain(chosen[*input].iter().copied())
+                    .chain(chosen[*input].iter().cloned())
                     .chain(std::iter::repeat_n(None, after.len()))
                     .collect(),
                 dag::OpNode::Aggregate {
@@ -930,9 +946,9 @@ impl MaintenancePlan {
                     // A key or MIN/MAX value is chosen here when its class can
                     // hold several exact values, and otherwise stays chosen
                     // when its input column was.
-                    let chosen_value = |expr, key: dag::KeyColumn| {
+                    let chosen_value = |expr, key: dag::KeyColumn| -> Option<ChosenValue> {
                         if key.ambiguous {
-                            Some(key.collation)
+                            Some(ChosenValue::Collation(key.collation))
                         } else {
                             passed_on(&chosen, *input, expr)
                         }
@@ -952,6 +968,9 @@ impl MaintenancePlan {
                                             Some(key),
                                             Some(argument),
                                         ) => chosen_value(argument, *key),
+                                        (AggFunc::JsonGroupArray, _, _) => {
+                                            Some(ChosenValue::JsonArray)
+                                        }
                                         _ => None,
                                     }
                                 }),
@@ -967,14 +986,42 @@ impl MaintenancePlan {
                         key_columns
                             .get(index)
                             .filter(|key| key.ambiguous)
-                            .map(|key| key.collation)
-                            .or_else(|| inputs.iter().find_map(|input| chosen[*input][index]))
+                            .map(|key| ChosenValue::Collation(key.collation))
+                            .or_else(|| {
+                                inputs
+                                    .iter()
+                                    .find_map(|input| chosen[*input][index].clone())
+                            })
                     })
                     .collect(),
             };
             chosen.push(columns);
         }
         chosen.swap_remove(dag.root)
+    }
+}
+
+/// How a test tool compares a view column whose value maintenance chose among
+/// several that SQL treats as equal (see `chosen_value_collations`).
+#[cfg(feature = "test_helper")]
+#[derive(Clone, Debug)]
+pub(crate) enum ChosenValue {
+    Collation(CollationSeq),
+    /// A `json_group_array` result: its elements are in no defined order.
+    JsonArray,
+}
+
+#[cfg(feature = "test_helper")]
+impl ChosenValue {
+    pub(crate) fn name(&self) -> String {
+        match self {
+            Self::Collation(collation) => collation.name(),
+            Self::JsonArray => "json_group_array".to_string(),
+        }
+    }
+
+    fn has_unordered_elements(&self) -> bool {
+        !matches!(self, Self::Collation(_))
     }
 }
 
@@ -1824,7 +1871,16 @@ fn state_table_sql(state_table_name: &str, node: &dag::OpNode) -> Result<String>
 /// (to find the next extreme after a retraction) and DISTINCT aggregates (to
 /// step the accumulator only on first occurrence of a value).
 pub(super) fn uses_multiset(agg: &Aggregate) -> bool {
-    matches!(agg.func, AggFunc::Min | AggFunc::Max) || tracks_distinct_values(agg)
+    matches!(agg.func, AggFunc::Min | AggFunc::Max)
+        || tracks_distinct_values(agg)
+        || recomputes_from_members(agg)
+}
+
+/// Whether an aggregate has no inverse: after a change, its group's result is
+/// computed again from every member of the group, which the multiset table
+/// keeps with exact values.
+pub(super) fn recomputes_from_members(agg: &Aggregate) -> bool {
+    matches!(agg.func, AggFunc::JsonGroupArray)
 }
 
 /// One aggregate's value multiset: one row per (group, value) with its
