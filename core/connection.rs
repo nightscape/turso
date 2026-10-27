@@ -4450,6 +4450,11 @@ impl Connection {
     where
         F: Fn(&crate::types::RelationChangeEvent) + Send + Sync + 'static,
     {
+        if self.mv_store().is_some() {
+            return Err(LimboError::InvalidArgument(
+                "change callbacks are not supported on an MVCC database".to_string(),
+            ));
+        }
         Ok(self.db.change_callbacks.add(filter, Arc::new(callback)))
     }
 

@@ -19581,6 +19581,15 @@ fn op_journal_mode_inner(
                     ).into());
                 }
                 if matches!(new_mode, journal_mode::JournalMode::Mvcc)
+                    && program.connection.db.change_callbacks.any()
+                {
+                    return Err(LimboError::InvalidArgument(
+                        "cannot change journal_mode to mvcc while change callbacks are registered: MVCC does not support change callbacks"
+                            .to_string(),
+                    )
+                    .into());
+                }
+                if matches!(new_mode, journal_mode::JournalMode::Mvcc)
                     && pager.has_external_page_codec()
                 {
                     return Err(LimboError::InvalidArgument(
