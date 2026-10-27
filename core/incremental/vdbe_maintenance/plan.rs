@@ -968,8 +968,10 @@ impl MaintenancePlan {
                                             Some(key),
                                             Some(argument),
                                         ) => chosen_value(argument, *key),
-                                        (AggFunc::JsonGroupArray, _, _) => {
-                                            Some(ChosenValue::JsonArray)
+                                        (AggFunc::JsonGroupArray, key, _) => {
+                                            Some(ChosenValue::JsonArray(element_collation(
+                                                aggregate, *key,
+                                            )))
                                         }
                                         _ => None,
                                     }
@@ -1007,8 +1009,9 @@ impl MaintenancePlan {
 #[derive(Clone, Debug)]
 pub(crate) enum ChosenValue {
     Collation(CollationSeq),
-    /// A `json_group_array` result: its elements are in no defined order.
-    JsonArray,
+    /// A `json_group_array` result: its elements are in no defined order,
+    /// and equal when equal under the collation.
+    JsonArray(CollationSeq),
 }
 
 #[cfg(feature = "test_helper")]
@@ -1016,12 +1019,31 @@ impl ChosenValue {
     pub(crate) fn name(&self) -> String {
         match self {
             Self::Collation(collation) => collation.name(),
-            Self::JsonArray => "json_group_array".to_string(),
+            Self::JsonArray(collation) => {
+                format!("json_group_array{}", collation_suffix(*collation))
+            }
         }
     }
 
     fn has_unordered_elements(&self) -> bool {
         !matches!(self, Self::Collation(_))
+    }
+}
+
+#[cfg(feature = "test_helper")]
+fn collation_suffix(collation: CollationSeq) -> String {
+    match collation {
+        CollationSeq::Binary => String::new(),
+        other => format!("/{}", other.name()),
+    }
+}
+
+/// The collation under which the elements of a DISTINCT aggregate are equal.
+#[cfg(feature = "test_helper")]
+fn element_collation(aggregate: &Aggregate, key: Option<dag::KeyColumn>) -> CollationSeq {
+    match key {
+        Some(key) if aggregate.distinctness.is_distinct() => key.collation,
+        _ => CollationSeq::Binary,
     }
 }
 

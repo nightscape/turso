@@ -18,6 +18,7 @@ use crate::incremental::dag;
 use crate::namespace::NamespaceId;
 use crate::schema::Schema;
 use crate::sync::Arc;
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
     translate_condition_expr, translate_expr_no_constant_opt, ConditionMetadata,
@@ -309,6 +310,8 @@ fn emit_group_aggregate_rows(
     let member_value_reg = program.alloc_register();
     let member_subtype_reg = program.alloc_register();
     let member_count_reg = program.alloc_register();
+    let previous_value_reg = program.alloc_register();
+    let has_previous_reg = program.alloc_register();
 
     program.emit_int(0, zero_reg);
     program.emit_int(1, plus_one_reg);
@@ -899,6 +902,13 @@ fn emit_group_aggregate_rows(
                         member_subtype: member_subtype_reg,
                         subtype_column,
                         member_count: member_count_reg,
+                        previous_value: previous_value_reg,
+                        has_previous: has_previous_reg,
+                        distinct_collation: agg
+                            .distinctness
+                            .is_distinct()
+                            .then(|| multiset_keys[i].map(|key| key.collation))
+                            .flatten(),
                         result: value_reg,
                     },
                     corrupt_label,
@@ -1161,6 +1171,9 @@ struct RecomputeRegisters {
     member_subtype: usize,
     subtype_column: usize,
     member_count: usize,
+    previous_value: usize,
+    has_previous: usize,
+    distinct_collation: Option<CollationSeq>,
     result: usize,
 }
 
@@ -1178,8 +1191,19 @@ fn emit_recompute_from_members(
     let func = AccumulatorFunc::Agg(agg.func.clone());
     let done_label = program.allocate_label();
     let member_loop_label = program.allocate_label();
-    let step_loop_label = program.allocate_label();
     let next_member_label = program.allocate_label();
+    let emit_step = |program: &mut ProgramBuilder| {
+        program.emit_insn(Insn::AggStep {
+            data: Box::new(AggStepData {
+                acc_reg: registers.result,
+                col: registers.member_value,
+                delimiter: 0,
+                func: func.clone(),
+                comparator: None,
+                collation: None,
+            }),
+        });
+    };
 
     program.emit_insn(Insn::Copy {
         src_reg: registers.group_start,
@@ -1190,6 +1214,7 @@ fn emit_recompute_from_members(
         dest: registers.result,
         dest_end: None,
     });
+    program.emit_int(0, registers.has_previous);
     program.emit_insn(Insn::SeekGE {
         is_index: true,
         cursor_id: index_cursor_id,
@@ -1222,25 +1247,44 @@ fn emit_recompute_from_members(
         subtype_reg: registers.member_subtype,
         dest_reg: registers.member_value,
     });
-    multiset.emit_load_count(program, registers.member_count, corrupt_label);
-    program.preassign_label_to_next_insn(step_loop_label);
-    program.emit_insn(Insn::AggStep {
-        data: Box::new(AggStepData {
-            acc_reg: registers.result,
-            col: registers.member_value,
-            delimiter: 0,
-            func: func.clone(),
-            comparator: None,
-            collation: None,
-        }),
-    });
-    program.emit_insn(Insn::DecrJumpZero {
-        reg: registers.member_count,
-        target_pc: next_member_label,
-    });
-    program.emit_insn(Insn::Goto {
-        target_pc: step_loop_label,
-    });
+    match registers.distinct_collation {
+        Some(collation) => {
+            let new_class_label = program.allocate_label();
+            program.emit_insn(Insn::IfNot {
+                reg: registers.has_previous,
+                target_pc: new_class_label,
+                jump_if_null: false,
+            });
+            program.emit_insn(Insn::Eq {
+                lhs: registers.member_value,
+                rhs: registers.previous_value,
+                target_pc: next_member_label,
+                flags: CmpInsFlags::default().null_eq(),
+                collation: Some(collation),
+            });
+            program.preassign_label_to_next_insn(new_class_label);
+            program.emit_insn(Insn::Copy {
+                src_reg: registers.member_value,
+                dst_reg: registers.previous_value,
+                extra_amount: 0,
+            });
+            program.emit_int(1, registers.has_previous);
+            emit_step(program);
+        }
+        None => {
+            let step_loop_label = program.allocate_label();
+            multiset.emit_load_count(program, registers.member_count, corrupt_label);
+            program.preassign_label_to_next_insn(step_loop_label);
+            emit_step(program);
+            program.emit_insn(Insn::DecrJumpZero {
+                reg: registers.member_count,
+                target_pc: next_member_label,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: step_loop_label,
+            });
+        }
+    }
     program.preassign_label_to_next_insn(next_member_label);
     program.emit_insn(Insn::Next {
         cursor_id: index_cursor_id,
