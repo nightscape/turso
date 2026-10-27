@@ -434,6 +434,12 @@ impl ToTokens for Stmt {
                 s.append(TK_AS, None)?;
                 select.to_tokens(s, context)
             }
+            Self::RefreshMaterializedView { view_name } => {
+                s.append(TK_REFRESH, None)?;
+                s.append(TK_MATERIALIZED, None)?;
+                s.append(TK_VIEW, None)?;
+                view_name.to_tokens(s, context)
+            }
             Self::CreateMaterializedView {
                 if_not_exists,
                 view_name,

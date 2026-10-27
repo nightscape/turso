@@ -78,6 +78,7 @@ impl StmtClass {
             | Stmt::CreateTrigger { .. }
             | Stmt::CreateView { .. }
             | Stmt::CreateMaterializedView { .. }
+            | Stmt::RefreshMaterializedView { .. }
             | Stmt::CreateVirtualTable(_)
             | Stmt::CreateType { .. }
             | Stmt::CreateDomain { .. }

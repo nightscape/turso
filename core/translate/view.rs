@@ -12,7 +12,7 @@ use crate::util::{
     PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX,
 };
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
+use crate::vdbe::insn::{ClearBtreeCount, CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
 use crate::{bail_parse_error, Connection, Result, MAIN_DB_ID};
 use turso_parser::ast;
 
@@ -181,34 +181,7 @@ pub fn translate_create_materialized_view(
         db: database_id,
     });
 
-    // Clear any existing data in the btree
-    // This is important because if we're reusing a page that previously held
-    // a materialized view, there might be old data still there
-    // We need to start with a clean slate
-    let clear_loop_label = program.allocate_label();
-    let clear_done_label = program.allocate_label();
-
-    // Rewind to the beginning of the btree
-    program.emit_insn(Insn::Rewind {
-        cursor_id: view_cursor_id,
-        pc_if_empty: clear_done_label,
-    });
-
-    // Loop to delete all rows
-    program.preassign_label_to_next_insn(clear_loop_label);
-    program.emit_insn(Insn::Delete {
-        cursor_id: view_cursor_id,
-        table_name: normalized_view_name.clone(),
-        is_part_of_update: false,
-    });
-    program.emit_insn(Insn::Next {
-        cursor_id: view_cursor_id,
-        pc_if_next: clear_loop_label,
-        fullscan: false,
-        is_index: false,
-    });
-
-    program.preassign_label_to_next_insn(clear_done_label);
+    emit_clear_view_rows(program, view_cursor_id, &normalized_view_name);
 
     // Open cursor to sqlite_schema table
     let table = resolver.with_schema(database_id, |s| {
@@ -313,6 +286,139 @@ pub fn translate_create_materialized_view(
 
     program.epilogue(resolver.schema());
     Ok(())
+}
+
+pub fn translate_refresh_materialized_view(
+    view_name: &ast::QualifiedName,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    if !connection.experimental_views_enabled() {
+        return Err(crate::LimboError::ParseError(
+            "REFRESH MATERIALIZED VIEW is an experimental feature. Enable with --experimental-views flag"
+                .to_string(),
+        ));
+    }
+    if connection.mvcc_enabled() {
+        bail_parse_error!("Materialized views are not supported in MVCC mode");
+    }
+    let normalized_view_name = normalize_ident(view_name.name.as_str());
+    let Some(namespace) = resolver.find_existing_table(view_name)? else {
+        bail_parse_error!("no such materialized view: {normalized_view_name}");
+    };
+    let database_id = namespace.database_id;
+    if database_id != MAIN_DB_ID {
+        bail_parse_error!("materialized views are not supported on attached databases");
+    }
+    let (is_materialized, is_incompatible, exists) = resolver.with_schema(database_id, |s| {
+        (
+            s.is_materialized_view(namespace.id, &normalized_view_name),
+            s.incompatible_materialized_view_root(namespace.id, &normalized_view_name)
+                .is_some(),
+            s.get_object_type(namespace.id, &normalized_view_name)
+                .is_some(),
+        )
+    });
+    if is_incompatible {
+        bail_parse_error!(
+            "materialized view {normalized_view_name} has an incompatible storage version; DROP and recreate it"
+        );
+    }
+    if !is_materialized {
+        if exists {
+            bail_parse_error!("{normalized_view_name} is not a materialized view");
+        }
+        bail_parse_error!("no such materialized view: {normalized_view_name}");
+    }
+
+    let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+    program.begin_write_on_database(database_id, schema_cookie)?;
+
+    let view_table = resolver
+        .with_schema(database_id, |s| {
+            s.get_btree_table(namespace.id, &normalized_view_name)
+        })
+        .expect("a materialized view has a btree table");
+    let view_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(view_table.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: view_cursor_id,
+        root_page: RegisterOrLiteral::Literal(view_table.root_page),
+        db: database_id,
+    });
+
+    emit_clear_view_rows(program, view_cursor_id, &normalized_view_name);
+    emit_clear_view_hidden_tables(program, resolver, namespace, &normalized_view_name);
+
+    program.emit_insn(Insn::PopulateMaterializedViews {
+        cursors: vec![(normalized_view_name, view_cursor_id)],
+    });
+
+    program.epilogue(resolver.schema());
+    Ok(())
+}
+
+fn emit_clear_view_hidden_tables(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    normalized_view_name: &str,
+) {
+    let database_id = namespace.database_id;
+    let roots: Vec<i64> = resolver.with_schema(database_id, |s| {
+        s.table_names(namespace.id)
+            .filter(|table_name| {
+                crate::incremental::view::state_table_belongs_to_view(
+                    table_name,
+                    normalized_view_name,
+                )
+            })
+            .flat_map(|table_name| {
+                let table_root = s
+                    .get_btree_table(namespace.id, table_name)
+                    .expect("hidden state table has a btree")
+                    .root_page;
+                let index_roots = s
+                    .get_indices(namespace.id, table_name)
+                    .map(|index| index.root_page);
+                std::iter::once(table_root)
+                    .chain(index_roots)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    });
+    for root in roots {
+        program.emit_insn(Insn::ClearBtree {
+            db: database_id,
+            root,
+            count: ClearBtreeCount::Nothing,
+        });
+    }
+}
+
+fn emit_clear_view_rows(program: &mut ProgramBuilder, view_cursor_id: usize, view_name: &str) {
+    let clear_loop_label = program.allocate_label();
+    let clear_done_label = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: view_cursor_id,
+        pc_if_empty: clear_done_label,
+    });
+
+    program.preassign_label_to_next_insn(clear_loop_label);
+    program.emit_insn(Insn::Delete {
+        cursor_id: view_cursor_id,
+        table_name: view_name.to_string(),
+        is_part_of_update: false,
+    });
+    program.emit_insn(Insn::Next {
+        cursor_id: view_cursor_id,
+        pc_if_next: clear_loop_label,
+        fullscan: false,
+        is_index: false,
+    });
+
+    program.preassign_label_to_next_insn(clear_done_label);
 }
 
 fn validate_create_view(
