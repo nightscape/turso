@@ -550,3 +550,39 @@ fn an_index_on_an_incompatible_view_does_not_block_open() -> anyhow::Result<()> 
     );
     Ok(())
 }
+
+/// A trigger that reads the view while the statement that fired it is still
+/// running sees the statement's own rows, whether or not it uses the index.
+#[turso_macros::test(views)]
+fn a_trigger_sees_the_running_statement_through_the_index(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT)")?;
+    conn.execute("CREATE TABLE seen (via TEXT, k TEXT, n INTEGER)")?;
+    conn.execute("CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t")?;
+    conn.execute("CREATE INDEX idx_v_k ON v(k)")?;
+    conn.execute(
+        "CREATE TRIGGER t_seen AFTER INSERT ON t BEGIN \
+         INSERT INTO seen SELECT 'index', NEW.k, count(*) FROM v WHERE k = NEW.k; \
+         INSERT INTO seen SELECT 'scan', NEW.k, count(*) FROM v NOT INDEXED WHERE k = NEW.k; \
+         END",
+    )?;
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'a'), (3, 'b')")?;
+
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT count(*) FROM seen"),
+        vec![vec![Value::Integer(6)]]
+    );
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT i.k, i.n, s.n FROM seen i JOIN seen s \
+             ON s.rowid = i.rowid + 1 AND i.via = 'index' AND s.via = 'scan' \
+             WHERE i.n != s.n ORDER BY i.rowid"
+        ),
+        Vec::<Vec<Value>>::new(),
+        "an indexed read in a trigger disagrees with a scan"
+    );
+    Ok(())
+}
