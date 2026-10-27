@@ -612,6 +612,32 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_columns_can_match_their_elements_under_a_collation() {
+        let text = |value: &str| vec![Value::Text(value.to_string())];
+        let view = result(1, vec![text(r#"["a","b"]"#)]);
+        let other_case = result(1, vec![text(r#"["B","A"]"#)]);
+        let nocase = [ChosenValueCollation::from_name("json_group_array/NOCASE")];
+        let binary = [ChosenValueCollation::from_name("json_group_array")];
+        assert!(diff_result_sets_with_chosen_values(&view, &other_case, &nocase).is_empty());
+        assert!(!diff_result_sets_with_chosen_values(&view, &other_case, &binary).is_empty());
+
+        let other_element = result(1, vec![text(r#"["B","C"]"#)]);
+        assert!(!diff_result_sets_with_chosen_values(&view, &other_element, &nocase).is_empty());
+
+        let view = result(1, vec![text("a | b")]);
+        let other_case = result(1, vec![text("B | A")]);
+        let nocase = [ChosenValueCollation::from_name("group_concat/NOCASE: | ")];
+        let binary = [ChosenValueCollation::from_name("group_concat: | ")];
+        assert!(diff_result_sets_with_chosen_values(&view, &other_case, &nocase).is_empty());
+        assert!(!diff_result_sets_with_chosen_values(&view, &other_case, &binary).is_empty());
+
+        let rtrim = [ChosenValueCollation::from_name("json_group_array/RTRIM")];
+        let view = result(1, vec![text(r#"["a ","b"]"#)]);
+        let trimmed = result(1, vec![text(r#"["b","a"]"#)]);
+        assert!(diff_result_sets_with_chosen_values(&view, &trimmed, &rtrim).is_empty());
+    }
+
+    #[test]
     fn invalid_row_arity_is_rejected() {
         assert_eq!(
             ResultSet::new(2, vec![Row(vec![Value::Integer(1)])]).unwrap_err(),
