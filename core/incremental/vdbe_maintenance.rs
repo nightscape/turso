@@ -190,6 +190,10 @@ fn compile_maintenance_plan(
         &ViewSink {
             root_page: view_root_page,
             num_columns: num_view_columns,
+            indexes: schema
+                .get_indices(crate::namespace::NamespaceId::ROOT, view_name)
+                .cloned()
+                .collect(),
         },
         schema,
         connection,

@@ -141,19 +141,30 @@ pub fn translate_create_index(
         }
         crate::bail_parse_error!("index {} already exists", original_idx_name.name.as_str());
     }
-    // Materialized views store their rows in a real table btree (so plain
-    // reads can use get_table() below like any other table), but writes to
-    // that btree go through the DBSP maintenance path (sink.rs), which emits
-    // raw Insert/Delete and has no notion of secondary indexes. An index
-    // created here would never be kept up to date by later changes to the
-    // view, silently going stale. Reject it the same way a plain view is
-    // rejected, rather than letting the engine look up a corrupt stale
-    // index on later reads.
     if resolver.with_schema(database_id, |s| {
         s.get_view(namespace.id, &tbl_name).is_some()
-            || s.is_materialized_view(namespace.id, &tbl_name)
     }) {
         crate::bail_parse_error!("views may not be indexed");
+    }
+    let is_materialized_view = resolver.with_schema(database_id, |s| {
+        s.is_materialized_view(namespace.id, &tbl_name)
+    });
+    if is_materialized_view {
+        let shape = if unique {
+            Some("UNIQUE index")
+        } else if where_clause.is_some() {
+            Some("partial index")
+        } else if using.is_some() {
+            Some("index method")
+        } else {
+            None
+        };
+        if let Some(shape) = shape {
+            crate::bail_parse_error!(
+                "{shape} on materialized view '{}' is not supported",
+                original_tbl_name.as_str()
+            );
+        }
     }
     let table = resolver.with_schema(database_id, |s| s.get_table(namespace.id, &tbl_name));
     let Some(table) = table else {
@@ -171,6 +182,12 @@ pub fn translate_create_index(
         bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
     }
     let columns = resolve_sorted_columns_with_resolver(&tbl, &columns, Some(resolver))?;
+    if is_materialized_view && columns.iter().any(|col| col.expr.is_some()) {
+        crate::bail_parse_error!(
+            "expression index on materialized view '{}' is not supported",
+            original_tbl_name.as_str()
+        );
+    }
 
     // Block CREATE INDEX on non-orderable custom type columns and STRUCT/UNION columns
     for col in &columns {
