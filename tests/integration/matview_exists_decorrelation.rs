@@ -5,7 +5,7 @@
 //! Shapes the rewrite cannot express must say so at DDL time and name the limitation;
 //! the failure this replaces was a view that reported success and answered empty.
 
-use crate::common::{limbo_exec_rows, TempDatabase};
+use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
 use rusqlite::types::Value;
 use std::sync::Arc;
 use turso_core::Connection;
@@ -366,5 +366,155 @@ fn a_computed_expression_alone_still_materializes() {
             &conn,
             "SELECT b.id FROM block b WHERE json_extract(b.properties, '$.task_state') = 'TODO'"
         ))
+    );
+}
+
+fn seed_holon(conn: &Arc<Connection>) {
+    limbo_exec_rows(
+        conn,
+        "CREATE TABLE block (id INTEGER PRIMARY KEY, properties TEXT)",
+    );
+    limbo_exec_rows(conn, "CREATE TABLE block_tags (block_id INTEGER, tag TEXT)");
+    limbo_exec_rows(
+        conn,
+        "CREATE TABLE block_requires (block_id INTEGER, required_id INTEGER)",
+    );
+    limbo_exec_rows(
+        conn,
+        "INSERT INTO block VALUES \
+         (1,'{\"task_state\":\"TODO\"}'),(2,'{\"task_state\":\"DONE\"}'), \
+         (3,'{\"task_state\":\"TODO\"}'),(4,'{\"task_state\":\"DONE\"}'),(5,'{}')",
+    );
+    limbo_exec_rows(
+        conn,
+        "INSERT INTO block_tags VALUES (1,'urgent'),(2,'urgent'),(3,'later')",
+    );
+    limbo_exec_rows(
+        conn,
+        "INSERT INTO block_requires VALUES (1,2),(3,2),(3,4),(5,1)",
+    );
+}
+
+fn maintain_through_holon_writes(conn: &Arc<Connection>, view: &str, view_sql: &str) {
+    limbo_exec_rows(
+        conn,
+        &format!("CREATE MATERIALIZED VIEW {view} AS {view_sql}"),
+    );
+    let check = |stage: &str| assert_view_matches(conn, view, view_sql, stage);
+    check("materializing over existing rows");
+
+    limbo_exec_rows(conn, "INSERT INTO block_requires VALUES (1,4)");
+    check("a second requirement for one row");
+    limbo_exec_rows(conn, "DELETE FROM block_requires WHERE block_id = 3");
+    check("removing every requirement of a row");
+    limbo_exec_rows(
+        conn,
+        "UPDATE block SET properties = '{\"task_state\":\"TODO\"}' WHERE id = 2",
+    );
+    check("a required row changing state");
+    limbo_exec_rows(
+        conn,
+        "INSERT INTO block_tags VALUES (4,'urgent'),(4,'urgent')",
+    );
+    check("duplicate tag rows");
+    limbo_exec_rows(conn, "DELETE FROM block WHERE id = 4");
+    check("deleting a required row");
+    limbo_exec_rows(
+        conn,
+        "INSERT INTO block VALUES (6,'{\"task_state\":\"TODO\"}')",
+    );
+    check("inserting an outer row");
+}
+
+/// The subquery reads a JOIN, which the planner cannot turn into a semi join.
+#[test]
+fn exists_over_a_join_maintains() {
+    let db = TempDatabase::builder().with_views(true).build();
+    let conn = db.connect_limbo();
+    seed_holon(&conn);
+
+    maintain_through_holon_writes(
+        &conn,
+        "blocked_by_open",
+        "SELECT b.id FROM block b WHERE EXISTS (SELECT 1 FROM block_requires bl \
+         JOIN block r ON r.id = bl.required_id \
+         WHERE bl.block_id = b.id AND json_extract(r.properties, '$.task_state') <> 'DONE')",
+    );
+}
+
+/// `json_extract` in the subquery's WHERE can fail on malformed JSON, so a join
+/// would have to skip rows the subquery tests.
+#[test]
+fn exists_with_a_json_filter_under_or_maintains() {
+    let db = TempDatabase::builder().with_views(true).build();
+    let conn = db.connect_limbo();
+    seed_holon(&conn);
+
+    maintain_through_holon_writes(
+        &conn,
+        "v",
+        "SELECT b.id FROM block b WHERE json_extract(b.properties, '$.task_state') = 'TODO' \
+         OR EXISTS (SELECT 1 FROM block_requires bl WHERE bl.block_id = b.id \
+         AND json_extract(bl.required_id, '$') = 2)",
+    );
+}
+
+/// An EXISTS inside an EXISTS that correlates to the query directly around it.
+#[test]
+fn nested_exists_maintains() {
+    let db = TempDatabase::builder().with_views(true).build();
+    let conn = db.connect_limbo();
+    seed_holon(&conn);
+
+    maintain_through_holon_writes(
+        &conn,
+        "v",
+        "SELECT b.id FROM block b WHERE EXISTS (SELECT 1 FROM block_requires bl \
+         WHERE bl.block_id = b.id AND EXISTS \
+         (SELECT 1 FROM block_tags bt WHERE bt.block_id = bl.required_id AND bt.tag = 'urgent'))",
+    );
+}
+
+/// A nested EXISTS that sits under an OR cannot become a join in the inner query.
+#[test]
+fn nested_exists_under_or_maintains() {
+    let db = TempDatabase::builder().with_views(true).build();
+    let conn = db.connect_limbo();
+    seed_holon(&conn);
+
+    maintain_through_holon_writes(
+        &conn,
+        "v",
+        "SELECT b.id FROM block b WHERE NOT EXISTS (SELECT 1 FROM block_requires bl \
+         WHERE bl.block_id = b.id AND (EXISTS \
+         (SELECT 1 FROM block_tags bt WHERE bt.block_id = bl.required_id AND bt.tag = 'urgent') \
+         OR bl.required_id = 4))",
+    );
+}
+
+#[track_caller]
+fn assert_refused_naming(db: &TempDatabase, conn: &Arc<Connection>, sql: &str, needle: &str) {
+    let err = limbo_exec_rows_fallible(db, conn, sql).expect_err("shape must be refused at DDL");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(needle),
+        "error must name the limitation ({needle}), got: {msg}"
+    );
+}
+
+/// A subquery two levels down that reads the outermost query is not supported.
+#[test]
+fn a_nested_exists_that_reads_two_levels_out_is_refused() {
+    let db = TempDatabase::builder().with_views(true).build();
+    let conn = db.connect_limbo();
+    seed_holon(&conn);
+
+    assert_refused_naming(
+        &db,
+        &conn,
+        "CREATE MATERIALIZED VIEW v AS SELECT b.id FROM block b \
+         WHERE EXISTS (SELECT 1 FROM block_requires bl WHERE bl.block_id = b.id AND EXISTS \
+         (SELECT 1 FROM block_tags bt WHERE bt.block_id = b.id AND bt.tag = 'urgent'))",
+        "directly around",
     );
 }
