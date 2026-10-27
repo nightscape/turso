@@ -87,6 +87,10 @@ pub fn check_statement_privileges(stmt: &ast::Stmt) -> Result<()> {
             Action::Drop,
             Object::View(view_name.name.as_str().to_string()),
         ),
+        ast::Stmt::RefreshMaterializedView { view_name } => PermissionDenied::owner(
+            Action::Alter,
+            Object::View(view_name.name.as_str().to_string()),
+        ),
         ast::Stmt::DropTrigger { trigger_name, .. } => PermissionDenied::owner(
             Action::Drop,
             Object::Trigger(trigger_name.name.as_str().to_string()),

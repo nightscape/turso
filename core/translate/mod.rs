@@ -231,6 +231,7 @@ fn translate_statement(
             | ast::Stmt::CreateTrigger { .. }
             | ast::Stmt::CreateView { .. }
             | ast::Stmt::CreateMaterializedView { .. }
+            | ast::Stmt::RefreshMaterializedView { .. }
             | ast::Stmt::CreateVirtualTable(..)
             | ast::Stmt::CreateType { .. }
             | ast::Stmt::CreateDomain { .. }
@@ -378,6 +379,9 @@ fn translate_statement(
             connection.clone(),
             program,
         )?,
+        ast::Stmt::RefreshMaterializedView { view_name } => {
+            view::translate_refresh_materialized_view(&view_name, resolver, connection, program)?
+        }
         ast::Stmt::CreateVirtualTable(vtab) => {
             translate_create_virtual_table(vtab, resolver, program, connection)?
         }
@@ -628,6 +632,7 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::CreateTrigger { .. } => "create_trigger",
         ast::Stmt::CreateView { .. } => "create_view",
         ast::Stmt::CreateMaterializedView { .. } => "create_materialized_view",
+        ast::Stmt::RefreshMaterializedView { .. } => "refresh_materialized_view",
         ast::Stmt::CreateVirtualTable(_) => "create_virtual_table",
         ast::Stmt::CreateType { .. } => "create_type",
         ast::Stmt::CreateDomain { .. } => "create_domain",

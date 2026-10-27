@@ -1818,6 +1818,7 @@ pub fn visit_stmt<V: AstVisitor>(stmt: &ast::Stmt, visitor: &mut V) -> Result<()
         | ast::Stmt::CreateTrigger { .. }
         | ast::Stmt::CreateView { .. }
         | ast::Stmt::CreateMaterializedView { .. }
+        | ast::Stmt::RefreshMaterializedView { .. }
         | ast::Stmt::CreateVirtualTable(_)
         | ast::Stmt::CreateType { .. }
         | ast::Stmt::CreateDomain { .. }
