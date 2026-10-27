@@ -256,3 +256,62 @@ expect {
     1|[{"k":4}]
     1
 }
+
+test matview-group-array-distinct {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, v TEXT);
+    CREATE MATERIALIZED VIEW mv AS
+      SELECT g, json_group_array(DISTINCT v) AS a, json_group_array(v) AS every FROM t GROUP BY g;
+    INSERT INTO t VALUES (1,1,'b'),(2,1,'a'),(3,1,'b'),(4,1,NULL),(5,1,NULL),(6,2,'a');
+    SELECT * FROM mv ORDER BY g;
+    DELETE FROM t WHERE id = 1;
+    SELECT * FROM mv ORDER BY g;
+    DELETE FROM t WHERE id = 3;
+    SELECT * FROM mv ORDER BY g;
+    DELETE FROM t WHERE id = 4;
+    SELECT * FROM mv ORDER BY g;
+    DELETE FROM t WHERE id = 5;
+    SELECT * FROM mv ORDER BY g;
+}
+expect {
+    1|[null,"a","b"]|[null,null,"a","b","b"]
+    2|["a"]|["a"]
+    1|[null,"a","b"]|[null,null,"a","b"]
+    2|["a"]|["a"]
+    1|[null,"a"]|[null,null,"a"]
+    2|["a"]|["a"]
+    1|[null,"a"]|[null,"a"]
+    2|["a"]|["a"]
+    1|["a"]|["a"]
+    2|["a"]|["a"]
+}
+
+test matview-group-array-distinct-numbers-equal-in-value {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, v);
+    CREATE MATERIALIZED VIEW mv AS
+      SELECT g, json_group_array(DISTINCT v) AS a FROM t GROUP BY g;
+    INSERT INTO t VALUES (1,1,2),(2,1,2.0),(3,1,3);
+    SELECT a FROM mv;
+    DELETE FROM t WHERE id = 1;
+    SELECT a FROM mv;
+}
+expect {
+    [2,3]
+    [2.0,3]
+}
+
+test matview-group-array-distinct-under-nocase {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, v TEXT COLLATE NOCASE);
+    CREATE MATERIALIZED VIEW mv AS
+      SELECT g, json_group_array(DISTINCT v) AS a FROM t GROUP BY g;
+    INSERT INTO t VALUES (1,1,'a'),(2,1,'A'),(3,1,'b');
+    SELECT a FROM mv;
+    DELETE FROM t WHERE id = 2;
+    SELECT a FROM mv;
+    DELETE FROM t WHERE id = 1;
+    SELECT a FROM mv;
+}
+expect {
+    ["A","b"]
+    ["a","b"]
+    ["b"]
+}
