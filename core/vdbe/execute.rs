@@ -16198,16 +16198,18 @@ pub fn op_populate_materialized_views(
         if state.populate_matviews_state.is_none() {
             state.populate_matviews_state = Some(crate::vdbe::PopulateMatViewsState {
                 view_idx: 0,
+                staged_row_changes_mark: conn.staged_row_changes_len(),
                 stmt: None,
             });
         }
-        let view_idx = state
+        let populate_state = state
             .populate_matviews_state
             .as_ref()
-            .expect("populate state was just initialized")
-            .view_idx;
+            .expect("populate state was just initialized");
+        let view_idx = populate_state.view_idx;
 
         if view_idx >= cursors.len() {
+            conn.truncate_staged_row_changes(populate_state.staged_row_changes_mark);
             state.populate_matviews_state = None;
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
