@@ -77,6 +77,8 @@ use arrangement::publish_node_output;
 
 mod top_k;
 use top_k::emit_top_k;
+mod fixpoint;
+use fixpoint::emit_fixpoint;
 
 /// What the maintenance program reads as its input relation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -278,6 +280,9 @@ fn build_plan_for_connection(
 /// The output table is keyed by [`dag::NodeId`], making fan-out explicit:
 /// downstream nodes consume the already-compiled [`NodeOutput`] of each
 /// declared input rather than recursively re-emitting its subtree.
+///
+/// The nodes of a recursive CTE's recursive arm are emitted by their
+/// fixpoint, which runs them once per round.
 fn emit_plan_nodes(
     program: &mut ProgramBuilder,
     view_name: &str,
@@ -287,13 +292,60 @@ fn emit_plan_nodes(
     connection: &Arc<Connection>,
 ) -> Result<NodeOutput> {
     let dag = plan.dag();
-    let operator_states = plan.operator_states();
+    let mut in_recursive_arm = vec![false; dag.nodes.len()];
+    for node in &dag.nodes {
+        if let dag::OpNode::Fixpoint {
+            inputs: [_, step],
+            body_start,
+        } = node
+        {
+            in_recursive_arm[*body_start..=*step].fill(true);
+        }
+    }
     let mut outputs: Vec<Option<NodeOutput>> = vec![None; dag.nodes.len()];
     for node_id in 0..dag.nodes.len() {
-        let operator_state = operator_states.for_node(node_id)?;
-        let output_contract = &operator_state.output;
+        if in_recursive_arm[node_id] {
+            continue;
+        }
+        outputs[node_id] = Some(emit_node(
+            program, view_name, plan, node_id, &outputs, input, schema, connection,
+        )?);
+    }
+
+    outputs[dag.root].take().ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "maintenance DAG root node {} was not compiled",
+            dag.root
+        ))
+    })
+}
+
+/// Emit one node from its inputs' outputs and publish its output.
+#[allow(clippy::too_many_arguments)]
+fn emit_node(
+    program: &mut ProgramBuilder,
+    view_name: &str,
+    plan: &MaintenancePlan,
+    node_id: dag::NodeId,
+    outputs: &[Option<NodeOutput>],
+    input: MaintenanceInput,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<NodeOutput> {
+    let dag = plan.dag();
+    let operator_state = plan.operator_states().for_node(node_id)?;
+    let output_contract = &operator_state.output;
+    {
         let output = match &dag.nodes[node_id] {
             dag::OpNode::Scan { .. } => scan_node_output(dag, node_id, output_contract, schema)?,
+            dag::OpNode::RecursiveInput { .. } => {
+                return Err(LimboError::InternalError(format!(
+                    "recursive CTE input {node_id} was emitted outside its fixpoint"
+                )))
+            }
+            dag::OpNode::Fixpoint { .. } => emit_fixpoint(
+                program, view_name, plan, node_id, outputs, input, schema, connection,
+            )?,
             dag::OpNode::Filter {
                 input: upstream,
                 predicate,
@@ -523,7 +575,7 @@ fn emit_plan_nodes(
                 )?
             }
         };
-        let output = publish_node_output(
+        publish_node_output(
             program,
             view_name,
             node_id,
@@ -531,16 +583,8 @@ fn emit_plan_nodes(
             input,
             operator_state,
             schema,
-        )?;
-        outputs[node_id] = Some(output);
+        )
     }
-
-    outputs[dag.root].take().ok_or_else(|| {
-        LimboError::InternalError(format!(
-            "maintenance DAG root node {} was not compiled",
-            dag.root
-        ))
-    })
 }
 
 fn emit_plan_to_sink(

@@ -15,8 +15,8 @@ use crate::translate::expr::{
 use crate::translate::optimizer::unnest::rewrite_correlated_subqueries;
 use crate::translate::optimizer::{optimize_plan, Optimizable};
 use crate::translate::plan::{
-    Aggregate, JoinType, NonFromClauseSubquery, Plan, QueryDestination, SelectPlan, SubqueryState,
-    TableReferences, WhereTerm,
+    Aggregate, JoinType, NonFromClauseSubquery, Plan, QueryDestination, RecursiveCtePlan,
+    SelectPlan, SubqueryState, TableReferences, WhereTerm,
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::select::prepare_select_plan;
@@ -182,7 +182,7 @@ fn build_dag_from_plan(
     resolver: &Resolver,
 ) -> Result<dag::MaintenanceDag> {
     let mut builder = dag::DagBuilder::new();
-    let mut root = build_plan_dag_node(&mut builder, plan, resolver)?;
+    let mut root = build_plan_dag_node(&mut builder, plan, resolver, None)?;
     if let Some(window) = window {
         root = builder.push(dag::OpNode::TopK {
             input: root,
@@ -276,13 +276,15 @@ fn constant_integer(expr: &ast::Expr) -> Result<i64> {
     }
 }
 
+/// `extra_result` is one more result column for every SELECT of `plan`.
 fn build_plan_dag_node(
     builder: &mut dag::DagBuilder,
     plan: &Plan,
     resolver: &Resolver,
+    extra_result: Option<&ast::Expr>,
 ) -> Result<dag::NodeId> {
     let root = match plan {
-        Plan::Select(select) => build_select_plan_dag(builder, select, resolver)?,
+        Plan::Select(select) => build_select_plan_dag(builder, select, resolver, extra_result)?,
         Plan::CompoundSelect {
             left,
             right_most,
@@ -295,16 +297,26 @@ fn build_plan_dag_node(
             }
             let mut inputs = Vec::with_capacity(left.len() + 1);
             for (branch, _) in left {
-                inputs.push(build_select_plan_dag(builder, branch, resolver)?);
+                inputs.push(build_select_plan_dag(
+                    builder,
+                    branch,
+                    resolver,
+                    extra_result,
+                )?);
             }
-            inputs.push(build_select_plan_dag(builder, right_most, resolver)?);
+            inputs.push(build_select_plan_dag(
+                builder,
+                right_most,
+                resolver,
+                extra_result,
+            )?);
 
             let operators: Vec<_> = left.iter().map(|(_, operator)| *operator).collect();
             let prefix_len = operators
                 .iter()
                 .rposition(|operator| *operator != ast::CompoundOperator::UnionAll)
                 .map_or(0, |last_dedup| last_dedup + 2);
-            let arity = right_most.result_columns.len();
+            let arity = right_most.result_columns.len() + usize::from(extra_result.is_some());
             let key_columns = if prefix_len == 0 {
                 Vec::new()
             } else {
@@ -331,9 +343,41 @@ fn build_plan_dag_node(
                 "materialized view planner produced a DML plan".to_string(),
             ));
         }
-        Plan::RecursiveCte(_) => return unsupported("recursive CTEs"),
+        Plan::RecursiveCte(cte) => build_recursive_cte_dag(builder, cte, resolver)?,
     };
     Ok(root)
+}
+
+/// Lower `WITH RECURSIVE` into a fixpoint over its seed arm and its recursive
+/// arm. The recursive arm also outputs the round of each row: one more than
+/// the round of the CTE row it read.
+fn build_recursive_cte_dag(
+    builder: &mut dag::DagBuilder,
+    cte: &RecursiveCtePlan,
+    resolver: &Resolver,
+) -> Result<dag::NodeId> {
+    if !cte.union_all {
+        return unsupported("recursive CTEs that use UNION");
+    }
+    if cte.limit.is_some() || cte.offset.is_some() || cte.queue_order.is_some() {
+        return unsupported("ORDER BY, LIMIT or OFFSET in recursive CTEs");
+    }
+    let initial = build_plan_dag_node(builder, &cte.initial_query, resolver, None)?;
+    let next_round = ast::Expr::Binary(
+        Box::new(ast::Expr::Column {
+            database: None,
+            table: cte.input_table_id,
+            column: builder.output_schema(initial).len(),
+            is_rowid_alias: false,
+        }),
+        ast::Operator::Add,
+        Box::new(ast::Expr::Literal(ast::Literal::Numeric("1".to_string()))),
+    );
+    let step = build_plan_dag_node(builder, &cte.recursive_query, resolver, Some(&next_round))?;
+    builder.push(dag::OpNode::Fixpoint {
+        inputs: [initial, step],
+        body_start: initial + 1,
+    })
 }
 
 fn synthesized_derived_table(
@@ -357,6 +401,7 @@ fn build_select_plan_dag(
     builder: &mut dag::DagBuilder,
     plan: &SelectPlan,
     resolver: &Resolver,
+    extra_result: Option<&ast::Expr>,
 ) -> Result<dag::NodeId> {
     if plan.limit.is_some() || plan.offset.is_some() {
         return unsupported("LIMIT or OFFSET");
@@ -438,6 +483,7 @@ fn build_select_plan_dag(
         .result_columns
         .iter()
         .map(|column| column.expr.clone())
+        .chain(extra_result.cloned())
         .collect::<Vec<_>>();
     node = builder.push(dag::OpNode::Project {
         input: node,
@@ -503,7 +549,7 @@ fn build_joined_rows_dag(
                 logical_id: joined.internal_id,
             })?,
             crate::schema::Table::FromClauseSubquery(subquery) => {
-                let input = build_plan_dag_node(builder, &subquery.plan, resolver)?;
+                let input = build_plan_dag_node(builder, &subquery.plan, resolver, None)?;
                 let table = Arc::new(synthesized_derived_table(
                     &subquery.name,
                     subquery.columns.clone(),
@@ -516,8 +562,28 @@ fn build_joined_rows_dag(
                 })?
             }
             crate::schema::Table::Virtual(_) => return unsupported("virtual-table FROM sources"),
-            crate::schema::Table::RecursiveCteInput(_) => {
-                return unsupported("recursive CTE inputs")
+            crate::schema::Table::RecursiveCteInput(input) => {
+                let mut columns = input.columns.clone();
+                columns.push(crate::schema::Column::new_default_text(
+                    Some("__round".to_string()),
+                    String::new(),
+                    None,
+                ));
+                builder.push(dag::OpNode::RecursiveInput {
+                    table: Arc::new(BTreeTable::new(
+                        0,
+                        input.name.clone(),
+                        crate::alloc::vec![],
+                        columns,
+                        crate::schema::BTreeCharacteristics::HAS_ROWID,
+                        crate::alloc::vec![],
+                        crate::alloc::vec![],
+                        crate::alloc::vec![],
+                        None,
+                    )),
+                    identifier: joined.identifier.clone(),
+                    logical_id: joined.internal_id,
+                })?
             }
         };
         inputs.push(input);
@@ -1148,7 +1214,10 @@ impl MaintenancePlan {
         for (node_id, node) in dag.nodes.iter().enumerate() {
             let width = dag.output_schema(node_id).len();
             let columns = match node {
-                dag::OpNode::Scan { .. } => vec![None; width],
+                dag::OpNode::Scan { .. } | dag::OpNode::RecursiveInput { .. } => {
+                    vec![None; width]
+                }
+                dag::OpNode::Fixpoint { inputs, .. } => chosen[inputs[0]].clone(),
                 dag::OpNode::Filter { input, .. }
                 | dag::OpNode::Alias { input, .. }
                 | dag::OpNode::TopK { input, .. } => chosen[*input].clone(),
@@ -1438,6 +1507,33 @@ fn validate_planned_node(
             )
         };
     match node {
+        dag::OpNode::RecursiveInput { .. } => {}
+        dag::OpNode::Fixpoint {
+            inputs: [_, step],
+            body_start,
+        } => {
+            for body_node in &dag.nodes[*body_start..=*step] {
+                match body_node {
+                    dag::OpNode::Join {
+                        kind: dag::JoinKind::Semi | dag::JoinKind::Anti,
+                        ..
+                    }
+                    | dag::OpNode::Pad { .. } => {
+                        return unsupported("outer joins or subqueries in a recursive CTE")
+                    }
+                    dag::OpNode::Aggregate { .. } => {
+                        return unsupported("aggregates or DISTINCT in a recursive CTE")
+                    }
+                    dag::OpNode::SetOp { prefix_len, .. } if *prefix_len > 0 => {
+                        return unsupported("UNION, INTERSECT or EXCEPT in a recursive CTE")
+                    }
+                    dag::OpNode::Fixpoint { .. } => {
+                        return unsupported("recursive CTEs inside a recursive CTE")
+                    }
+                    _ => {}
+                }
+            }
+        }
         dag::OpNode::Scan { table, .. } => {
             if !table.has_rowid {
                 return unsupported("WITHOUT ROWID base tables");
@@ -1684,6 +1780,12 @@ fn plan_node_output(
             DeltaIdentity::BindingRowids(1),
             vec![table.has_rowid].into(),
         ),
+        // A CTE row is identified by its rowid in the fixpoint's table.
+        dag::OpNode::RecursiveInput { .. } => (DeltaIdentity::BindingRowids(1), vec![true].into()),
+        dag::OpNode::Fixpoint { .. } => (
+            DeltaIdentity::OperatorRowid,
+            vec![false; schema.bindings.len()].into(),
+        ),
         dag::OpNode::Filter { input, .. } | dag::OpNode::Project { input, .. } => {
             let upstream = prior_output(*input)?;
             (upstream.published_identity, upstream.binding_rowids.clone())
@@ -1816,7 +1918,10 @@ fn plan_node_output(
 fn node_has_native_arrangement(node: &dag::OpNode) -> bool {
     matches!(
         node,
-        dag::OpNode::Scan { .. } | dag::OpNode::Aggregate { .. }
+        dag::OpNode::Scan { .. }
+            | dag::OpNode::Aggregate { .. }
+            | dag::OpNode::RecursiveInput { .. }
+            | dag::OpNode::Fixpoint { .. }
     )
 }
 
@@ -1901,13 +2006,26 @@ fn plan_operator_states(
                 "{}{DBSP_CIRCUIT_VERSION}_{view_name}__n{node_id}",
                 crate::schema::DBSP_TABLE_PREFIX,
             );
-            Some(HiddenTableDef {
-                create_sql: state_table_sql(
+            let create_sql = match node {
+                dag::OpNode::Fixpoint { inputs, .. } => {
+                    let identity_width =
+                        |input: dag::NodeId| catalog.nodes[input].output.published_identity.width();
+                    let identity_width = identity_width(inputs[0]).max(identity_width(inputs[1]));
+                    fixpoint_table_sql(
+                        &table_name,
+                        1 + identity_width,
+                        dag.output_schema(node_id).len(),
+                    )
+                }
+                _ => state_table_sql(
                     &table_name,
                     node,
                     output.emitted_identity.width(),
                     dag.output_schema(node_id).len(),
                 )?,
+            };
+            Some(HiddenTableDef {
+                create_sql,
                 table_name,
                 primary_key_index: true,
             })
@@ -2118,6 +2236,7 @@ fn node_requires_primary_state(dag: &dag::MaintenanceDag, node_id: dag::NodeId) 
     match &dag.nodes[node_id] {
         dag::OpNode::Aggregate { .. } | dag::OpNode::TopK { .. } => true,
         dag::OpNode::SetOp { prefix_len, .. } => *prefix_len > 0,
+        dag::OpNode::Fixpoint { .. } => true,
         _ => false,
     }
 }
@@ -2236,6 +2355,25 @@ fn state_table_sql(
             "this DAG operator has no state table".to_string(),
         )),
     }
+}
+
+/// The rows of a recursive CTE: `(key.., values.., round)`. The key is a
+/// tag (0 for seed rows, 1 for recursive rows) and the identity of the
+/// row's derivation, padded with zeros; it is the primary key.
+fn fixpoint_table_sql(table_name: &str, key_width: usize, value_width: usize) -> String {
+    let table_ident = crate::util::quote_identifier(table_name);
+    let key = (0..key_width).map(|i| format!("k{i}")).collect::<Vec<_>>();
+    let columns = key
+        .iter()
+        .cloned()
+        .chain((0..value_width).map(|i| format!("c{i}")))
+        .chain(std::iter::once("round".to_string()))
+        .collect::<Vec<_>>();
+    format!(
+        "CREATE TABLE {table_ident} ({}, PRIMARY KEY ({}))",
+        columns.join(", "),
+        key.join(", ")
+    )
 }
 
 /// Whether an aggregate keeps per-value state in the multiset table: MIN/MAX
