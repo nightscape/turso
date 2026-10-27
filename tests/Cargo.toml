@@ -59,6 +59,7 @@ serial_test = { version = "3", features = ["file_locks"] }
 test-log = { version = "0.2.17", features = ["trace"] }
 turso_macros.workspace = true
 crossbeam-epoch = "0.9.18"
+proptest = "1.9"
 
 [features]
 default = ["test_helper", "fts", "io_uring"]
