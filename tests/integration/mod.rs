@@ -49,3 +49,4 @@ mod tests {
             .init();
     }
 }
+mod recursive_cte_dependent_matview;
