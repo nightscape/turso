@@ -1,0 +1,92 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
+
+# EXISTS and NOT EXISTS under OR and NOT are not semi or anti joins. The view
+# keeps one match flag per outer row and subquery, and the WHERE clause reads
+# the flags. Covers OR of EXISTS and NOT EXISTS, a plain predicate beside an
+# EXISTS, NOT around an EXISTS and around EXISTS AND p, duplicate outer rows,
+# NULL keys, a transaction that commits, and one that rolls back.
+test matview-exists-under-or-and-not {
+    CREATE TABLE oo(id INTEGER PRIMARY KEY, k INTEGER, v TEXT);
+    CREATE TABLE ii(id INTEGER PRIMARY KEY, k INTEGER, w INTEGER);
+    CREATE TABLE xx(k INTEGER);
+    INSERT INTO oo VALUES (1, 1, 'a'), (2, 2, 'b'), (3, NULL, 'n'), (4, 2, 'b'), (5, 5, 'e');
+    INSERT INTO ii VALUES (1, 1, 10), (2, 1, 20), (3, 2, 5), (4, NULL, 1);
+    INSERT INTO xx VALUES (2), (2), (5);
+    CREATE MATERIALIZED VIEW v_or AS SELECT id, v FROM oo WHERE EXISTS (SELECT 1 FROM ii WHERE ii.k = oo.k) OR NOT EXISTS (SELECT 1 FROM xx WHERE xx.k = oo.k);
+    CREATE MATERIALIZED VIEW v_p_or AS SELECT id FROM oo WHERE v = 'e' OR EXISTS (SELECT 1 FROM ii WHERE ii.k = oo.k AND ii.w > 8);
+    CREATE MATERIALIZED VIEW v_not AS SELECT id FROM oo WHERE NOT (EXISTS (SELECT 1 FROM ii WHERE ii.k = oo.k));
+    CREATE MATERIALIZED VIEW v_not_and AS SELECT id FROM oo WHERE NOT (EXISTS (SELECT 1 FROM ii WHERE ii.k = oo.k) AND v <> 'b');
+    CREATE MATERIALIZED VIEW v_bag AS SELECT v FROM oo WHERE EXISTS (SELECT 1 FROM xx WHERE xx.k = oo.k) OR id = 1;
+    SELECT 'or', * FROM v_or ORDER BY 2;
+    SELECT 'por', * FROM v_p_or ORDER BY 2;
+    SELECT 'not', * FROM v_not ORDER BY 2;
+    SELECT 'nand', * FROM v_not_and ORDER BY 2;
+    SELECT 'bag', * FROM v_bag ORDER BY 2;
+    BEGIN;
+    DELETE FROM ii WHERE id = 3;
+    INSERT INTO ii VALUES (5, 5, 50);
+    UPDATE oo SET k = 1 WHERE id = 4;
+    COMMIT;
+    INSERT INTO ii VALUES (6, 2, 7), (7, 2, 8);
+    DELETE FROM ii WHERE id = 1;
+    UPDATE oo SET v = 'bb' WHERE id = 2;
+    DELETE FROM xx WHERE k = 2;
+    INSERT INTO oo VALUES (6, 1, 'f'), (7, 5, 'b');
+    SELECT 'or2', * FROM v_or ORDER BY 2;
+    SELECT 'por2', * FROM v_p_or ORDER BY 2;
+    SELECT 'not2', * FROM v_not ORDER BY 2;
+    SELECT 'nand2', * FROM v_not_and ORDER BY 2;
+    SELECT 'bag2', * FROM v_bag ORDER BY 2;
+    BEGIN;
+    DELETE FROM ii;
+    DELETE FROM xx;
+    ROLLBACK;
+    DELETE FROM xx;
+    DELETE FROM ii;
+    SELECT 'or3', COUNT(*) FROM v_or;
+    SELECT 'not3', COUNT(*) FROM v_not;
+    SELECT 'nand3', COUNT(*) FROM v_not_and;
+}
+expect {
+    or|1|a
+    or|2|b
+    or|3|n
+    or|4|b
+    por|1
+    por|5
+    not|3
+    not|5
+    nand|2
+    nand|3
+    nand|4
+    nand|5
+    bag|a
+    bag|b
+    bag|b
+    bag|e
+    or2|1|a
+    or2|2|bb
+    or2|3|n
+    or2|4|b
+    or2|5|e
+    or2|6|f
+    or2|7|b
+    por2|1
+    por2|4
+    por2|5
+    por2|6
+    por2|7
+    not2|3
+    nand2|3
+    nand2|4
+    nand2|7
+    bag2|a
+    bag2|b
+    bag2|e
+    or3|7
+    not3|7
+    nand3|7
+}

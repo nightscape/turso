@@ -293,6 +293,60 @@ fn a_computed_conjunct_beside_not_exists_over_a_matview_source_maintains() {
     assert_ready_matches(&conn, "an upstream row entering the matview");
 }
 
+/// A disjunction of two subqueries beside a computed conjunct: three indicator columns
+/// feed one predicate, and the OR is evaluated over them.
+#[test]
+fn a_computed_conjunct_beside_an_or_of_exists_maintains() {
+    let db = TempDatabase::builder().with_views(true).build();
+    let conn = db.connect_limbo();
+    limbo_exec_rows(
+        &conn,
+        "CREATE TABLE block (id INTEGER PRIMARY KEY, properties TEXT)",
+    );
+    limbo_exec_rows(
+        &conn,
+        "CREATE TABLE block_tags (block_id INTEGER, tag TEXT)",
+    );
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO block VALUES \
+         (1,'{\"task_state\":\"TODO\"}'),(2,'{\"task_state\":\"TODO\"}'), \
+         (3,'{\"task_state\":\"DONE\"}'),(4,'{\"task_state\":\"TODO\"}')",
+    );
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO block_tags VALUES (1,'agent'),(2,'human-only')",
+    );
+
+    const AGENT_READY: &str = "SELECT b.id FROM block b \
+         WHERE json_extract(b.properties, '$.task_state') = 'TODO' \
+           AND (EXISTS (SELECT 1 FROM block_tags bt WHERE bt.block_id = b.id AND bt.tag = 'agent') \
+                OR NOT EXISTS (SELECT 1 FROM block_tags bt WHERE bt.block_id = b.id AND bt.tag = 'human-only'))";
+
+    limbo_exec_rows(
+        &conn,
+        &format!("CREATE MATERIALIZED VIEW agent_ready AS {AGENT_READY}"),
+    );
+    let check = |stage: &str| {
+        assert_eq!(
+            ids(limbo_exec_rows(&conn, "SELECT id FROM agent_ready")),
+            ids(limbo_exec_rows(&conn, AGENT_READY)),
+            "matview disagrees with a fresh recompute after {stage}"
+        );
+    };
+    check("materializing over existing rows");
+
+    // Both branches true at once, then only the first.
+    limbo_exec_rows(&conn, "INSERT INTO block_tags VALUES (2,'agent')");
+    check("tagging a human-only row as agent");
+
+    limbo_exec_rows(&conn, "INSERT INTO block_tags VALUES (4,'human-only')");
+    check("marking a free row human-only");
+
+    limbo_exec_rows(&conn, "DELETE FROM block_tags WHERE block_id = 1");
+    check("removing the agent tag");
+}
+
 /// Guards against over-reach: a computed expression with no subquery beside it still
 /// compiles and materializes.
 #[test]
