@@ -1,5 +1,6 @@
 mod test_alter_table_reopen;
 mod test_btree;
+mod test_cdc_callback_attached;
 mod test_change_callback;
 mod test_ddl;
 mod test_ddl_interrupt_schema_cookie;
