@@ -332,6 +332,10 @@ fn emit_group_aggregate_rows(
     let member_count_reg = program.alloc_register();
     let previous_value_reg = program.alloc_register();
     let has_previous_reg = program.alloc_register();
+    let separator_regs = aggregates
+        .iter()
+        .map(|agg| matches!(agg.func, AggFunc::GroupConcat).then(|| program.alloc_register()))
+        .collect::<Vec<_>>();
 
     program.emit_int(0, zero_reg);
     program.emit_int(1, plus_one_reg);
@@ -343,6 +347,25 @@ fn emit_group_aggregate_rows(
         index_name: None,
         affinity_str: None,
     });
+
+    for (agg, separator_reg) in aggregates.iter().zip(&separator_regs) {
+        let Some(separator_reg) = *separator_reg else {
+            continue;
+        };
+        match agg.args.get(1) {
+            Some(separator) => {
+                translate_expr_no_constant_opt(
+                    program,
+                    Some(&table_references),
+                    separator,
+                    separator_reg,
+                    &resolver,
+                    NoConstantOptReason::RegisterReuse,
+                )?;
+            }
+            None => program.emit_string8(",".to_string(), separator_reg),
+        }
+    }
 
     let finalize_label = program.allocate_label();
     let end_label = program.allocate_label();
@@ -905,6 +928,7 @@ fn emit_group_aggregate_rows(
                             .is_distinct()
                             .then(|| multiset_keys[i].map(|key| key.collation))
                             .flatten(),
+                        separator: separator_regs[i],
                         result: value_reg,
                     },
                     corrupt_label,
@@ -1173,6 +1197,7 @@ struct RecomputeRegisters {
     previous_value: usize,
     has_previous: usize,
     distinct_collation: Option<CollationSeq>,
+    separator: Option<usize>,
     result: usize,
 }
 
@@ -1196,7 +1221,7 @@ fn emit_recompute_from_members(
             data: Box::new(AggStepData {
                 acc_reg: registers.result,
                 col: registers.member_value,
-                delimiter: 0,
+                delimiter: registers.separator.unwrap_or(0),
                 func: func.clone(),
                 comparator: None,
                 collation: None,
