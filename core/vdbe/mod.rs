@@ -279,6 +279,7 @@ pub(crate) fn step_view_delta_batch(
 #[derive(Debug)]
 pub struct PopulateMatViewsState {
     pub view_idx: usize,
+    pub staged_row_changes_mark: usize,
     pub stmt: Option<Box<crate::statement::Statement>>,
 }
 
