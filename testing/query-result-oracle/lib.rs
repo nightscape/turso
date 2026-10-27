@@ -516,6 +516,47 @@ mod tests {
     }
 
     #[test]
+    fn json_array_columns_match_when_they_have_the_same_elements_in_any_order() {
+        let text = |value: &str| vec![Value::Text(value.to_string())];
+        let chosen = [ChosenValueCollation::from_name("json_group_array")];
+        let view = result(1, vec![text(r#"["b",null,1,{"k":[1,2]},"a,b"]"#)]);
+
+        let reordered = result(1, vec![text(r#"[1,"a,b",{"k":[1,2]},"b",null]"#)]);
+        assert!(diff_result_sets_with_chosen_values(&view, &reordered, &chosen).is_empty());
+
+        let element_missing = result(1, vec![text(r#"["b",null,1,{"k":[1,2]}]"#)]);
+        assert!(!diff_result_sets_with_chosen_values(&view, &element_missing, &chosen).is_empty());
+
+        let element_repeated = result(1, vec![text(r#"["b","b",null,1,{"k":[1,2]},"a,b"]"#)]);
+        assert!(!diff_result_sets_with_chosen_values(&view, &element_repeated, &chosen).is_empty());
+
+        let other_element = result(1, vec![text(r#"["b",null,1,{"k":[1,3]},"a,b"]"#)]);
+        assert!(!diff_result_sets_with_chosen_values(&view, &other_element, &chosen).is_empty());
+
+        assert!(!diff_result_sets(&view, &reordered).is_empty());
+    }
+
+    #[test]
+    fn group_concat_columns_match_when_they_have_the_same_parts_in_any_order() {
+        let text = |value: &str| vec![Value::Text(value.to_string())];
+        let chosen = [ChosenValueCollation::from_name("group_concat: | ")];
+        let view = result(1, vec![text("b | a | c")]);
+
+        let reordered = result(1, vec![text("c | b | a")]);
+        assert!(diff_result_sets_with_chosen_values(&view, &reordered, &chosen).is_empty());
+
+        let part_missing = result(1, vec![text("b | a")]);
+        assert!(!diff_result_sets_with_chosen_values(&view, &part_missing, &chosen).is_empty());
+
+        let other_separator = result(1, vec![text("b,a,c")]);
+        assert!(!diff_result_sets_with_chosen_values(&view, &other_separator, &chosen).is_empty());
+
+        let null = result(1, vec![vec![Value::Null]]);
+        assert!(diff_result_sets_with_chosen_values(&null, &null, &chosen).is_empty());
+        assert!(!diff_result_sets_with_chosen_values(&view, &null, &chosen).is_empty());
+    }
+
+    #[test]
     fn invalid_row_arity_is_rejected() {
         assert_eq!(
             ResultSet::new(2, vec![Row(vec![Value::Integer(1)])]).unwrap_err(),
