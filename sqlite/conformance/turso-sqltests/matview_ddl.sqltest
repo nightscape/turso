@@ -166,3 +166,33 @@ test matview-default-time-trigger-rejected {
 expect error {
     cannot create BEFORE trigger on view: v
 }
+
+test matview-index-follows-writes {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 'x'), (2, 'y');
+    CREATE MATERIALIZED VIEW v AS SELECT a, b FROM t;
+    CREATE INDEX idx_v_b ON v(b);
+    INSERT INTO t VALUES (3, 'x');
+    DELETE FROM t WHERE a = 2;
+    UPDATE t SET b = 'z' WHERE a = 1;
+    SELECT a, b FROM v WHERE b = 'x';
+    SELECT a, b FROM v WHERE b = 'z';
+    SELECT a, b FROM v NOT INDEXED ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    3|x
+    1|z
+    1|z
+    3|x
+    ok
+}
+
+test matview-index-refuses-unsupported-shapes {
+    CREATE TABLE t(a, b);
+    CREATE MATERIALIZED VIEW v AS SELECT a, b FROM t;
+    CREATE UNIQUE INDEX i1 ON v(a);
+}
+expect error {
+    UNIQUE index on materialized view 'v' is not supported
+}

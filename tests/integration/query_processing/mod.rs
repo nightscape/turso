@@ -16,7 +16,17 @@ mod test_vacuum_into_mvcc;
 mod test_write_path;
 
 mod encryption;
+mod matview_index_oracle;
 mod test_expr_index;
+mod test_ivm_matview_index;
+mod test_ivm_matview_index_cursor;
+mod test_ivm_matview_index_differential;
+mod test_ivm_matview_index_ordering;
+mod test_ivm_matview_index_overlay;
+mod test_ivm_matview_index_overlay_fork;
+mod test_ivm_matview_index_reads;
+mod test_ivm_matview_index_txn;
+mod test_ivm_matview_index_types;
 mod test_multi_thread;
 mod test_non_utf8_text;
 mod test_schema_updated;
