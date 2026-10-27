@@ -1,0 +1,100 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@requires materialized_views "requires materialized view support"
+
+test matview-recursive-cte-name-is-case-insensitive {
+    CREATE TABLE node (id TEXT PRIMARY KEY, pid TEXT);
+    INSERT INTO node VALUES ('a','root'),('b','a'),('c','b');
+    CREATE MATERIALIZED VIEW v_rec AS
+      WITH RECURSIVE Tree AS (
+        SELECT id, pid, 0 AS depth FROM node WHERE pid = 'root'
+        UNION ALL
+        SELECT c.id, c.pid, p.depth + 1 FROM NODE c JOIN TREE p ON c.pid = p.id
+      ) SELECT id, depth FROM tree;
+    SELECT id, depth FROM v_rec ORDER BY 1;
+}
+expect {
+    a|0
+    b|1
+    c|2
+}
+
+test matview-recursive-cte-maintained-across-case {
+    CREATE TABLE node (id TEXT PRIMARY KEY, pid TEXT);
+    INSERT INTO node VALUES ('a','root'),('b','a');
+    CREATE MATERIALIZED VIEW v_rec AS
+      WITH RECURSIVE Tree AS (
+        SELECT id, pid, 0 AS depth FROM node WHERE pid = 'root'
+        UNION ALL
+        SELECT c.id, c.pid, p.depth + 1 FROM node c JOIN TREE p ON c.pid = p.id
+      ) SELECT id, depth FROM tree;
+    INSERT INTO NODE VALUES ('c','b');
+    SELECT id, depth FROM v_rec ORDER BY 1;
+}
+expect {
+    a|0
+    b|1
+    c|2
+}
+
+test matview-recursive-cte-move-under-own-descendant {
+    CREATE TABLE node (id TEXT PRIMARY KEY, pid TEXT);
+    INSERT INTO node VALUES ('r','root'),('x','r'),('d','x');
+    CREATE MATERIALIZED VIEW v_path AS
+      WITH RECURSIVE paths AS (
+        SELECT id, '/' || id AS path FROM node WHERE pid = 'root'
+        UNION ALL
+        SELECT c.id, p.path || '/' || c.id FROM node c JOIN paths p ON c.pid = p.id
+      ) SELECT id, path FROM paths;
+    UPDATE node SET pid = 'd' WHERE id = 'x';
+    SELECT id, path FROM v_path ORDER BY 1;
+}
+expect {
+    r|/r
+}
+
+test matview-recursive-cte-move-back-from-under-own-descendant {
+    CREATE TABLE node (id TEXT PRIMARY KEY, pid TEXT);
+    INSERT INTO node VALUES ('r','root'),('x','r'),('d','x');
+    CREATE MATERIALIZED VIEW v_path AS
+      WITH RECURSIVE paths AS (
+        SELECT id, '/' || id AS path FROM node WHERE pid = 'root'
+        UNION ALL
+        SELECT c.id, p.path || '/' || c.id FROM node c JOIN paths p ON c.pid = p.id
+      ) SELECT id, path FROM paths;
+    UPDATE node SET pid = 'd' WHERE id = 'x';
+    UPDATE node SET pid = 'r' WHERE id = 'x';
+    SELECT id, path FROM v_path ORDER BY 1;
+}
+expect {
+    d|/r/x/d
+    r|/r
+    x|/r/x
+}
+
+test matview-recursive-cte-with-union-is-refused {
+    CREATE TABLE node (id TEXT PRIMARY KEY, pid TEXT);
+    CREATE MATERIALIZED VIEW v_set AS
+      WITH RECURSIVE tree AS (
+        SELECT id FROM node WHERE pid = 'root'
+        UNION
+        SELECT c.id FROM node c JOIN tree p ON c.pid = p.id
+      ) SELECT id FROM tree;
+}
+expect error {
+    materialized views with recursive CTEs that use UNION are not yet supported
+}
+
+test matview-recursive-cte-with-left-join-is-refused {
+    CREATE TABLE node (id TEXT PRIMARY KEY, pid TEXT);
+    CREATE TABLE tag (id TEXT, tag TEXT);
+    CREATE MATERIALIZED VIEW v_tagged AS
+      WITH RECURSIVE tree AS (
+        SELECT id, NULL AS tag FROM node WHERE pid = 'root'
+        UNION ALL
+        SELECT c.id, t.tag FROM tree p JOIN node c ON c.pid = p.id LEFT JOIN tag t ON t.id = c.id
+      ) SELECT id, tag FROM tree;
+}
+expect error {
+    materialized views with outer joins or subqueries in a recursive CTE are not yet supported
+}
