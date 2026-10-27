@@ -176,30 +176,19 @@ fn test_commit_after_reopen_with_plain_view(tmp_db: TempDatabase) -> anyhow::Res
     Ok(())
 }
 
-/// Regression test for #10056: `CREATE INDEX` on a materialized view's own
-/// storage used to succeed, but nothing in the view's maintenance path keeps
-/// that index up to date on later writes, so it silently went stale and
-/// reopening the database failed with "sqlite_schema contains index for
-/// missing table" (populate_indices ran before the view's backing table was
-/// registered). CREATE INDEX on a materialized view must be rejected, the
-/// same way it already is for a plain view, and the attempt must leave the
-/// database in a state that still reopens cleanly.
+/// A plain index on a materialized view follows the view's maintenance and
+/// survives a reopen.
 #[turso_macros::test(views)]
-fn create_index_on_materialized_view_is_rejected(tmp_db: TempDatabase) -> anyhow::Result<()> {
+fn create_index_on_materialized_view_is_maintained(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
     conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, type TEXT, amt INTEGER)")?;
     conn.execute(
         "CREATE MATERIALIZED VIEW tm AS SELECT type, sum(amt) AS totamt FROM t GROUP BY type",
     )?;
     conn.execute("INSERT INTO t VALUES (1, 'a', 10), (2, 'b', 20)")?;
-
-    let err = conn
-        .execute("CREATE UNIQUE INDEX tm_type ON tm (type)")
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("views may not be indexed"),
-        "{err}"
-    );
+    conn.execute("CREATE INDEX tm_type ON tm (type)")?;
+    conn.execute("INSERT INTO t VALUES (3, 'a', 5)")?;
+    conn.execute("DELETE FROM t WHERE id = 2")?;
     drop(conn);
 
     let reopened = TempDatabase::builder()
@@ -207,8 +196,12 @@ fn create_index_on_materialized_view_is_rejected(tmp_db: TempDatabase) -> anyhow
         .with_views(true)
         .build();
     let conn = reopened.connect_limbo();
-    let view: Vec<(String, i64)> = conn.exec_rows("SELECT type, totamt FROM tm ORDER BY type");
-    assert_eq!(view, vec![("a".to_string(), 10), ("b".to_string(), 20)]);
+    let indexed: Vec<(String, i64)> =
+        conn.exec_rows("SELECT type, totamt FROM tm WHERE type = 'a'");
+    assert_eq!(indexed, vec![("a".to_string(), 15)]);
+    let scanned: Vec<(String, i64)> =
+        conn.exec_rows("SELECT type, totamt FROM tm NOT INDEXED ORDER BY type");
+    assert_eq!(scanned, vec![("a".to_string(), 15)]);
 
     Ok(())
 }
