@@ -10,8 +10,8 @@ use crate::sync::Arc;
 use crate::translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{expr_contains_nondeterministic_scalar_function, WalkControl};
-use crate::translate::optimizer::optimize_plan;
 use crate::translate::optimizer::unnest::rewrite_correlated_subqueries;
+use crate::translate::optimizer::{optimize_plan, Optimizable};
 use crate::translate::plan::{
     Aggregate, JoinType, Plan, QueryDestination, SelectPlan, SubqueryState, TableReferences,
 };
@@ -132,7 +132,7 @@ fn validate_stream_expr(
 /// Aggregate recognition and deduplication use the planner's own collector
 /// ([`resolve_window_and_aggregate_functions`]); this is only the IVM gate on
 /// top of it.
-fn validate_supported_aggregate(agg: &Aggregate) -> Result<()> {
+fn validate_supported_aggregate(agg: &Aggregate, resolver: &Resolver) -> Result<()> {
     if !agg.order_by().is_empty() {
         return unsupported("ORDER BY in aggregates");
     }
@@ -144,11 +144,19 @@ fn validate_supported_aggregate(agg: &Aggregate) -> Result<()> {
         | AggFunc::Avg
         | AggFunc::Min
         | AggFunc::Max
+        | AggFunc::GroupConcat
         | AggFunc::JsonGroupArray => {}
         ref other => return unsupported(&format!("the {} aggregate", other.as_str())),
     }
-    if agg.args.len() > 1 {
-        return unsupported("multi-argument aggregates");
+    match (&agg.func, agg.args.as_slice()) {
+        (AggFunc::GroupConcat, [_, separator]) => {
+            if !separator.is_constant(resolver) || changes_between_statements(separator, resolver)?
+            {
+                return unsupported("a group_concat separator that is not constant");
+            }
+        }
+        (_, [] | [_]) => {}
+        _ => return unsupported("multi-argument aggregates"),
     }
     Ok(())
 }
@@ -973,6 +981,14 @@ impl MaintenancePlan {
                                                 aggregate, *key,
                                             )))
                                         }
+                                        (AggFunc::GroupConcat, key, _) => {
+                                            group_concat_separator(aggregate).map(|separator| {
+                                                ChosenValue::Concat(
+                                                    separator,
+                                                    element_collation(aggregate, *key),
+                                                )
+                                            })
+                                        }
                                         _ => None,
                                     }
                                 }),
@@ -1012,6 +1028,9 @@ pub(crate) enum ChosenValue {
     /// A `json_group_array` result: its elements are in no defined order,
     /// and equal when equal under the collation.
     JsonArray(CollationSeq),
+    /// A `group_concat` result with this separator: its parts are in no
+    /// defined order, and equal when equal under the collation.
+    Concat(String, CollationSeq),
 }
 
 #[cfg(feature = "test_helper")]
@@ -1021,6 +1040,9 @@ impl ChosenValue {
             Self::Collation(collation) => collation.name(),
             Self::JsonArray(collation) => {
                 format!("json_group_array{}", collation_suffix(*collation))
+            }
+            Self::Concat(separator, collation) => {
+                format!("group_concat{}:{separator}", collation_suffix(*collation))
             }
         }
     }
@@ -1044,6 +1066,18 @@ fn element_collation(aggregate: &Aggregate, key: Option<dag::KeyColumn>) -> Coll
     match key {
         Some(key) if aggregate.distinctness.is_distinct() => key.collation,
         _ => CollationSeq::Binary,
+    }
+}
+
+/// The separator of a `group_concat` call, when it is a string literal.
+#[cfg(feature = "test_helper")]
+fn group_concat_separator(aggregate: &Aggregate) -> Option<String> {
+    match aggregate.args.get(1) {
+        None => Some(",".to_string()),
+        Some(ast::Expr::Literal(ast::Literal::String(separator))) => {
+            Some(crate::translate::expr::sanitize_string(separator))
+        }
+        Some(_) => None,
     }
 }
 
@@ -1315,7 +1349,7 @@ fn validate_planned_node(
                 )?;
             }
             for aggregate in aggregates {
-                validate_supported_aggregate(aggregate)?;
+                validate_supported_aggregate(aggregate, resolver)?;
                 for expr in &aggregate.args {
                     check_expr(
                         expr,
@@ -1907,7 +1941,7 @@ pub(super) fn uses_multiset(agg: &Aggregate) -> bool {
 /// computed again from every member of the group, which the multiset table
 /// keeps with exact values.
 pub(super) fn recomputes_from_members(agg: &Aggregate) -> bool {
-    matches!(agg.func, AggFunc::JsonGroupArray)
+    matches!(agg.func, AggFunc::GroupConcat | AggFunc::JsonGroupArray)
 }
 
 /// One aggregate's value multiset: one row per (group, value) with its
