@@ -1180,6 +1180,7 @@ pub struct ProgramState {
     /// carries a version no cookie will ever match and the enclosing `COMMIT`
     /// publishes it to every other connection.
     schema_when_stmt_started: Option<Arc<Schema>>,
+    staged_row_changes_mark: usize,
     /// Number of immediate foreign key violations that occurred during the active statement. If nonzero,
     /// the statement subtransactionwill roll back.
     fk_immediate_violations_during_stmt: AtomicIsize,
@@ -1280,6 +1281,7 @@ impl ProgramState {
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             schema_when_stmt_started: None,
+            staged_row_changes_mark: 0,
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
             fk_immediate_violation: None,
             rowsets: HashMap::default(),
@@ -1448,6 +1450,7 @@ impl ProgramState {
         self.fk_immediate_violation = None;
         *self.fk_deferred_violations_when_stmt_started.get_mut() = 0;
         self.schema_when_stmt_started = None;
+        self.staged_row_changes_mark = 0;
         if !self.rowsets.is_empty() {
             self.rowsets.clear();
         }
@@ -1756,6 +1759,7 @@ impl ProgramState {
         }
 
         self.has_stmt_transaction = true;
+        self.staged_row_changes_mark = connection.staged_row_changes_len();
 
         // Store the deferred foreign key violations counter at the start of the statement.
         // This is used to ensure that if an interactive transaction had deferred FK violations and a statement subtransaction rolls back,
@@ -1850,6 +1854,9 @@ impl ProgramState {
                 }
             });
             pager.set_schema_cookie(None);
+        }
+        if ends_write_statement && end_statement == EndStatement::RollbackSavepoint {
+            connection.truncate_staged_row_changes(self.staged_row_changes_mark);
         }
 
         // Drain attached pagers upfront so we can clean them up regardless of path.

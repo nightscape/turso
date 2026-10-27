@@ -2,9 +2,10 @@ use std::sync::Arc;
 
 use either::Either;
 
+use crate::change_callbacks::StagedRowChange;
 use crate::namespace::NamespaceId;
 use crate::numeric::Numeric;
-use crate::schema::BTreeTable;
+use crate::schema::{BTreeTable, TURSO_INTERNAL_PREFIX};
 use crate::storage::btree::CursorTrait;
 use crate::types::{IOResult, ImmutableRecord, RecordBuf};
 use crate::vdbe::builder::CursorType;
@@ -29,18 +30,31 @@ pub(crate) fn change_log_route(
     state: &ProgramState,
     cursor_id: usize,
 ) -> Result<Option<ChangeLogRoute>> {
-    // Materialized views currently live in main. Writes to temp or attached
-    // databases must not be resolved through main's schema just because a
-    // table there happens to have the same name or root page.
-    if state.cursor_databases.get(cursor_id).copied().flatten() != Some(MAIN_DB_ID) {
+    let Some(database_id) = state.cursor_databases.get(cursor_id).copied().flatten() else {
         return Ok(None);
-    }
+    };
     let cursor_table = match program.cursor_ref.get(cursor_id) {
         Some((_, CursorType::BTreeTable(table)))
         | Some((_, CursorType::MaterializedView(table, _))) => table.clone(),
         _ => return Ok(None),
     };
-    let schema = program.connection.schema.read();
+    let connection = &program.connection;
+    let callbacks_active = connection.db.change_callbacks.any();
+    // Materialized views currently live in main. Writes to temp or attached
+    // databases must not be resolved through main's schema just because a
+    // table there happens to have the same name or root page.
+    if database_id != MAIN_DB_ID {
+        if !callbacks_active || !is_reported_table(connection, database_id, &cursor_table) {
+            return Ok(None);
+        }
+        return Ok(Some(ChangeLogRoute {
+            table: cursor_table,
+            dependent_views: crate::alloc::Vec::new(),
+            is_materialized_view: false,
+            report_to_callbacks: true,
+        }));
+    }
+    let schema = connection.schema.read();
     // Check for dependent views before doing anything else: a plain write to
     // a table with no materialized views is the overwhelmingly common case,
     // and it must stay as cheap as it was before change-log routing existed,
@@ -48,8 +62,12 @@ pub(crate) fn change_log_route(
     // schema-owned table descriptor and the is_materialized_view check below.
     let dependent_views =
         schema.get_dependent_materialized_views(NamespaceId::ROOT, &cursor_table.name);
-    let report_to_callbacks = program.connection.db.change_callbacks.any()
-        && schema.is_materialized_view(NamespaceId::ROOT, &cursor_table.name);
+    if dependent_views.is_empty() && !callbacks_active {
+        return Ok(None);
+    }
+    let is_materialized_view = schema.is_materialized_view(NamespaceId::ROOT, &cursor_table.name);
+    let report_to_callbacks = callbacks_active
+        && (is_materialized_view || is_reported_table(connection, MAIN_DB_ID, &cursor_table));
     if dependent_views.is_empty() && !report_to_callbacks {
         return Ok(None);
     }
@@ -77,13 +95,27 @@ pub(crate) fn change_log_route(
         table.has_rowid,
         "a materialized view's base table always has a rowid"
     );
-    let is_materialized_view = schema.is_materialized_view(NamespaceId::ROOT, &table.name);
     Ok(Some(ChangeLogRoute {
         table,
         dependent_views,
         is_materialized_view,
         report_to_callbacks,
     }))
+}
+
+/// User tables are reported only while CDC capture is on for the connection.
+/// The CDC table itself, `sqlite_*` tables and the hidden tables of
+/// materialized views never are.
+fn is_reported_table(connection: &Connection, database_id: usize, table: &BTreeTable) -> bool {
+    let capture = connection.get_capture_data_changes_info();
+    let Some(capture) = capture.as_ref() else {
+        return false;
+    };
+    let is_cdc_table = database_id == MAIN_DB_ID && table.name.eq_ignore_ascii_case(&capture.table);
+    table.has_rowid
+        && !table.name.starts_with("sqlite_")
+        && !table.name.starts_with(TURSO_INTERNAL_PREFIX)
+        && !is_cdc_table
 }
 
 /// One row written by `Insert` or removed by `Delete`, with its images as
@@ -280,9 +312,24 @@ pub(crate) fn log_row_change_for_views(
             .row_change
             .take()
             .expect("CaptureRowChange always runs before a routed write reaches the change log");
-        connection.stage_row_change(change);
+        connection.stage_row_change(StagedRowChange {
+            relation_name: relation_name(connection, change.database_id, &change.table),
+            is_materialized_view: view_change.route.is_materialized_view,
+            change,
+        });
     }
     Ok(IOResult::Done(()))
+}
+
+fn relation_name(connection: &Connection, database_id: usize, table: &BTreeTable) -> String {
+    if database_id == MAIN_DB_ID {
+        return table.name.clone();
+    }
+    let database = connection
+        .namespaces
+        .name(database_id)
+        .expect("a routed write is in a named database");
+    format!("{database}.{}", table.name)
 }
 
 fn log_to_view_change_log(
@@ -439,7 +486,7 @@ fn materialized_view_record_change(
     Ok((physical_values, weight))
 }
 
-fn normalize_table_change_record(
+pub(crate) fn normalize_table_change_record(
     table: &BTreeTable,
     rowid: i64,
     mut values: crate::alloc::Vec<Value>,
