@@ -271,22 +271,33 @@ fn describe_side(
     }
 }
 
-/// A built-in SQL collation, for a column whose value a query chose among
-/// several values that compare equal under it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How to compare a column whose value a query chose among several values
+/// that match: a built-in SQL collation, or the unordered elements of an
+/// aggregate result.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChosenValueCollation {
     Binary,
     NoCase,
     RTrim,
+    /// A `json_group_array` result: its elements are in no defined order.
+    JsonArray,
+    /// A `group_concat` result with this separator: its parts are in no
+    /// defined order.
+    Concat(String),
 }
 
 impl ChosenValueCollation {
-    /// Parse a built-in collation name, ignoring case.
+    /// Parse a built-in collation name, ignoring case, `json_group_array`, or
+    /// `group_concat:<separator>`.
     pub fn from_name(name: &str) -> Option<Self> {
+        if let Some(separator) = name.strip_prefix("group_concat:") {
+            return Some(Self::Concat(separator.to_string()));
+        }
         match name.to_ascii_uppercase().as_str() {
             "BINARY" => Some(Self::Binary),
             "NOCASE" => Some(Self::NoCase),
             "RTRIM" => Some(Self::RTrim),
+            "JSON_GROUP_ARRAY" => Some(Self::JsonArray),
             _ => None,
         }
     }
@@ -295,8 +306,9 @@ impl ChosenValueCollation {
     /// collation map to the same member. As in SQLite comparisons, an integer
     /// and a real are equal when they are the same number, and the collation
     /// only applies to text: NOCASE folds ASCII letters, RTRIM ignores
-    /// trailing spaces.
-    fn class_member(self, value: &Value) -> Value {
+    /// trailing spaces. Aggregate text is equal when it has the same
+    /// elements.
+    fn class_member(&self, value: &Value) -> Value {
         match value {
             Value::Real(real) => match real_as_exact_integer(*real) {
                 Some(integer) => Value::Integer(integer),
@@ -306,10 +318,53 @@ impl ChosenValueCollation {
                 Self::Binary => text.clone(),
                 Self::NoCase => text.to_ascii_lowercase(),
                 Self::RTrim => text.trim_end_matches(' ').to_string(),
+                Self::JsonArray => sorted_json_array_elements(text).join(","),
+                Self::Concat(separator) => {
+                    let mut parts: Vec<&str> = text.split(separator.as_str()).collect();
+                    parts.sort_unstable();
+                    parts.join(separator)
+                }
             }),
             Value::Null | Value::Integer(_) | Value::Blob(_) => value.clone(),
         }
     }
+}
+
+/// The top-level elements of the JSON array text `array`, sorted. Splits at
+/// the commas outside strings, objects and arrays.
+fn sorted_json_array_elements(array: &str) -> Vec<&str> {
+    let inner = array
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .expect("a json_group_array result is a JSON array");
+    let mut elements = Vec::new();
+    let (mut depth, mut in_string, mut escaped, mut start) = (0usize, false, false, 0);
+    for (index, byte) in inner.bytes().enumerate() {
+        if in_string {
+            match (escaped, byte) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                (false, b'"') => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => depth += 1,
+            b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                elements.push(&inner[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if !inner.is_empty() {
+        elements.push(&inner[start..]);
+    }
+    elements.sort_unstable();
+    elements
 }
 
 /// The integer equal to `real`, when one exists.
@@ -341,7 +396,7 @@ pub fn diff_result_sets_with_chosen_values(
             .iter()
             .enumerate()
             .map(
-                |(column, value)| match chosen.get(column).copied().flatten() {
+                |(column, value)| match chosen.get(column).and_then(Option::as_ref) {
                     Some(collation) => collation.class_member(value),
                     None => value.clone(),
                 },
