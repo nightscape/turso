@@ -166,6 +166,7 @@ pub(crate) struct NamedSavepointFrame {
     /// to restore staged DDL on attached databases.
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
     pub(crate) hooks_memo: Option<SavepointMemo>,
+    pub(crate) staged_row_changes_len: usize,
 }
 
 /// Info returned by `rollback_named_savepoint_frame` so callers can
@@ -175,6 +176,7 @@ pub(crate) struct RollbackFrameInfo {
     pub(crate) temp_schema_snapshot: Option<Arc<Schema>>,
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
     pub(crate) hooks_memo: Option<SavepointMemo>,
+    pub(crate) staged_row_changes_len: usize,
 }
 
 struct SchemaReparseGuard {
@@ -4666,7 +4668,17 @@ impl Connection {
         self.staged_row_changes.lock().push(change);
     }
 
-    pub(crate) fn clear_staged_row_changes(&self) {
+    pub(crate) fn staged_row_changes_len(&self) -> usize {
+        self.staged_row_changes.lock().len()
+    }
+
+    pub(crate) fn truncate_staged_row_changes(&self, len: usize) {
+        self.staged_row_changes.lock().truncate(len);
+    }
+
+    /// Every path that ends a transaction without committing must call this.
+    pub(crate) fn discard_transaction_changes(&self) {
+        self.transaction_changes.clear();
         self.staged_row_changes.lock().clear();
     }
 
@@ -5009,6 +5021,7 @@ impl Connection {
             temp_schema_snapshot: frame.temp_schema_snapshot.clone(),
             staged_schema_snapshot: frame.staged_schema_snapshot.clone(),
             hooks_memo: frame.hooks_memo.clone(),
+            staged_row_changes_len: frame.staged_row_changes_len,
         };
         // ROLLBACK TO keeps the target savepoint itself on the stack;
         // only nested savepoints above it are discarded.
@@ -5150,8 +5163,7 @@ impl Connection {
         // The entire transaction is being rolled back, so every materialized
         // view delta captured within it is void. Leaving them behind would
         // apply phantom changes to the views at the next successful commit.
-        self.transaction_changes.clear();
-        self.clear_staged_row_changes();
+        self.discard_transaction_changes();
     }
 
     /// Roll back transaction state for helpers that start a manual `BEGIN`
