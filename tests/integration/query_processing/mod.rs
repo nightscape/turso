@@ -5,6 +5,7 @@ mod test_change_callback;
 mod test_ddl;
 mod test_ddl_interrupt_schema_cookie;
 mod test_eqp_json;
+mod test_foreign_table;
 mod test_hash_join_materialization;
 mod test_in_seek;
 mod test_is_seek;

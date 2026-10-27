@@ -1933,6 +1933,63 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct OneRowFdw;
+
+    impl turso_core::foreign::ForeignDataWrapper for OneRowFdw {
+        fn key_columns(&self) -> &[turso_core::foreign::KeyColumn] {
+            &[]
+        }
+
+        fn schema_sql(&self) -> String {
+            "CREATE TABLE one_row(v INTEGER)".to_string()
+        }
+
+        fn open_cursor(
+            &self,
+            _conn: Arc<turso_core::Connection>,
+        ) -> turso_core::Result<Box<dyn turso_core::foreign::ForeignCursor>> {
+            Ok(Box::new(OneRowCursor))
+        }
+    }
+
+    struct OneRowCursor;
+
+    impl turso_core::foreign::ForeignCursor for OneRowCursor {
+        fn filter(
+            &mut self,
+            _constraints: &[turso_core::foreign::PushedConstraint],
+        ) -> turso_core::Result<bool> {
+            Ok(true)
+        }
+
+        fn next(&mut self) -> turso_core::Result<bool> {
+            Ok(false)
+        }
+
+        fn column(&self, _idx: usize) -> turso_core::Result<Value> {
+            Ok(Value::from_i64(42))
+        }
+
+        fn rowid(&self) -> i64 {
+            0
+        }
+    }
+
+    #[test]
+    fn register_foreign_table_makes_it_queryable() {
+        let db = TursoDatabase::new(config_with_features(None));
+        assert!(!db.open().unwrap().is_io());
+        let conn = db.connect().unwrap();
+        conn.register_foreign_table("one_row", Arc::new(OneRowFdw))
+            .unwrap();
+
+        let mut stmt = conn.prepare_single("SELECT v FROM one_row").unwrap();
+        assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Row);
+        assert_eq!(stmt.row_value(0).unwrap(), Value::from_i64(42));
+        assert_eq!(stmt.step(None).unwrap(), TursoStatusCode::Done);
+    }
+
     #[test]
     fn capi_page_codec_does_not_read_c_struct_padding() {
         unsafe extern "C" fn transform(
