@@ -425,6 +425,42 @@ fn alter_an_indexed_view(alter: &str, renamed: &str, reason: &str) -> Vec<String
     wrong
 }
 
+/// `DROP VIEW` takes the index's btree and its sqlite_schema row with it.
+/// A surviving row would point at a freed root page and break the next open.
+#[turso_macros::test(views)]
+fn drop_view_removes_its_indexes(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let path = tmp_db.path.clone();
+    {
+        let conn = tmp_db.connect_limbo();
+        setup(&conn)?;
+        conn.execute("DROP VIEW v")?;
+        assert_eq!(
+            limbo_exec_rows(
+                &conn,
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'idx_v_id'"
+            ),
+            vec![vec![Value::Integer(0)]],
+            "DROP VIEW must delete the index's sqlite_schema row"
+        );
+    }
+    drop(tmp_db);
+
+    let reopened = TempDatabase::builder()
+        .with_db_path(&path)
+        .with_views(true)
+        .build();
+    let conn = reopened.connect_limbo();
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT count(*) FROM t_raw"),
+        vec![vec![Value::Integer(6)]]
+    );
+    assert_eq!(
+        limbo_exec_rows(&conn, "PRAGMA integrity_check"),
+        vec![vec![Value::Text("ok".to_string())]]
+    );
+    Ok(())
+}
+
 /// `DROP INDEX` on a view's index leaves the view maintained and the file
 /// consistent.
 #[turso_macros::test(views)]

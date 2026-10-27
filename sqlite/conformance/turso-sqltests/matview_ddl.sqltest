@@ -188,6 +188,28 @@ expect {
     ok
 }
 
+# The dropped view's index pages are freed; recreating the view must not
+# write index entries into them.
+test matview-recreated-after-drop-forgets-its-indexes {
+    CREATE TABLE t(id TEXT PRIMARY KEY, p TEXT);
+    INSERT INTO t VALUES ('a', 'x'), ('b', 'a');
+    CREATE MATERIALIZED VIEW v AS SELECT id, p FROM t;
+    CREATE INDEX idx_v_id ON v(id);
+    CREATE INDEX idx_v_p ON v(p);
+    DROP VIEW v;
+    CREATE MATERIALIZED VIEW v AS SELECT id, p FROM t WHERE id != 'z';
+    CREATE INDEX idx_v_p ON v(p);
+    SELECT id, p FROM v WHERE p = 'a';
+    SELECT id, p FROM v NOT INDEXED ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    b|a
+    a|x
+    b|a
+    ok
+}
+
 test matview-index-refuses-unsupported-shapes {
     CREATE TABLE t(a, b);
     CREATE MATERIALIZED VIEW v AS SELECT a, b FROM t;
