@@ -558,3 +558,71 @@ fn uncorrelated_exists_maintains() {
     limbo_exec_rows(&conn, "DELETE FROM block_requires");
     check("emptying the subquery table");
 }
+
+fn rows_sorted(conn: &Arc<Connection>, sql: &str) -> Vec<String> {
+    let mut rows: Vec<String> = limbo_exec_rows(conn, sql)
+        .into_iter()
+        .map(|row| format!("{row:?}"))
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// An EXISTS in the SELECT list reads the same flag as one in the WHERE clause.
+#[test]
+fn exists_in_the_select_list_maintains() {
+    let db = TempDatabase::builder().with_views(true).build();
+    let conn = db.connect_limbo();
+    seed_holon(&conn);
+    const VIEW_SQL: &str = "SELECT b.id, \
+         CASE WHEN EXISTS (SELECT 1 FROM block_tags bt WHERE bt.block_id = b.id) \
+         THEN 'tagged' ELSE 'bare' END AS kind, \
+         EXISTS (SELECT 1 FROM block_requires bl WHERE bl.block_id = b.id) AS has_requirement \
+         FROM block b";
+
+    limbo_exec_rows(
+        &conn,
+        &format!("CREATE MATERIALIZED VIEW kinds AS {VIEW_SQL}"),
+    );
+    let check = |stage: &str| {
+        assert_eq!(
+            rows_sorted(&conn, "SELECT * FROM kinds"),
+            rows_sorted(&conn, VIEW_SQL),
+            "matview kinds disagrees with a fresh recompute after {stage}"
+        );
+    };
+    check("materializing over existing rows");
+
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO block_tags VALUES (4,'urgent'),(4,'later')",
+    );
+    check("tagging a bare row twice");
+
+    limbo_exec_rows(&conn, "DELETE FROM block_tags WHERE block_id = 4");
+    check("removing both tags");
+
+    limbo_exec_rows(&conn, "DELETE FROM block_requires WHERE block_id = 3");
+    check("removing every requirement of a row");
+
+    limbo_exec_rows(&conn, "INSERT INTO block VALUES (8,'{}')");
+    check("inserting an outer row");
+}
+
+/// A grouped query publishes only its group keys and aggregates, so a flag in
+/// its SELECT list has nothing to read.
+#[test]
+fn exists_in_the_select_list_of_a_grouped_query_is_refused() {
+    let db = TempDatabase::builder().with_views(true).build();
+    let conn = db.connect_limbo();
+    seed_holon(&conn);
+
+    assert_refused_naming(
+        &db,
+        &conn,
+        "CREATE MATERIALIZED VIEW v AS SELECT b.id, \
+         EXISTS (SELECT 1 FROM block_tags bt WHERE bt.block_id = b.id) AS tagged \
+         FROM block b GROUP BY b.id",
+        "subqueries",
+    );
+}
