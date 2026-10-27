@@ -183,7 +183,7 @@ pub use turso_macros::{
     turso_assert_unreachable, turso_debug_assert, turso_soft_unreachable,
 };
 pub use turso_parser::ast::EqpFormat;
-pub use types::{IOResult, Value, ValueBlob, ValueRef};
+pub use types::{CallbackId, IOResult, Value, ValueBlob, ValueRef};
 pub use util::IOExt;
 pub use vdbe::array::array_values_from_any;
 pub use vdbe::{

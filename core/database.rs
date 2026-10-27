@@ -711,6 +711,7 @@ pub struct Database<
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
     page_codec_id: Option<PageCodecId>,
+    pub(crate) change_callbacks: parking_lot::RwLock<Vec<types::ChangeCallbackEntry>>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -877,6 +878,7 @@ impl Database {
                 encryption_cipher_mode.unwrap_or(CipherMode::None),
             ),
             page_codec_id,
+            change_callbacks: parking_lot::RwLock::new(Vec::new()),
 
             durable_storage: None,
         };

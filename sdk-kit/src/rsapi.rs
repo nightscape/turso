@@ -66,6 +66,8 @@ impl Drop for SyncBusyGuard {
 }
 
 pub use turso_core::types::FromValue;
+pub use turso_core::types::{DatabaseChange, DatabaseChangeType, RelationChangeEvent};
+pub use turso_core::CallbackId;
 pub use turso_ext::{
     AggCtx, ContextDestructor, FinalizeFunction, InitAggFunction, ResultCode, ScalarFunction,
     StepFunction, Value as ExtensionValue, ValueDestructor,
@@ -1169,6 +1171,32 @@ impl TursoConnection {
 
     fn map_sync_transient_error(&self, error: TursoError) -> TursoError {
         map_sync_transient_error(self.sync_busy.as_ref(), error)
+    }
+    /// Register a callback for committed changes. See [turso_core::Connection::set_change_callback].
+    pub fn set_change_callback<F>(&self, callback: F) -> Result<CallbackId, TursoError>
+    where
+        F: Fn(&RelationChangeEvent) + Send + Sync + 'static,
+    {
+        Ok(self.connection.set_change_callback(callback)?)
+    }
+    /// Like [Self::set_change_callback], limited to the named relations.
+    pub fn set_change_callback_for<F>(
+        &self,
+        relations: &[&str],
+        callback: F,
+    ) -> Result<CallbackId, TursoError>
+    where
+        F: Fn(&RelationChangeEvent) + Send + Sync + 'static,
+    {
+        Ok(self
+            .connection
+            .set_change_callback_for(relations, callback)?)
+    }
+    pub fn clear_change_callback(&self, id: CallbackId) {
+        self.connection.clear_change_callback(id);
+    }
+    pub fn clear_all_change_callbacks(&self) {
+        self.connection.clear_all_change_callbacks();
     }
     /// Set busy timeout for the connection
     pub fn set_busy_timeout(&self, duration: Duration) {

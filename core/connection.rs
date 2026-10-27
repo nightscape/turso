@@ -4407,6 +4407,55 @@ impl Connection {
         self.bump_prepare_context_generation();
     }
 
+    /// Register a callback for committed changes of every table (with CDC on) and
+    /// materialized view of this database, whichever connection commits.
+    pub fn set_change_callback<F>(&self, callback: F) -> Result<crate::types::CallbackId>
+    where
+        F: Fn(&crate::types::RelationChangeEvent) + Send + Sync + 'static,
+    {
+        self.add_change_callback(None, callback)
+    }
+
+    /// Like `set_change_callback`, limited to the named relations.
+    pub fn set_change_callback_for<F>(
+        &self,
+        relations: &[&str],
+        callback: F,
+    ) -> Result<crate::types::CallbackId>
+    where
+        F: Fn(&crate::types::RelationChangeEvent) + Send + Sync + 'static,
+    {
+        let filter = relations.iter().map(|name| name.to_string()).collect();
+        self.add_change_callback(Some(filter), callback)
+    }
+
+    pub fn clear_change_callback(&self, id: crate::types::CallbackId) {
+        self.db
+            .change_callbacks
+            .write()
+            .retain(|(callback_id, _, _)| *callback_id != id);
+    }
+
+    pub fn clear_all_change_callbacks(&self) {
+        self.db.change_callbacks.write().clear();
+    }
+
+    fn add_change_callback<F>(
+        &self,
+        filter: crate::types::RelationFilter,
+        callback: F,
+    ) -> Result<crate::types::CallbackId>
+    where
+        F: Fn(&crate::types::RelationChangeEvent) + Send + Sync + 'static,
+    {
+        let id = crate::types::CallbackId::next();
+        self.db
+            .change_callbacks
+            .write()
+            .push((id, filter, Arc::new(callback)));
+        Ok(id)
+    }
+
     /// Sets maximum total accumulated timeout. If the duration is Zero, we unset the busy handler.
     pub fn set_busy_timeout(&self, duration: Duration) {
         *self.busy_handler.write() = if duration.is_zero() {

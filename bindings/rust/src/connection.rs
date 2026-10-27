@@ -516,6 +516,40 @@ impl Connection {
         conn.set_busy_timeout(duration);
         Ok(())
     }
+
+    /// Register a callback for committed changes of materialized views (and of
+    /// tables while CDC is on). The callback runs on the committing thread
+    /// after the commit is complete.
+    pub fn set_change_callback<F>(&self, callback: F) -> Result<turso_sdk_kit::rsapi::CallbackId>
+    where
+        F: Fn(&turso_sdk_kit::rsapi::RelationChangeEvent) + Send + Sync + 'static,
+    {
+        Ok(self.get_inner_connection()?.set_change_callback(callback)?)
+    }
+
+    /// Like [Self::set_change_callback], limited to the named relations.
+    pub fn set_change_callback_for<F>(
+        &self,
+        relations: &[&str],
+        callback: F,
+    ) -> Result<turso_sdk_kit::rsapi::CallbackId>
+    where
+        F: Fn(&turso_sdk_kit::rsapi::RelationChangeEvent) + Send + Sync + 'static,
+    {
+        Ok(self
+            .get_inner_connection()?
+            .set_change_callback_for(relations, callback)?)
+    }
+
+    pub fn clear_change_callback(&self, id: turso_sdk_kit::rsapi::CallbackId) -> Result<()> {
+        self.get_inner_connection()?.clear_change_callback(id);
+        Ok(())
+    }
+
+    pub fn clear_all_change_callbacks(&self) -> Result<()> {
+        self.get_inner_connection()?.clear_all_change_callbacks();
+        Ok(())
+    }
 }
 
 impl Debug for Connection {

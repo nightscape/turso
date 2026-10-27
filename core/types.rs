@@ -3891,7 +3891,7 @@ impl<'a> SeekKey<'a> {
 
 #[derive(Debug)]
 pub enum DatabaseChangeType {
-    Delete,
+    Delete { bin_record: std::vec::Vec<u8> },
     Update { bin_record: std::vec::Vec<u8> },
     Insert { bin_record: std::vec::Vec<u8> },
 }
@@ -3904,6 +3904,54 @@ pub struct DatabaseChange {
     pub table_name: String,
     pub id: i64,
 }
+
+impl DatabaseChange {
+    /// Decode the row image of this change, one value per column.
+    pub fn parse_record(&self) -> Result<Vec<Value>> {
+        let (DatabaseChangeType::Insert { bin_record }
+        | DatabaseChangeType::Update { bin_record }
+        | DatabaseChangeType::Delete { bin_record }) = &self.change;
+        ImmutableRecordRef::from_bin_record(bin_record).get_values_owned()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CallbackId(u64);
+
+impl CallbackId {
+    pub(crate) fn next() -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self(COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// Committed changes of one table or materialized view.
+///
+/// Events are delivered after the commit is complete. A rolled back
+/// transaction, statement or savepoint delivers nothing. All events of one
+/// commit share `commit_id`; `commit_index` and `commit_len` count the events
+/// the commit produced before any callback filter is applied.
+#[derive(Debug)]
+pub struct RelationChangeEvent {
+    pub relation_name: String,
+    pub columns: Vec<String>,
+    pub changes: Vec<DatabaseChange>,
+    pub commit_id: u64,
+    pub commit_index: u32,
+    pub commit_len: u32,
+}
+
+impl RelationChangeEvent {
+    pub fn commit_id(&self) -> u64 {
+        self.commit_id
+    }
+}
+
+pub type ChangeCallbackFn = std::sync::Arc<dyn Fn(&RelationChangeEvent) + Send + Sync>;
+
+pub type RelationFilter = Option<std::collections::HashSet<String>>;
+
+pub type ChangeCallbackEntry = (CallbackId, RelationFilter, ChangeCallbackFn);
 
 #[derive(Debug)]
 pub struct WalFrameInfo {
