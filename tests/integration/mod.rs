@@ -18,6 +18,7 @@ mod fuzz_transaction;
 mod index_method;
 mod integrity_check;
 mod lossy_index_keys;
+mod matview_exists_decorrelation;
 mod mvcc;
 mod pragma;
 mod query_processing;
