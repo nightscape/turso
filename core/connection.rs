@@ -475,7 +475,8 @@ pub struct Connection {
     /// consumer indexes for materialized-view maintenance.
     pub(crate) transaction_changes: crate::incremental::view::TransactionChanges,
     /// Row changes of the open transaction that change callbacks will see once it commits.
-    pub(crate) staged_row_changes: parking_lot::Mutex<Vec<crate::vdbe::row_change::RowChange>>,
+    pub(crate) staged_row_changes:
+        parking_lot::Mutex<Vec<crate::change_callbacks::StagedRowChange>>,
     /// Prepared IVM bytecode keyed by schema epoch and physical view layout.
     pub(crate) maintenance_program_cache:
         crate::incremental::vdbe_maintenance::MaintenanceProgramCache,
@@ -4452,7 +4453,7 @@ impl Connection {
         Ok(self.db.change_callbacks.add(filter, Arc::new(callback)))
     }
 
-    pub(crate) fn stage_row_change(&self, change: crate::vdbe::row_change::RowChange) {
+    pub(crate) fn stage_row_change(&self, change: crate::change_callbacks::StagedRowChange) {
         self.staged_row_changes.lock().push(change);
     }
 

@@ -5,7 +5,13 @@ use crate::types::{
     CallbackId, ChangeCallbackEntry, ChangeCallbackFn, DatabaseChange, DatabaseChangeType,
     ImmutableRecord, RelationChangeEvent, RelationFilter,
 };
-use crate::vdbe::row_change::RowChange;
+use crate::vdbe::row_change::{normalize_table_change_record, RowChange};
+
+pub(crate) struct StagedRowChange {
+    pub(crate) change: RowChange,
+    pub(crate) relation_name: String,
+    pub(crate) is_materialized_view: bool,
+}
 
 pub(crate) struct ChangeCallbacks {
     entries: parking_lot::RwLock<Vec<ChangeCallbackEntry>>,
@@ -53,7 +59,7 @@ impl ChangeCallbacks {
     }
 }
 
-pub(crate) fn dispatch(callbacks: &ChangeCallbacks, staged: Vec<RowChange>) {
+pub(crate) fn dispatch(callbacks: &ChangeCallbacks, staged: Vec<StagedRowChange>) {
     let mut events = build_events(staged);
     if events.is_empty() {
         return;
@@ -91,23 +97,37 @@ fn next_commit_id() -> u64 {
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-fn build_events(staged: Vec<RowChange>) -> Vec<RelationChangeEvent> {
+fn build_events(staged: Vec<StagedRowChange>) -> Vec<RelationChangeEvent> {
     let mut relations: Vec<RelationRows> = Vec::new();
     let mut relation_of_name: HashMap<String, usize> = HashMap::new();
-    for row in staged {
+    for staged_row in staged {
+        let StagedRowChange {
+            change: row,
+            relation_name,
+            is_materialized_view,
+        } = staged_row;
         let relation = *relation_of_name
-            .entry(row.table.name.clone())
+            .entry(relation_name.clone())
             .or_insert_with(|| {
                 relations.push(RelationRows {
+                    relation_name,
                     table: row.table.clone(),
+                    is_materialized_view,
                     rows: Vec::new(),
                     row_of_rowid: HashMap::new(),
                 });
                 relations.len() - 1
             });
         let relation = &mut relations[relation];
-        let before = row.images.before().map(view_image);
-        let after = row.images.after().map(view_image);
+        let image = |record: &ImmutableRecord| {
+            if is_materialized_view {
+                view_image(record)
+            } else {
+                table_image(&row.table, row.rowid, record)
+            }
+        };
+        let before = row.images.before().map(image);
+        let after = row.images.after().map(image);
         match relation.row_of_rowid.get(&row.rowid) {
             Some(&index) => relation.rows[index].after = after,
             None => {
@@ -127,7 +147,9 @@ fn build_events(staged: Vec<RowChange>) -> Vec<RelationChangeEvent> {
 }
 
 struct RelationRows {
+    relation_name: String,
     table: std::sync::Arc<crate::schema::BTreeTable>,
+    is_materialized_view: bool,
     rows: Vec<NetRow>,
     row_of_rowid: HashMap<i64, usize>,
 }
@@ -145,49 +167,52 @@ impl RelationRows {
             .into_iter()
             .filter(|row| row.before != row.after)
             .collect();
-        let mut changes = Vec::new();
-        for row in &changed {
-            if let Some(bin_record) = &row.before {
-                changes.push((
-                    row.rowid,
-                    DatabaseChangeType::Delete {
-                        bin_record: bin_record.clone(),
-                    },
-                ));
+        let mut deletes = Vec::new();
+        let mut updates = Vec::new();
+        let mut inserts = Vec::new();
+        for row in changed {
+            match (row.before, row.after) {
+                (Some(before), None) => {
+                    deletes.push((row.rowid, DatabaseChangeType::Delete { bin_record: before }))
+                }
+                (None, Some(after)) => {
+                    inserts.push((row.rowid, DatabaseChangeType::Insert { bin_record: after }))
+                }
+                (Some(before), Some(after)) if self.is_materialized_view => {
+                    deletes.push((row.rowid, DatabaseChangeType::Delete { bin_record: before }));
+                    inserts.push((row.rowid, DatabaseChangeType::Insert { bin_record: after }));
+                }
+                (Some(_), Some(after)) => {
+                    updates.push((row.rowid, DatabaseChangeType::Update { bin_record: after }))
+                }
+                (None, None) => unreachable!("equal images were filtered out"),
             }
         }
-        for row in &changed {
-            if let Some(bin_record) = &row.after {
-                changes.push((
-                    row.rowid,
-                    DatabaseChangeType::Insert {
-                        bin_record: bin_record.clone(),
-                    },
-                ));
-            }
-        }
-        if changes.is_empty() {
+        if deletes.is_empty() && updates.is_empty() && inserts.is_empty() {
             return None;
         }
-        let relation_name = self.table.name.clone();
+        let relation_name = self.relation_name;
+        let changes = deletes
+            .into_iter()
+            .chain(updates)
+            .chain(inserts)
+            .enumerate()
+            .map(|(index, (id, change))| DatabaseChange {
+                change_id: index as i64 + 1,
+                change_time: 0,
+                change,
+                table_name: relation_name.clone(),
+                id,
+            })
+            .collect();
         Some(RelationChangeEvent {
             columns: self
                 .table
                 .columns()
                 .iter()
-                .map(|column| column.name.clone().expect("view column has a name"))
+                .map(|column| column.name.clone().expect("a relation column has a name"))
                 .collect(),
-            changes: changes
-                .into_iter()
-                .enumerate()
-                .map(|(index, (id, change))| DatabaseChange {
-                    change_id: index as i64 + 1,
-                    change_time: 0,
-                    change,
-                    table_name: relation_name.clone(),
-                    id,
-                })
-                .collect(),
+            changes,
             relation_name,
             commit_id: 0,
             commit_index: 0,
@@ -196,13 +221,26 @@ impl RelationRows {
     }
 }
 
-pub(crate) fn view_image(record: &ImmutableRecord) -> Vec<u8> {
+fn view_image(record: &ImmutableRecord) -> Vec<u8> {
     let mut values = record
         .get_values_owned()
         .expect("a staged view row image decodes");
     values.pop().expect("a view row image ends with its weight");
-    ImmutableRecord::from_values(&values, values.len())
-        .expect("a view row image encodes")
+    encode(&values)
+}
+
+fn table_image(table: &crate::schema::BTreeTable, rowid: i64, record: &ImmutableRecord) -> Vec<u8> {
+    let values = record
+        .get_values_owned()
+        .expect("a staged table row image decodes");
+    let values = normalize_table_change_record(table, rowid, values)
+        .expect("a staged table row image matches its table");
+    encode(&values)
+}
+
+fn encode(values: &[crate::Value]) -> Vec<u8> {
+    ImmutableRecord::from_values(values, values.len())
+        .expect("a row image encodes")
         .get_payload()
         .to_vec()
 }
