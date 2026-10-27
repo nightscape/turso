@@ -155,6 +155,25 @@ pub enum OpNode {
         logical_id: TableInternalId,
     },
 
+    /// The rows of a recursive CTE, read by its recursive arm. A leaf whose
+    /// delta and arrangement the enclosing [`OpNode::Fixpoint`] supplies.
+    /// Output schema: the CTE's columns, then the round in which each row
+    /// was derived.
+    RecursiveInput {
+        table: Arc<BTreeTable>,
+        identifier: String,
+        logical_id: TableInternalId,
+    },
+
+    /// `WITH RECURSIVE ... UNION ALL`: `inputs` are the seed arm and the
+    /// recursive arm. The recursive arm is the nodes `body_start..=inputs[1]`;
+    /// they read the CTE through [`OpNode::RecursiveInput`] leaves and output
+    /// the CTE's columns plus the round. Output schema: the seed arm's.
+    Fixpoint {
+        inputs: [NodeId; 2],
+        body_start: NodeId,
+    },
+
     /// Selection (σ). Linear — its incremental form is itself applied to the
     /// input delta, so it keeps no state. Output schema: its input's.
     Filter {
@@ -271,14 +290,14 @@ impl OpNode {
     /// The input node ids this operator consumes, in order.
     pub fn inputs(&self) -> &[NodeId] {
         match self {
-            OpNode::Scan { .. } => &[],
+            OpNode::Scan { .. } | OpNode::RecursiveInput { .. } => &[],
             OpNode::Filter { input, .. }
             | OpNode::Project { input, .. }
             | OpNode::Alias { input, .. }
             | OpNode::Pad { input, .. }
             | OpNode::Aggregate { input, .. }
             | OpNode::TopK { input, .. } => std::slice::from_ref(input),
-            OpNode::Join { inputs, .. } => inputs,
+            OpNode::Join { inputs, .. } | OpNode::Fixpoint { inputs, .. } => inputs,
             OpNode::SetOp { inputs, .. } => inputs,
         }
     }
@@ -366,6 +385,11 @@ impl DagBuilder {
                 table,
                 identifier,
                 logical_id,
+            }
+            | OpNode::RecursiveInput {
+                table,
+                identifier,
+                logical_id,
             } => (
                 table
                     .columns()
@@ -386,6 +410,30 @@ impl DagBuilder {
                     logical_id: *logical_id,
                 }],
             ),
+            OpNode::Fixpoint {
+                inputs: [initial, step],
+                body_start,
+            } => {
+                let body = *body_start..=*step;
+                if *body_start != initial + 1
+                    || body.clone().any(|node| {
+                        self.nodes[node]
+                            .inputs()
+                            .iter()
+                            .any(|input| !body.contains(input))
+                    })
+                    || self.output_schemas[*step].len() != self.output_schemas[*initial].len() + 1
+                {
+                    return Err(LimboError::InternalError(
+                        "a recursive CTE arm must follow its seed arm and add the round"
+                            .to_string(),
+                    ));
+                }
+                (
+                    self.output_schemas[*initial].columns.clone(),
+                    self.output_schemas[*initial].bindings.clone(),
+                )
+            }
             OpNode::Filter { input, .. } | OpNode::TopK { input, .. } => (
                 self.output_schemas[*input].columns.clone(),
                 self.output_schemas[*input].bindings.clone(),
