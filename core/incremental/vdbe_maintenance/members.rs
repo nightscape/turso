@@ -94,6 +94,31 @@ impl MemberTable {
     pub(super) fn index_cursor_id(&self) -> usize {
         self.index_cursor_id
     }
+
+    /// Read the count of the member the index cursor is on into `dest`.
+    pub(super) fn emit_load_count(
+        &self,
+        program: &mut ProgramBuilder,
+        dest: usize,
+        corrupt_label: BranchOffset,
+    ) {
+        let rowid_reg = program.alloc_register();
+        program.emit_insn(Insn::IdxRowId {
+            cursor_id: self.index_cursor_id,
+            dest: rowid_reg,
+        });
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: self.table_cursor_id,
+            src_reg: rowid_reg,
+            target_pc: corrupt_label,
+        });
+        program.emit_insn(Insn::Column {
+            cursor_id: self.table_cursor_id,
+            column: self.key_width,
+            dest,
+            default: None,
+        });
+    }
 }
 
 /// Write the record of the `width` values at `start` into `dest`. Records
