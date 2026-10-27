@@ -377,18 +377,20 @@ fn emit_plan_nodes(
                         schema,
                         connection,
                     )?,
-                    dag::JoinKind::Semi | dag::JoinKind::Anti => emit_semi_or_anti_join(
-                        program,
-                        view_name,
-                        node_id,
-                        *kind,
-                        &contract,
-                        output_contract,
-                        input,
-                        operator_state,
-                        schema,
-                        connection,
-                    )?,
+                    dag::JoinKind::Semi | dag::JoinKind::Anti | dag::JoinKind::Mark { .. } => {
+                        emit_semi_or_anti_join(
+                            program,
+                            view_name,
+                            node_id,
+                            *kind,
+                            &contract,
+                            output_contract,
+                            input,
+                            operator_state,
+                            schema,
+                            connection,
+                        )?
+                    }
                 }
             }
             dag::OpNode::Pad {

@@ -92,6 +92,27 @@ pub enum JoinKind {
     /// Rows of the first input that no row of the second input matches
     /// (`NOT EXISTS`). Output schema: the first input's.
     Anti,
+    Mark {
+        subquery_id: TableInternalId,
+        result_reg: usize,
+    },
+}
+
+impl JoinKind {
+    pub fn mark_expr(self) -> Option<ast::Expr> {
+        match self {
+            JoinKind::Mark {
+                subquery_id,
+                result_reg,
+            } => Some(ast::Expr::SubqueryResult {
+                subquery_id,
+                lhs: None,
+                not_in: false,
+                query_type: ast::SubqueryType::Exists { result_reg },
+            }),
+            JoinKind::Inner | JoinKind::Semi | JoinKind::Anti => None,
+        }
+    }
 }
 
 /// One incremental operator in the maintenance DAG.
@@ -154,7 +175,8 @@ pub enum OpNode {
     /// Binary join (⋈) with arbitrary ON predicates. Pure: no projection, no
     /// WHERE (those are `Project`/`Filter` above). Output schema: the
     /// concatenation of the left and right schemas for an inner join, the
-    /// left schema for a semi or anti join. Keeping this node binary makes SQL's
+    /// left schema for a semi or anti join, and the left schema plus the match
+    /// column for a mark join. Keeping this node binary makes SQL's
     /// mixed outer-join tree explicit and bounds every delta decomposition
     /// to the bilinear two-input rule.
     ///
@@ -396,10 +418,15 @@ impl DagBuilder {
             ),
             OpNode::Join {
                 inputs,
-                kind: JoinKind::Semi | JoinKind::Anti,
+                kind: kind @ (JoinKind::Semi | JoinKind::Anti | JoinKind::Mark { .. }),
                 ..
             } => (
-                self.output_schemas[inputs[0]].columns.clone(),
+                self.output_schemas[inputs[0]]
+                    .columns
+                    .iter()
+                    .cloned()
+                    .chain(kind.mark_expr().map(Some))
+                    .collect(),
                 self.output_schemas[inputs[0]].bindings.clone(),
             ),
             OpNode::Pad {
