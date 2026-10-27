@@ -19,10 +19,14 @@ pub mod cdc;
 pub mod dbpage;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod functions;
+#[cfg(not(any(feature = "fuzz", feature = "bench")))]
+mod functions;
 pub mod index_method;
 pub mod io;
 #[cfg(all(feature = "json", any(feature = "fuzz", feature = "bench")))]
 pub mod json;
+#[cfg(all(feature = "json", not(any(feature = "fuzz", feature = "bench"))))]
+mod json;
 #[cfg(all(
     test,
     feature = "fs",
@@ -35,6 +39,8 @@ pub mod namespace;
 pub mod native_ext;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
+#[cfg(not(any(feature = "fuzz", feature = "bench")))]
+mod numeric;
 pub mod schema;
 pub mod security;
 pub mod skiplist;
@@ -44,6 +50,8 @@ pub mod type_ordering;
 pub mod types;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod vdbe;
+#[cfg(not(any(feature = "fuzz", feature = "bench")))]
+mod vdbe;
 pub mod vector;
 
 #[cfg(feature = "cli_only")]
@@ -53,6 +61,7 @@ pub(crate) mod thread;
 
 mod assert;
 mod attach;
+mod change_callbacks;
 mod connection;
 mod connection_hooks;
 mod database;
@@ -61,16 +70,10 @@ mod error;
 mod ext;
 mod fast_lock;
 mod function;
-#[cfg(not(any(feature = "fuzz", feature = "bench")))]
-mod functions;
 mod incremental;
 mod incremental_blob;
 pub use incremental_blob::Blob;
 mod info;
-#[cfg(all(feature = "json", not(any(feature = "fuzz", feature = "bench"))))]
-mod json;
-#[cfg(not(any(feature = "fuzz", feature = "bench")))]
-mod numeric;
 mod parameters;
 #[cfg(feature = "percentile")]
 mod percentile;
@@ -90,8 +93,6 @@ mod translate;
 mod util;
 #[cfg(feature = "uuid")]
 mod uuid;
-#[cfg(not(any(feature = "fuzz", feature = "bench")))]
-mod vdbe;
 mod vtab;
 
 #[cfg(any(feature = "fuzz", feature = "bench"))]
