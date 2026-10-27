@@ -35,6 +35,9 @@ pub(super) fn tracks_distinct_values(agg: &Aggregate) -> bool {
         && !recomputes_from_members(agg)
 }
 
+const READS_ONLY_THE_QUERY_AROUND: &str =
+    "subqueries inside subqueries that read more than the query directly around them";
+
 fn unsupported<T>(what: &str) -> Result<T> {
     Err(LimboError::ParseError(format!(
         "materialized views with {what} are not yet supported",
@@ -598,23 +601,39 @@ fn push_exists_mark(
         .map(|table| table.internal_id)
         .collect::<FxHashSet<_>>();
 
+    let hidden_ids = inner
+        .table_references
+        .joined_tables()
+        .iter()
+        .filter(|table| {
+            table
+                .join_info
+                .as_ref()
+                .is_some_and(|join| matches!(join.join_type, JoinType::Semi | JoinType::Anti))
+        })
+        .map(|table| table.internal_id)
+        .collect::<FxHashSet<_>>();
+
     let mut on = Vec::new();
     let mut inner_terms = Vec::new();
     for term in &inner.where_clause {
         let mut reads_outer = false;
+        let mut reads_hidden = false;
         walk_expr_with_subqueries(&term.expr, &mut |node| {
             if let ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } = node {
                 if !inner_ids.contains(table) {
                     if !outer_ids.contains(table) {
-                        return unsupported(
-                            "subqueries inside subqueries that read more than the query directly around them",
-                        );
+                        return unsupported(READS_ONLY_THE_QUERY_AROUND);
                     }
                     reads_outer = true;
                 }
+                reads_hidden |= hidden_ids.contains(table);
             }
             Ok(WalkControl::Continue)
         })?;
+        if reads_outer && reads_hidden {
+            return unsupported(READS_ONLY_THE_QUERY_AROUND);
+        }
         if !reads_outer {
             inner_terms.push(term.clone());
             continue;
