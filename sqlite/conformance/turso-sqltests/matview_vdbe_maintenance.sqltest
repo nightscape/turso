@@ -4027,10 +4027,10 @@ expect {
 test matview-vdbe-rejected-create-is-clean {
     CREATE TABLE t7(a INTEGER, b TEXT);
     INSERT INTO t7 VALUES (1,'x');
-    CREATE MATERIALIZED VIEW bad7 AS SELECT group_concat(a) FROM t7 GROUP BY b;
+    CREATE MATERIALIZED VIEW bad7 AS SELECT json_group_object(b, a) FROM t7 GROUP BY b;
 }
 expect error {
-    materialized views with the group_concat aggregate are not yet supported
+    materialized views with the json_group_object aggregate are not yet supported
 }
 
 # Bare columns in HAVING use SQLite's arbitrary-row semantics, which cannot
