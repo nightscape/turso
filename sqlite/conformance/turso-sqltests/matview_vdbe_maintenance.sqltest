@@ -636,6 +636,37 @@ expect error {
     integer overflow
 }
 
+# Retracting one infinite row must not poison the rows that remain: the view
+# must keep matching a fresh SUM/TOTAL/AVG, including NULL when +Inf and -Inf
+# are both present.
+test matview-vdbe-sum-infinity-retraction {
+    CREATE TABLE sum_inf(g INTEGER, x REAL);
+    CREATE MATERIALIZED VIEW sum_inf_view AS
+      SELECT g, SUM(x) AS s, TOTAL(x) AS t, AVG(x) AS a FROM sum_inf GROUP BY g;
+    INSERT INTO sum_inf VALUES (1, -9e999), (1, -9e999), (1, 1.5), (2, 9e999), (2, -9e999), (3, 9e999);
+    DELETE FROM sum_inf WHERE rowid = 1;
+    SELECT v.g, v.s IS f.s, v.t IS f.t, v.a IS f.a
+      FROM sum_inf_view v JOIN (SELECT g, SUM(x) AS s, TOTAL(x) AS t, AVG(x) AS a FROM sum_inf GROUP BY g) f ON v.g = f.g
+      ORDER BY v.g;
+    DELETE FROM sum_inf WHERE rowid = 5;
+    SELECT v.g, v.s IS f.s, v.t IS f.t, v.a IS f.a
+      FROM sum_inf_view v JOIN (SELECT g, SUM(x) AS s, TOTAL(x) AS t, AVG(x) AS a FROM sum_inf GROUP BY g) f ON v.g = f.g
+      ORDER BY v.g;
+    SELECT g, s, t, a FROM sum_inf_view WHERE g = 1;
+    DELETE FROM sum_inf WHERE rowid = 2;
+    SELECT g, s, t, a FROM sum_inf_view WHERE g = 1;
+}
+expect {
+    1|1|1|1
+    2|1|1|1
+    3|1|1|1
+    1|1|1|1
+    2|1|1|1
+    3|1|1|1
+    1|-Inf|-Inf|-Inf
+    1|1.5|1.5|1.5
+}
+
 # The single row also exists when WHERE filters out every scanned row.
 test matview-vdbe-scalar-aggregate-where-filters-all {
     CREATE TABLE t28(x INTEGER);
