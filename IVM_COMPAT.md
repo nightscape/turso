@@ -65,7 +65,7 @@ even if the regular query engine does.
 | `ORDER BY` | ❌ No | Rejected in the materialized-view definition. Reads from the completed view may use regular `ORDER BY`. |
 | `LIMIT` / `OFFSET` | ❌ No | Rejected in the materialized-view definition. |
 | Window functions | ❌ No | |
-| Recursive CTEs | ❌ No | Turso's regular engine does not currently support these either. |
+| Recursive CTEs | ✅ Yes | `WITH RECURSIVE ... UNION ALL`. The recursive part may use `JOIN`, `LEFT JOIN` with the CTE on the left side, and `EXISTS` / `NOT EXISTS` over base-table rows. Not yet supported: `UNION`, `ORDER BY` / `LIMIT` / `OFFSET` in the CTE, aggregates, `DISTINCT` or set operations in the recursive part, nested recursive CTEs, the CTE on the right side of a `LEFT JOIN`, and subqueries that read the CTE or its columns. A statement fails if the recursion does not end after 10000 rounds. |
 
 ### Joins
 
