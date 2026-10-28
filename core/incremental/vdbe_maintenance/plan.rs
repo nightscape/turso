@@ -190,8 +190,15 @@ fn build_plan_dag_node(
     let root = match plan {
         Plan::Select(select) => build_select_plan_dag(builder, select, resolver)?,
         Plan::CompoundSelect {
-            left, right_most, ..
+            left,
+            right_most,
+            limit,
+            offset,
+            ..
         } => {
+            if limit.is_some() || offset.is_some() {
+                return unsupported("LIMIT or OFFSET on a compound SELECT");
+            }
             let mut inputs = Vec::with_capacity(left.len() + 1);
             for (branch, _) in left {
                 inputs.push(build_select_plan_dag(builder, branch, resolver)?);
