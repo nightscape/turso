@@ -1,0 +1,27 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+@verify-materialized-views
+
+# ORDER BY, LIMIT and OFFSET in materialized views. A view keeps its rows in
+# rowid order: a read that needs an order writes its own ORDER BY.
+
+test matview-compound-limit-rejected {
+    CREATE TABLE cl_a(x INTEGER);
+    CREATE TABLE cl_b(x INTEGER);
+    CREATE MATERIALIZED VIEW cl AS
+      SELECT x FROM cl_a UNION ALL SELECT x FROM cl_b ORDER BY 1 LIMIT 1;
+}
+expect error {
+    materialized views with LIMIT or OFFSET on a compound SELECT are not yet supported
+}
+
+test matview-compound-offset-rejected {
+    CREATE TABLE co_a(x INTEGER);
+    CREATE TABLE co_b(x INTEGER);
+    CREATE MATERIALIZED VIEW co AS
+      SELECT x FROM co_a UNION SELECT x FROM co_b ORDER BY 1 LIMIT -1 OFFSET 1;
+}
+expect error {
+    materialized views with LIMIT or OFFSET on a compound SELECT are not yet supported
+}
