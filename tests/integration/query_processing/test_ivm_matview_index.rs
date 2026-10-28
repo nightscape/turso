@@ -696,3 +696,37 @@ fn an_index_on_a_recursive_view_follows_the_tree(tmp_db: TempDatabase) -> anyhow
     }
     Ok(())
 }
+
+/// REFRESH exists to repair a view whose rows went stale, here by a write
+/// that bypassed maintenance. The repaired rows need repaired index entries.
+#[test]
+fn refresh_of_a_stale_view_rebuilds_its_index() -> anyhow::Result<()> {
+    let tmp_db = TempDatabase::builder().with_views(true).build();
+    let path = tmp_db.path.clone();
+    {
+        let conn = tmp_db.connect_limbo();
+        setup(&conn)?;
+    }
+    drop(tmp_db);
+
+    let sqlite = rusqlite::Connection::open(&path)?;
+    sqlite.pragma_update(None, "writable_schema", "ON")?;
+    sqlite.execute("UPDATE t_raw SET id = 'z' || id WHERE st = 'TODO'", [])?;
+    drop(sqlite);
+
+    let reopened = TempDatabase::builder()
+        .with_db_path(&path)
+        .with_views(true)
+        .build();
+    let conn = reopened.connect_limbo();
+    conn.execute("REFRESH MATERIALIZED VIEW v")?;
+
+    assert_integrity_ok(&conn, "REFRESH of a stale view");
+    assert_index_matches_scan(
+        &conn,
+        "REFRESH of a stale view",
+        "SELECT id, st FROM v WHERE id >= 'b' ORDER BY id",
+        "SELECT id, st FROM v NOT INDEXED WHERE id >= 'b' ORDER BY id",
+    );
+    Ok(())
+}
