@@ -1512,14 +1512,25 @@ fn validate_planned_node(
             inputs: [_, step],
             body_start,
         } => {
-            for body_node in &dag.nodes[*body_start..=*step] {
+            let mut reads_cte = vec![false; dag.nodes.len()];
+            for (id, body_node) in dag
+                .nodes
+                .iter()
+                .enumerate()
+                .take(*step + 1)
+                .skip(*body_start)
+            {
+                reads_cte[id] = matches!(body_node, dag::OpNode::RecursiveInput { .. })
+                    || body_node.inputs().iter().any(|&input| reads_cte[input]);
                 match body_node {
                     dag::OpNode::Join {
+                        inputs: [_, right],
                         kind: dag::JoinKind::Semi | dag::JoinKind::Anti,
                         ..
-                    }
-                    | dag::OpNode::Pad { .. } => {
-                        return unsupported("outer joins or subqueries in a recursive CTE")
+                    } if reads_cte[*right] => {
+                        return unsupported(
+                            "recursive CTEs on the NULL side of a LEFT JOIN or inside EXISTS or NOT EXISTS",
+                        )
                     }
                     dag::OpNode::Aggregate { .. } => {
                         return unsupported("aggregates or DISTINCT in a recursive CTE")
@@ -2359,7 +2370,9 @@ fn state_table_sql(
 
 /// The rows of a recursive CTE: `(key.., values.., round)`. The key is a
 /// tag (0 for seed rows, 1 for recursive rows) and the identity of the
-/// row's derivation, padded with zeros; it is the primary key.
+/// row's derivation, padded with zeros. The primary key is the key and the
+/// round, because an operator rowid freed in one round can name another row
+/// in a different round of the same statement.
 fn fixpoint_table_sql(table_name: &str, key_width: usize, value_width: usize) -> String {
     let table_ident = crate::util::quote_identifier(table_name);
     let key = (0..key_width).map(|i| format!("k{i}")).collect::<Vec<_>>();
@@ -2370,7 +2383,7 @@ fn fixpoint_table_sql(table_name: &str, key_width: usize, value_width: usize) ->
         .chain(std::iter::once("round".to_string()))
         .collect::<Vec<_>>();
     format!(
-        "CREATE TABLE {table_ident} ({}, PRIMARY KEY ({}))",
+        "CREATE TABLE {table_ident} ({}, PRIMARY KEY ({}, round))",
         columns.join(", "),
         key.join(", ")
     )
