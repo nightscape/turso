@@ -348,6 +348,7 @@ pub fn translate_refresh_materialized_view(
     });
 
     emit_clear_view_rows(program, view_cursor_id, &normalized_view_name);
+    emit_clear_view_indexes(program, resolver, namespace, &normalized_view_name);
     emit_clear_view_hidden_tables(program, resolver, namespace, &normalized_view_name);
 
     program.emit_insn(Insn::PopulateMaterializedViews {
@@ -356,6 +357,29 @@ pub fn translate_refresh_materialized_view(
 
     program.epilogue(resolver.schema());
     Ok(())
+}
+
+/// The row delete loop does not maintain the view's indexes, and the
+/// repopulation adds an entry for every row, so the indexes start empty.
+fn emit_clear_view_indexes(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    normalized_view_name: &str,
+) {
+    let database_id = namespace.database_id;
+    let roots: Vec<i64> = resolver.with_schema(database_id, |s| {
+        s.get_indices(namespace.id, normalized_view_name)
+            .map(|index| index.root_page)
+            .collect()
+    });
+    for root in roots {
+        program.emit_insn(Insn::ClearBtree {
+            db: database_id,
+            root,
+            count: ClearBtreeCount::Nothing,
+        });
+    }
 }
 
 fn emit_clear_view_hidden_tables(
