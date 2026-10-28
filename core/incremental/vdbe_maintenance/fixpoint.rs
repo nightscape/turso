@@ -1135,12 +1135,9 @@ mod tests {
         );
     }
 
-    /// Phase 2 measures this: the recursive arm joins each round's rows with
-    /// a full scan of `block`.
-    #[test]
-    #[ignore = "timing of a 10 000-block view creation"]
-    fn create_a_path_view_over_ten_thousand_blocks() {
-        let conn = open("fixpoint-ten-thousand-blocks.db");
+    /// Ten roots, and below them every block `x > 10` has parent `x / 10`.
+    fn open_ten_thousand_blocks(name: &str) -> Arc<Connection> {
+        let conn = open(name);
         conn.execute("CREATE TABLE block(id INTEGER PRIMARY KEY, parent_id INTEGER, content TEXT)")
             .unwrap();
         conn.execute(
@@ -1148,6 +1145,10 @@ mod tests {
              INSERT INTO block SELECT x, CASE WHEN x <= 10 THEN NULL ELSE x / 10 END, 'b' || x FROM c",
         )
         .unwrap();
+        conn
+    }
+
+    fn create_path_view(conn: &Arc<Connection>) -> std::time::Duration {
         let started = std::time::Instant::now();
         conn.execute(
             "CREATE MATERIALIZED VIEW block_with_path AS \
@@ -1159,11 +1160,47 @@ mod tests {
              SELECT * FROM paths",
         )
         .unwrap();
-        let elapsed = started.elapsed();
+        started.elapsed()
+    }
+
+    #[test]
+    #[ignore = "timing of a 10 000-block view creation"]
+    fn create_a_path_view_over_ten_thousand_blocks() {
+        let conn = open_ten_thousand_blocks("fixpoint-ten-thousand-blocks.db");
+        let elapsed = create_path_view(&conn);
+        eprintln!("CREATE of block_with_path over 10 000 blocks took {elapsed:?}");
         assert_eq!(
             rows(&conn, "SELECT count(*) FROM block_with_path"),
             vec![vec!["10000".to_string()]]
         );
-        eprintln!("CREATE of block_with_path over 10 000 blocks took {elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_secs(300));
+    }
+
+    #[test]
+    #[ignore = "timing of one write to a 10 000-block view"]
+    fn move_a_thousand_block_subtree_in_a_path_view_over_ten_thousand_blocks() {
+        let conn = open_ten_thousand_blocks("fixpoint-move-ten-thousand-blocks.db");
+        create_path_view(&conn);
+        let started = std::time::Instant::now();
+        conn.execute("UPDATE block SET parent_id = 2 WHERE id = 1")
+            .unwrap();
+        let elapsed = started.elapsed();
+        eprintln!("moving a 1000-block subtree in block_with_path took {elapsed:?}");
+        assert_eq!(
+            rows(
+                &conn,
+                "SELECT count(*), sum(path LIKE '/2/1%'), sum(length(path)) FROM block_with_path"
+            ),
+            vec![vec![
+                "10000".to_string(),
+                "1000".to_string(),
+                "136364".to_string()
+            ]]
+        );
+        assert_eq!(
+            rows(&conn, "SELECT path FROM block_with_path WHERE id = 1999"),
+            vec![vec!["/2/1/19/199/1999".to_string()]]
+        );
+        assert!(elapsed < std::time::Duration::from_secs(60));
     }
 }
