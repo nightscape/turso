@@ -176,10 +176,104 @@ fn validate_supported_aggregate(agg: &Aggregate, resolver: &Resolver) -> Result<
 /// Lower the main query planner's bound relational plan into the maintenance
 /// DAG. Parser spelling (aliases, stars, USING expansion, ordinal GROUP BY,
 /// and compound arity) has already been resolved by this point.
-fn build_dag_from_plan(plan: &Plan, resolver: &Resolver) -> Result<dag::MaintenanceDag> {
+fn build_dag_from_plan(
+    plan: &Plan,
+    window: Option<Window>,
+    resolver: &Resolver,
+) -> Result<dag::MaintenanceDag> {
     let mut builder = dag::DagBuilder::new();
-    let root = build_plan_dag_node(&mut builder, plan, resolver)?;
+    let mut root = build_plan_dag_node(&mut builder, plan, resolver)?;
+    if let Some(window) = window {
+        root = builder.push(dag::OpNode::TopK {
+            input: root,
+            sort_keys: window.sort_keys,
+            limit: window.limit,
+            offset: window.offset,
+        })?;
+    }
     builder.finish(root)
+}
+
+/// The ORDER BY, LIMIT and OFFSET of a view's top SELECT, as a
+/// [`dag::OpNode::TopK`] needs them.
+struct Window {
+    sort_keys: Vec<dag::SortKey>,
+    limit: Option<i64>,
+    offset: i64,
+}
+
+/// Remove ORDER BY, LIMIT and OFFSET from the view's top SELECT and return
+/// the window they select, or `None` when they keep every row. A view holds
+/// its rows in rowid order, so ORDER BY alone changes nothing.
+fn take_window(plan: &mut SelectPlan, resolver: &Resolver) -> Result<Option<Window>> {
+    let order_by = std::mem::take(&mut plan.order_by);
+    // A negative LIMIT is no limit and a negative OFFSET is no offset.
+    let limit = plan
+        .limit
+        .take()
+        .map(|limit| constant_integer(&limit))
+        .transpose()?
+        .filter(|limit| *limit >= 0);
+    let offset = plan
+        .offset
+        .take()
+        .map(|offset| constant_integer(&offset))
+        .transpose()?
+        .map_or(0, |offset| offset.max(0));
+    if limit.is_none() && offset == 0 {
+        return Ok(None);
+    }
+    // The planner drops the ORDER BY of an aggregate without GROUP BY: its
+    // one row needs no order.
+    let one_row = !plan.aggregates.is_empty()
+        && plan
+            .group_by
+            .as_ref()
+            .is_none_or(|group_by| group_by.exprs.is_empty());
+    if order_by.is_empty() && !one_row {
+        return unsupported("LIMIT or OFFSET without ORDER BY");
+    }
+    let mut sort_keys = Vec::with_capacity(order_by.len());
+    for (expr, order, nulls) in &order_by {
+        let default_nulls = match order {
+            ast::SortOrder::Asc => ast::NullsOrder::First,
+            ast::SortOrder::Desc => ast::NullsOrder::Last,
+        };
+        if nulls.is_some_and(|nulls| nulls != default_nulls) {
+            return unsupported("NULLS FIRST or NULLS LAST against the default order");
+        }
+        let result_column = |term: &ast::Expr| {
+            plan.result_columns
+                .iter()
+                .position(|column| crate::util::exprs_are_equivalent(&column.expr, term))
+        };
+        let column = result_column(expr).or_else(|| match expr.as_ref() {
+            ast::Expr::Collate(term, _) => result_column(term),
+            _ => None,
+        });
+        let Some(column) = column else {
+            return unsupported("ORDER BY terms that are not result columns");
+        };
+        let collation = plan_expr_collation(expr, &plan.table_references, resolver)?
+            .unwrap_or(CollationSeq::Binary);
+        sort_keys.push(dag::SortKey {
+            column,
+            order: *order,
+            collation,
+        });
+    }
+    Ok(Some(Window {
+        sort_keys,
+        limit,
+        offset,
+    }))
+}
+
+fn constant_integer(expr: &ast::Expr) -> Result<i64> {
+    match crate::util::parse_signed_number(expr) {
+        Ok(crate::Value::Numeric(crate::numeric::Numeric::Integer(value))) => Ok(value),
+        _ => unsupported("LIMIT or OFFSET values other than integer constants"),
+    }
 }
 
 fn build_plan_dag_node(
@@ -378,9 +472,6 @@ fn build_joined_rows_dag(
     where_clause: &[WhereTerm],
     resolver: &Resolver,
 ) -> Result<dag::NodeId> {
-    if !plan.order_by.is_empty() {
-        return unsupported("ORDER BY");
-    }
     if !plan.values.is_empty() {
         return unsupported("VALUES");
     }
@@ -1058,9 +1149,9 @@ impl MaintenancePlan {
             let width = dag.output_schema(node_id).len();
             let columns = match node {
                 dag::OpNode::Scan { .. } => vec![None; width],
-                dag::OpNode::Filter { input, .. } | dag::OpNode::Alias { input, .. } => {
-                    chosen[*input].clone()
-                }
+                dag::OpNode::Filter { input, .. }
+                | dag::OpNode::Alias { input, .. }
+                | dag::OpNode::TopK { input, .. } => chosen[*input].clone(),
                 dag::OpNode::Project { input, projections } => projections
                     .iter()
                     .map(|projection| passed_on(&chosen, *input, projection))
@@ -1243,11 +1334,17 @@ pub(crate) fn plan_view(
         connection,
     )?;
     unnest_correlated_subqueries(&mut relational_plan, resolver)?;
+    // Before optimization: the optimizer drops an ORDER BY that an index or
+    // the GROUP BY already satisfies.
+    let window = match &mut relational_plan {
+        Plan::Select(select) => take_window(select, resolver)?,
+        _ => None,
+    };
     // Lower the same optimized plan regular execution runs. Maintenance does
     // not depend on its access paths: no operator state depends on the order
     // in which a query would meet the rows.
     optimize_plan(&mut planner_program, &mut relational_plan, resolver)?;
-    let dag = build_dag_from_plan(&relational_plan, resolver)?;
+    let dag = build_dag_from_plan(&relational_plan, window, resolver)?;
     let operator_states = plan_operator_states(view_name, &dag, resolver)?;
     let output_arity = dag.root_schema().len();
     let version_marker = version_marker_table(view_name);
@@ -1455,6 +1552,25 @@ fn validate_planned_node(
                 ));
             }
         }
+        dag::OpNode::TopK {
+            input,
+            sort_keys,
+            limit,
+            offset,
+        } => {
+            let width = dag.output_schema(*input).len();
+            if sort_keys.iter().any(|key| key.column >= width)
+                || limit.is_some_and(|limit| limit < 0)
+                || *offset < 0
+            {
+                return Err(LimboError::InternalError(
+                    "top-k DAG node has an invalid window".to_string(),
+                ));
+            }
+            if sort_keys.iter().any(|key| key.collation.is_custom()) {
+                return unsupported("custom collations on ORDER BY keys");
+            }
+        }
         dag::OpNode::Aggregate {
             input,
             group_exprs,
@@ -1638,6 +1754,16 @@ fn plan_node_output(
         }
         // These operators may retain source expressions as output values, but
         // they do not preserve a one-to-one source-row namespace.
+        // The window keeps its input's rows and identities. Rowids that are
+        // not the identity are not needed: the window is the root.
+        dag::OpNode::TopK { input, .. } => {
+            let upstream = prior_output(*input)?;
+            let rowids = match upstream.published_identity {
+                DeltaIdentity::BindingRowids(_) => upstream.binding_rowids.clone(),
+                _ => vec![false; upstream.binding_rowids.len()].into(),
+            };
+            (upstream.published_identity, rowids)
+        }
         dag::OpNode::Aggregate { input, .. } => (
             DeltaIdentity::OperatorRowid,
             vec![false; prior_output(*input)?.binding_rowids.len()].into(),
@@ -1776,7 +1902,12 @@ fn plan_operator_states(
                 crate::schema::DBSP_TABLE_PREFIX,
             );
             Some(HiddenTableDef {
-                create_sql: state_table_sql(&table_name, node)?,
+                create_sql: state_table_sql(
+                    &table_name,
+                    node,
+                    output.emitted_identity.width(),
+                    dag.output_schema(node_id).len(),
+                )?,
                 table_name,
                 primary_key_index: true,
             })
@@ -1985,7 +2116,7 @@ fn arrangement_table_sql(
 
 fn node_requires_primary_state(dag: &dag::MaintenanceDag, node_id: dag::NodeId) -> bool {
     match &dag.nodes[node_id] {
-        dag::OpNode::Aggregate { .. } => true,
+        dag::OpNode::Aggregate { .. } | dag::OpNode::TopK { .. } => true,
         dag::OpNode::SetOp { prefix_len, .. } => *prefix_len > 0,
         _ => false,
     }
@@ -2007,8 +2138,18 @@ fn node_requires_primary_state(dag: &dag::MaintenanceDag, node_id: dag::NodeId) 
 ///
 /// In each case the state row's rowid is the operator output identity.
 ///
+/// For a window: every input row with its multiplicity, a member table (see
+/// `members::MemberTable`) whose key orders rows as the window takes them:
+/// `(s.., i.., exact, c.., mult)`, the sort keys, the row identity, the
+/// record of the values, and the values.
+///
 /// Declared column types are empty so nothing coerces the stored values.
-fn state_table_sql(state_table_name: &str, node: &dag::OpNode) -> Result<String> {
+fn state_table_sql(
+    state_table_name: &str,
+    node: &dag::OpNode,
+    identity_width: usize,
+    output_width: usize,
+) -> Result<String> {
     let state_table_ident = crate::util::quote_identifier(state_table_name);
     match node {
         dag::OpNode::Aggregate {
@@ -2061,6 +2202,30 @@ fn state_table_sql(state_table_name: &str, node: &dag::OpNode) -> Result<String>
                 columns.push(format!("cnt{i}"));
             }
             let key: Vec<String> = (0..*arity).map(|i| format!("c{i}")).collect();
+            Ok(format!(
+                "CREATE TABLE {state_table_ident} ({}, PRIMARY KEY ({}))",
+                columns.join(", "),
+                key.join(", ")
+            ))
+        }
+        dag::OpNode::TopK { sort_keys, .. } => {
+            let mut columns = Vec::new();
+            let mut key = Vec::new();
+            for (i, sort_key) in sort_keys.iter().enumerate() {
+                columns.push(format!("s{i}{}", collate_clause(sort_key.collation)));
+                key.push(match sort_key.order {
+                    ast::SortOrder::Asc => format!("s{i}"),
+                    ast::SortOrder::Desc => format!("s{i} DESC"),
+                });
+            }
+            let rest = (0..identity_width)
+                .map(|i| format!("i{i}"))
+                .chain(std::iter::once("exact".to_string()))
+                .chain((0..output_width).map(|i| format!("c{i}")))
+                .collect::<Vec<_>>();
+            columns.extend(rest.iter().cloned());
+            key.extend(rest);
+            columns.push("mult".to_string());
             Ok(format!(
                 "CREATE TABLE {state_table_ident} ({}, PRIMARY KEY ({}))",
                 columns.join(", "),

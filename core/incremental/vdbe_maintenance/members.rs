@@ -119,6 +119,10 @@ impl MemberTable {
             default: None,
         });
     }
+
+    pub(super) fn table_cursor_id(&self) -> usize {
+        self.table_cursor_id
+    }
 }
 
 /// Write the record of the `width` values at `start` into `dest`. Records

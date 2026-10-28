@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use turso_parser::ast;
+use turso_parser::ast::{self, SortOrder};
 
 use crate::schema::BTreeTable;
 use crate::translate::collate::CollationSeq;
@@ -75,6 +75,15 @@ pub struct KeyColumn {
     /// every exact value of the class with its count, and shows the smallest
     /// one (see `vdbe_maintenance::members`).
     pub ambiguous: bool,
+}
+
+/// One ORDER BY term of a [`OpNode::TopK`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SortKey {
+    /// The input column the term sorts by.
+    pub column: usize,
+    pub order: SortOrder,
+    pub collation: CollationSeq,
 }
 
 /// Join semantics supported by one maintenance node.
@@ -242,6 +251,20 @@ pub enum OpNode {
         /// One entry per content-key column (empty when `prefix_len == 0`).
         key_columns: Vec<KeyColumn>,
     },
+
+    /// The rows of its input that come first in `sort_keys` order: skip
+    /// `offset` rows, then keep `limit` rows (all of them when `None`). The
+    /// row identity orders rows that tie on every key. Keeps every input
+    /// row in its state table, so a row that leaves the window is replaced
+    /// by the next one. Output schema: its input's.
+    TopK {
+        input: NodeId,
+        sort_keys: Vec<SortKey>,
+        /// Never negative.
+        limit: Option<i64>,
+        /// Never negative.
+        offset: i64,
+    },
 }
 
 impl OpNode {
@@ -253,7 +276,8 @@ impl OpNode {
             | OpNode::Project { input, .. }
             | OpNode::Alias { input, .. }
             | OpNode::Pad { input, .. }
-            | OpNode::Aggregate { input, .. } => std::slice::from_ref(input),
+            | OpNode::Aggregate { input, .. }
+            | OpNode::TopK { input, .. } => std::slice::from_ref(input),
             OpNode::Join { inputs, .. } => inputs,
             OpNode::SetOp { inputs, .. } => inputs,
         }
@@ -362,7 +386,7 @@ impl DagBuilder {
                     logical_id: *logical_id,
                 }],
             ),
-            OpNode::Filter { input, .. } => (
+            OpNode::Filter { input, .. } | OpNode::TopK { input, .. } => (
                 self.output_schemas[*input].columns.clone(),
                 self.output_schemas[*input].bindings.clone(),
             ),
