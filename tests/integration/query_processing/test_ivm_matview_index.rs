@@ -586,3 +586,113 @@ fn a_trigger_sees_the_running_statement_through_the_index(
     );
     Ok(())
 }
+
+fn assert_integrity_ok(conn: &Arc<turso_core::Connection>, after: &str) {
+    assert_eq!(
+        limbo_exec_rows(conn, "PRAGMA integrity_check"),
+        vec![vec![Value::Text("ok".into())]],
+        "after {after}"
+    );
+}
+
+/// REFRESH rewrites the view's rows, so it must rewrite their index entries.
+#[turso_macros::test(views)]
+fn refresh_rebuilds_the_index_with_the_view(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    setup(&conn)?;
+    conn.execute("CREATE TABLE g (k TEXT, n INTEGER)")?;
+    conn.execute("INSERT INTO g VALUES ('a', 1), ('a', 2), ('b', 3)")?;
+    conn.execute("CREATE MATERIALIZED VIEW s AS SELECT k, sum(n) AS total FROM g GROUP BY k")?;
+    conn.execute("CREATE INDEX idx_s_total ON s(total)")?;
+
+    for step in [
+        "REFRESH MATERIALIZED VIEW v",
+        "UPDATE t_raw SET st = 'X' WHERE id = 'b1'",
+        "REFRESH MATERIALIZED VIEW v",
+        "REFRESH MATERIALIZED VIEW s",
+        "INSERT INTO g VALUES ('c', 4)",
+        "REFRESH MATERIALIZED VIEW s",
+    ] {
+        conn.execute(step)?;
+        assert_integrity_ok(&conn, step);
+        assert_index_matches_scan(
+            &conn,
+            step,
+            "SELECT id, st FROM v WHERE id >= 'b2'",
+            "SELECT id, st FROM v NOT INDEXED WHERE id >= 'b2'",
+        );
+        assert_index_matches_scan(
+            &conn,
+            step,
+            "SELECT k, total FROM s WHERE total > 2 ORDER BY total",
+            "SELECT k, total FROM s NOT INDEXED WHERE total > 2 ORDER BY total",
+        );
+    }
+    Ok(())
+}
+
+/// A window view and a recursive view write their rows through the same
+/// sink as any view, so their indexes follow every move in and out.
+#[turso_macros::test(views)]
+fn an_index_on_a_top_k_view_follows_the_window(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, score INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)")?;
+    conn.execute(
+        "CREATE MATERIALIZED VIEW top AS SELECT id, score FROM t ORDER BY score DESC LIMIT 3",
+    )?;
+    conn.execute("CREATE INDEX idx_top_score ON top(score)")?;
+
+    for step in [
+        "INSERT INTO t VALUES (6, 45)",
+        "DELETE FROM t WHERE id = 5",
+        "UPDATE t SET score = 5 WHERE id = 4",
+        "UPDATE t SET score = 100 WHERE id = 1",
+        "UPDATE t SET score = score + 1",
+        "REFRESH MATERIALIZED VIEW top",
+    ] {
+        conn.execute(step)?;
+        assert_integrity_ok(&conn, step);
+        assert_index_matches_scan(
+            &conn,
+            step,
+            "SELECT id, score FROM top WHERE score > 0 ORDER BY score",
+            "SELECT id, score FROM top NOT INDEXED WHERE score > 0 ORDER BY score",
+        );
+    }
+    Ok(())
+}
+
+#[turso_macros::test(views)]
+fn an_index_on_a_recursive_view_follows_the_tree(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE node (id TEXT PRIMARY KEY, pid TEXT)")?;
+    conn.execute("INSERT INTO node VALUES ('a', 'root'), ('b', 'a'), ('c', 'b'), ('d', 'a')")?;
+    conn.execute(
+        "CREATE MATERIALIZED VIEW tree AS \
+         WITH RECURSIVE r AS ( \
+           SELECT id, 0 AS depth FROM node WHERE pid = 'root' \
+           UNION ALL \
+           SELECT n.id, r.depth + 1 FROM node n JOIN r ON n.pid = r.id \
+         ) SELECT id, depth FROM r",
+    )?;
+    conn.execute("CREATE INDEX idx_tree_depth ON tree(depth)")?;
+
+    for step in [
+        "INSERT INTO node VALUES ('e', 'c')",
+        "UPDATE node SET pid = 'd' WHERE id = 'b'",
+        "DELETE FROM node WHERE id = 'd'",
+        "UPDATE node SET pid = 'a' WHERE id = 'b'",
+        "REFRESH MATERIALIZED VIEW tree",
+    ] {
+        conn.execute(step)?;
+        assert_integrity_ok(&conn, step);
+        assert_index_matches_scan(
+            &conn,
+            step,
+            "SELECT id, depth FROM tree WHERE depth >= 1 ORDER BY depth, id",
+            "SELECT id, depth FROM tree NOT INDEXED WHERE depth >= 1 ORDER BY depth, id",
+        );
+    }
+    Ok(())
+}

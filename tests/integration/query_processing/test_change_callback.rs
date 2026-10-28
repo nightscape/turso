@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use turso_core::types::DatabaseChangeType;
@@ -473,4 +474,192 @@ fn switching_to_mvcc_while_a_change_callback_is_registered_is_refused() {
         error.to_string().contains("change callbacks"),
         "got {error}"
     );
+}
+
+/// Applies every committed event of `view` to a copy of the view, keyed by
+/// rowid, so a test can compare the copy with the view.
+fn replay_view_changes(
+    conn: &Arc<turso_core::Connection>,
+    view: &'static str,
+) -> Arc<Mutex<BTreeMap<i64, String>>> {
+    let image = Arc::new(Mutex::new(view_rows_by_rowid(conn, view)));
+    let sink = image.clone();
+    conn.set_change_callback(move |event| {
+        if event.relation_name != view {
+            return;
+        }
+        let mut image = sink.lock().unwrap();
+        for change in &event.changes {
+            let row = format!("{:?}", change.parse_record().unwrap());
+            match change.change {
+                DatabaseChangeType::Insert { .. } => assert!(
+                    image.insert(change.id, row).is_none(),
+                    "insert of rowid {} that {view} already holds",
+                    change.id
+                ),
+                DatabaseChangeType::Delete { .. } => assert_eq!(
+                    image.remove(&change.id),
+                    Some(row),
+                    "delete of a row {view} does not hold"
+                ),
+                DatabaseChangeType::Update { .. } => {
+                    panic!("a view change is a delete or an insert")
+                }
+            }
+        }
+    })
+    .unwrap();
+    image
+}
+
+fn view_rows_by_rowid(conn: &Arc<turso_core::Connection>, view: &str) -> BTreeMap<i64, String> {
+    let mut stmt = conn
+        .prepare(format!("SELECT rowid, * FROM {view}"))
+        .unwrap();
+    let mut rows = BTreeMap::new();
+    stmt.run_with_row_callback(|row| {
+        let values: Vec<turso_core::Value> = row.get_values().cloned().collect();
+        let turso_core::Value::Numeric(turso_core::Numeric::Integer(rowid)) = values[0] else {
+            panic!("a view rowid is an integer, got {:?}", values[0]);
+        };
+        rows.insert(rowid, format!("{:?}", &values[1..]));
+        Ok(())
+    })
+    .unwrap();
+    rows
+}
+
+/// Runs each step, then checks that the events replayed so far rebuild the
+/// view. A step is one or more statements; a transaction is one step.
+fn assert_events_replay_the_view(
+    conn: &Arc<turso_core::Connection>,
+    view: &'static str,
+    steps: &[&[&str]],
+) -> anyhow::Result<()> {
+    let image = replay_view_changes(conn, view);
+    for step in steps {
+        for sql in *step {
+            conn.execute(sql)?;
+        }
+        assert_eq!(
+            *image.lock().unwrap(),
+            view_rows_by_rowid(conn, view),
+            "replayed events of {view} disagree with the view after {step:?}"
+        );
+    }
+    Ok(())
+}
+
+#[turso_macros::test(views)]
+fn a_row_that_stays_in_a_top_k_window_reports_nothing(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, score INTEGER, note TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd')")?;
+    conn.execute("CREATE MATERIALIZED VIEW top AS SELECT id, score FROM t ORDER BY score LIMIT 2")?;
+    let seen = record_changes(&conn, "top");
+
+    conn.execute("UPDATE t SET note = 'x' WHERE id = 1")?;
+    conn.execute("UPDATE t SET score = 15 WHERE id = 1")?;
+    conn.execute("UPDATE t SET score = 10 WHERE id = 1")?;
+    conn.execute("INSERT INTO t VALUES (5, 50, 'e')")?;
+    conn.execute("UPDATE t SET score = 35 WHERE id = 4")?;
+    conn.execute("DELETE FROM t WHERE id = 3")?;
+    conn.execute("BEGIN")?;
+    conn.execute("UPDATE t SET score = 5 WHERE id = 2")?;
+    conn.execute("UPDATE t SET score = 20 WHERE id = 2")?;
+    conn.execute("COMMIT")?;
+
+    assert_eq!(
+        kinds(&seen),
+        ["delete", "insert", "delete", "insert"],
+        "only the two score changes of row 1 are visible: {:?}",
+        seen.lock().unwrap()
+    );
+    Ok(())
+}
+
+#[turso_macros::test(views)]
+fn top_k_view_events_replay_the_view(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, score INTEGER)")?;
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 20)")?;
+    conn.execute(
+        "CREATE MATERIALIZED VIEW top AS SELECT id, score FROM t ORDER BY score DESC LIMIT 3 OFFSET 1",
+    )?;
+    assert_events_replay_the_view(
+        &conn,
+        "top",
+        &[
+            &["INSERT INTO t VALUES (6, 50)"],
+            &["UPDATE t SET score = 25 WHERE id = 1"],
+            &["DELETE FROM t WHERE id = 4"],
+            &["UPDATE t SET score = score + 1"],
+            &[
+                "BEGIN",
+                "INSERT INTO t VALUES (7, 100)",
+                "DELETE FROM t WHERE id = 7",
+                "UPDATE t SET score = 0 WHERE id = 6",
+                "COMMIT",
+            ],
+        ],
+    )
+}
+
+#[turso_macros::test(views)]
+fn json_group_array_view_events_replay_the_view(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, g TEXT, v TEXT)")?;
+    conn.execute("INSERT INTO t VALUES (1, 'a', 'x'), (2, 'a', 'y'), (3, 'b', 'z')")?;
+    conn.execute(
+        "CREATE MATERIALIZED VIEW mv AS \
+         SELECT g, json_group_array(v) AS vs, group_concat(v) AS c FROM t GROUP BY g",
+    )?;
+    assert_events_replay_the_view(
+        &conn,
+        "mv",
+        &[
+            &["INSERT INTO t VALUES (4, 'a', 'w')"],
+            &["UPDATE t SET v = 'q' WHERE id = 2"],
+            &["UPDATE t SET g = 'b' WHERE id = 1"],
+            &["DELETE FROM t WHERE g = 'b'"],
+            &[
+                "BEGIN",
+                "INSERT INTO t VALUES (5, 'c', 'k')",
+                "UPDATE t SET v = 'm' WHERE id = 5",
+                "COMMIT",
+            ],
+            &["BEGIN", "INSERT INTO t VALUES (6, 'c', 'n')", "ROLLBACK"],
+        ],
+    )
+}
+
+#[turso_macros::test(views)]
+fn recursive_view_events_replay_the_view(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE node (id TEXT PRIMARY KEY, pid TEXT)")?;
+    conn.execute("INSERT INTO node VALUES ('a', 'root'), ('b', 'a'), ('c', 'b'), ('d', 'a')")?;
+    conn.execute(
+        "CREATE MATERIALIZED VIEW tree AS \
+         WITH RECURSIVE r AS ( \
+           SELECT id, 0 AS depth FROM node WHERE pid = 'root' \
+           UNION ALL \
+           SELECT n.id, r.depth + 1 FROM node n JOIN r ON n.pid = r.id \
+         ) SELECT id, depth FROM r",
+    )?;
+    assert_events_replay_the_view(
+        &conn,
+        "tree",
+        &[
+            &["INSERT INTO node VALUES ('e', 'c')"],
+            &["UPDATE node SET pid = 'd' WHERE id = 'b'"],
+            &["DELETE FROM node WHERE id = 'd'"],
+            &["UPDATE node SET pid = 'a' WHERE id = 'b'"],
+            &[
+                "BEGIN",
+                "INSERT INTO node VALUES ('f', 'e')",
+                "UPDATE node SET pid = 'root' WHERE id = 'c'",
+                "COMMIT",
+            ],
+        ],
+    )
 }
