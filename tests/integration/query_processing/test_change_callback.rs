@@ -601,6 +601,14 @@ fn top_k_view_events_replay_the_view(tmp_db: TempDatabase) -> anyhow::Result<()>
                 "UPDATE t SET score = 0 WHERE id = 6",
                 "COMMIT",
             ],
+            &["REFRESH MATERIALIZED VIEW top"],
+            &[
+                "BEGIN",
+                "INSERT INTO t VALUES (8, 90)",
+                "REFRESH MATERIALIZED VIEW top",
+                "COMMIT",
+            ],
+            &["BEGIN", "REFRESH MATERIALIZED VIEW top", "ROLLBACK"],
         ],
     )
 }
@@ -629,6 +637,14 @@ fn json_group_array_view_events_replay_the_view(tmp_db: TempDatabase) -> anyhow:
                 "COMMIT",
             ],
             &["BEGIN", "INSERT INTO t VALUES (6, 'c', 'n')", "ROLLBACK"],
+            &["REFRESH MATERIALIZED VIEW mv"],
+            &[
+                "BEGIN",
+                "INSERT INTO t VALUES (7, 'd', 'o')",
+                "REFRESH MATERIALIZED VIEW mv",
+                "COMMIT",
+            ],
+            &["BEGIN", "REFRESH MATERIALIZED VIEW mv", "ROLLBACK"],
         ],
     )
 }
@@ -660,6 +676,14 @@ fn recursive_view_events_replay_the_view(tmp_db: TempDatabase) -> anyhow::Result
                 "UPDATE node SET pid = 'root' WHERE id = 'c'",
                 "COMMIT",
             ],
+            &["REFRESH MATERIALIZED VIEW tree"],
+            &[
+                "BEGIN",
+                "INSERT INTO node VALUES ('g', 'f')",
+                "REFRESH MATERIALIZED VIEW tree",
+                "COMMIT",
+            ],
+            &["BEGIN", "REFRESH MATERIALIZED VIEW tree", "ROLLBACK"],
         ],
     )
 }
