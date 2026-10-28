@@ -37,7 +37,7 @@ When you modify data in a table that underlies a materialized view, Turso increm
 
 - Supported aggregate functions are `COUNT`, `SUM`, `TOTAL`, `AVG`, `MIN`, and `MAX`, including `DISTINCT` arguments and `FILTER (WHERE ...)`. Other aggregate functions are not yet supported.
 - `FULL OUTER JOIN`, window functions, and `ORDER BY`, `LIMIT`, or `OFFSET` in the defining query are not yet supported.
-- Scalar and correlated subqueries are not yet supported. FROM-clause derived tables and non-recursive CTEs are supported.
+- Scalar and correlated subqueries are not yet supported. FROM-clause derived tables and CTEs are supported. For recursive CTEs, see [Recursive CTEs](#recursive-ctes).
 - Virtual-table sources, virtual generated columns, non-deterministic expressions, bound parameters, and custom collations on grouping or deduplication keys are not yet supported.
 - Materialized views on attached databases and materialized views under experimental MVCC mode are not yet supported.
 - The `TEMPORARY` modifier is not supported for materialized views.
@@ -45,6 +45,33 @@ When you modify data in a table that underlies a materialized view, Turso increm
 A materialized view may reference another materialized view. Turso maintains
 the dependency chain in transaction order and prevents an upstream object from
 being dropped while a dependent materialized view exists.
+
+## Recursive CTEs
+
+A materialized view can use `WITH RECURSIVE` with `UNION ALL`. Turso maintains it incrementally, like any other materialized view.
+
+The recursive part of the CTE can join base tables with `JOIN` and `LEFT JOIN`, and can filter its base-table rows with `EXISTS` and `NOT EXISTS`. For `LEFT JOIN`, the recursive CTE must be on the left side. A subquery cannot read the recursive CTE or its columns.
+
+These recursive CTE forms are not yet supported:
+
+- `UNION` (without `ALL`) between the initial part and the recursive part.
+- `ORDER BY`, `LIMIT`, or `OFFSET` in the recursive CTE.
+- Aggregates, `DISTINCT`, `UNION`, `INTERSECT`, or `EXCEPT` in the recursive part.
+- A recursive CTE inside another recursive CTE.
+- The recursive CTE on the right side of a `LEFT JOIN`, or a subquery that reads the recursive CTE or its columns.
+
+If the recursion does not end after 10000 rounds, for example because the data contains a cycle that no condition stops, the statement fails with `materialized view <name>: recursive CTE did not converge after 10000 rounds`. This applies to `CREATE MATERIALIZED VIEW` and to writes to the tables that the view reads.
+
+```sql
+CREATE TABLE node (id INTEGER PRIMARY KEY, parent INTEGER);
+
+CREATE MATERIALIZED VIEW subtree AS
+  WITH RECURSIVE t(id, depth) AS (
+    SELECT id, 0 FROM node WHERE parent IS NULL
+    UNION ALL
+    SELECT n.id, t.depth + 1 FROM node n JOIN t ON n.parent = t.id
+  ) SELECT id, depth FROM t;
+```
 
 ## Examples
 
