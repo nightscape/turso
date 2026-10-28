@@ -95,6 +95,22 @@ pub(super) struct ArrangementHandle {
     value_columns: Arc<[usize]>,
     /// `None` when each physical row has multiplicity one.
     count_column: Option<usize>,
+    /// Set when joins may build an index on this btree and seek it instead of
+    /// scanning the btree.
+    probe_index: Option<ProbeIndex>,
+}
+
+/// An index on `(column, rowid)` of a btree that does not change while the
+/// maintenance program runs. A join that probes the btree more than a few
+/// times builds the index once and then seeks it.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ProbeIndex {
+    pub(super) column: usize,
+    pub(super) cursor_id: usize,
+    /// The number of probes so far; 0 before the first.
+    pub(super) probe_count_reg: usize,
+    /// 1 once the index is built, else 0.
+    pub(super) built_reg: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -127,6 +143,17 @@ impl ArrangementHandle {
     pub(super) fn count_column(&self) -> Option<usize> {
         self.count_column
     }
+
+    pub(super) fn probe_index(&self) -> Option<&ProbeIndex> {
+        self.probe_index.as_ref()
+    }
+
+    pub(super) fn with_probe_index(self, probe_index: ProbeIndex) -> Self {
+        Self {
+            probe_index: Some(probe_index),
+            ..self
+        }
+    }
 }
 
 pub(super) fn btree_arrangement(
@@ -148,6 +175,7 @@ pub(super) fn btree_arrangement(
         binding_rowid_columns: binding_rowid_columns.into(),
         value_columns: value_columns.into(),
         count_column,
+        probe_index: None,
     }
 }
 
