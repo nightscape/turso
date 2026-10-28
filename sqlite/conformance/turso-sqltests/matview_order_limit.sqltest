@@ -25,3 +25,320 @@ test matview-compound-offset-rejected {
 expect error {
     materialized views with LIMIT or OFFSET on a compound SELECT are not yet supported
 }
+
+# ORDER BY without LIMIT does not change which rows a view holds.
+test matview-order-by-without-limit {
+    CREATE TABLE ob(id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO ob VALUES (1, 30), (2, 10), (3, 20);
+    CREATE MATERIALIZED VIEW ob_v AS SELECT id, x FROM ob ORDER BY x DESC;
+    INSERT INTO ob VALUES (4, 5);
+    SELECT id, x FROM ob_v ORDER BY id;
+}
+expect {
+    1|30
+    2|10
+    3|20
+    4|5
+}
+
+# The window refills from the rows below it when a row inside it goes away,
+# and an UPDATE moves a row in and out of it.
+test matview-limit-window-maintenance {
+    CREATE TABLE lw(id INTEGER PRIMARY KEY, score INTEGER, name TEXT);
+    INSERT INTO lw VALUES (1, 50, 'a'), (2, 40, 'b'), (3, 30, 'c'), (4, 20, 'd'), (5, 10, 'e');
+    CREATE MATERIALIZED VIEW lw_top AS
+      SELECT id, score, name FROM lw ORDER BY score DESC LIMIT 3;
+    SELECT 'init', id FROM lw_top ORDER BY score DESC;
+    INSERT INTO lw VALUES (6, 45, 'f');
+    SELECT 'inside', id FROM lw_top ORDER BY score DESC;
+    INSERT INTO lw VALUES (7, 1, 'g');
+    SELECT 'outside', id FROM lw_top ORDER BY score DESC;
+    DELETE FROM lw WHERE id = 1;
+    SELECT 'refill', id FROM lw_top ORDER BY score DESC;
+    UPDATE lw SET score = 100 WHERE id = 5;
+    SELECT 'move-in', id FROM lw_top ORDER BY score DESC;
+    UPDATE lw SET score = 0 WHERE id = 5;
+    SELECT 'move-out', id FROM lw_top ORDER BY score DESC;
+    UPDATE lw SET name = 'renamed' WHERE id = 6;
+    SELECT 'value', id, name FROM lw_top ORDER BY score DESC;
+}
+expect {
+    init|1
+    init|2
+    init|3
+    inside|1
+    inside|6
+    inside|2
+    outside|1
+    outside|6
+    outside|2
+    refill|6
+    refill|2
+    refill|3
+    move-in|5
+    move-in|6
+    move-in|2
+    move-out|6
+    move-out|2
+    move-out|3
+    value|6|renamed
+    value|2|b
+    value|3|c
+}
+
+test matview-limit-offset-window {
+    CREATE TABLE lo(id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO lo VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6);
+    CREATE MATERIALIZED VIEW lo_v AS SELECT x FROM lo ORDER BY x LIMIT 2 OFFSET 2;
+    SELECT 'init', x FROM lo_v ORDER BY x;
+    DELETE FROM lo WHERE x = 1;
+    SELECT 'shift', x FROM lo_v ORDER BY x;
+    INSERT INTO lo VALUES (7, 0), (8, -1);
+    SELECT 'front', x FROM lo_v ORDER BY x;
+}
+expect {
+    init|3
+    init|4
+    shift|4
+    shift|5
+    front|2
+    front|3
+}
+
+# A negative LIMIT means no limit and a negative OFFSET means no offset, as in
+# SQLite.
+test matview-limit-special-values {
+    CREATE TABLE ls(id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO ls VALUES (1, 1), (2, 2), (3, 3);
+    CREATE MATERIALIZED VIEW ls_zero AS SELECT x FROM ls ORDER BY x LIMIT 0;
+    CREATE MATERIALIZED VIEW ls_all AS SELECT x FROM ls ORDER BY x LIMIT -1;
+    CREATE MATERIALIZED VIEW ls_big AS SELECT x FROM ls ORDER BY x LIMIT 100;
+    CREATE MATERIALIZED VIEW ls_neg_offset AS SELECT x FROM ls ORDER BY x LIMIT 2 OFFSET -3;
+    CREATE MATERIALIZED VIEW ls_only_offset AS SELECT x FROM ls ORDER BY x LIMIT -5 OFFSET 1;
+    CREATE MATERIALIZED VIEW ls_comma AS SELECT x FROM ls ORDER BY x LIMIT 1, 1;
+    INSERT INTO ls VALUES (4, 0);
+    SELECT 'zero', count(*) FROM ls_zero;
+    SELECT 'all', count(*) FROM ls_all;
+    SELECT 'big', count(*) FROM ls_big;
+    SELECT 'neg-offset', group_concat(x) FROM (SELECT x FROM ls_neg_offset ORDER BY x);
+    SELECT 'only-offset', group_concat(x) FROM (SELECT x FROM ls_only_offset ORDER BY x);
+    SELECT 'comma', x FROM ls_comma;
+}
+expect {
+    zero|0
+    all|4
+    big|4
+    neg-offset|0,1
+    only-offset|1,2,3
+    comma|1
+}
+
+# Ties on the sort columns are decided by the row identity, so the test keeps
+# ties away from the window boundary. NULL sorts first in ascending order.
+test matview-limit-multi-column-nulls {
+    CREATE TABLE mc(id INTEGER PRIMARY KEY, g TEXT, x INTEGER);
+    INSERT INTO mc VALUES (1, 'b', 2), (2, 'a', 9), (3, NULL, 5), (4, 'b', 1), (5, 'c', 0);
+    CREATE MATERIALIZED VIEW mc_v AS SELECT g, x FROM mc ORDER BY g, x DESC LIMIT 3;
+    SELECT 'init', g, x FROM mc_v ORDER BY g, x DESC;
+    UPDATE mc SET g = 'z' WHERE id = 3;
+    SELECT 'moved', g, x FROM mc_v ORDER BY g, x DESC;
+}
+expect {
+    init||5
+    init|a|9
+    init|b|2
+    moved|a|9
+    moved|b|2
+    moved|b|1
+}
+
+# The window after an aggregate: a group enters and leaves it when its
+# count changes.
+test matview-limit-after-group-by {
+    CREATE TABLE gb(id INTEGER PRIMARY KEY, k TEXT);
+    INSERT INTO gb VALUES (1, 'a'), (2, 'a'), (3, 'a'), (4, 'b'), (5, 'b'), (6, 'c');
+    CREATE MATERIALIZED VIEW gb_top AS
+      SELECT k, count(*) AS n FROM gb GROUP BY k ORDER BY n DESC LIMIT 2;
+    SELECT 'init', k, n FROM gb_top ORDER BY n DESC;
+    INSERT INTO gb VALUES (7, 'c'), (8, 'c'), (9, 'c');
+    SELECT 'enter', k, n FROM gb_top ORDER BY n DESC;
+    DELETE FROM gb WHERE k = 'a';
+    SELECT 'leave', k, n FROM gb_top ORDER BY n DESC;
+}
+expect {
+    init|a|3
+    init|b|2
+    enter|c|4
+    enter|a|3
+    leave|c|4
+    leave|b|2
+}
+
+test matview-limit-distinct-and-join {
+    CREATE TABLE dj_a(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE TABLE dj_b(id INTEGER PRIMARY KEY, a_id INTEGER, y INTEGER);
+    INSERT INTO dj_a VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO dj_b VALUES (1, 1, 7), (2, 2, 5), (3, 3, 6), (4, 1, 7);
+    CREATE MATERIALIZED VIEW dj_join AS
+      SELECT dj_b.id, dj_a.x, dj_b.y FROM dj_a JOIN dj_b ON dj_a.id = dj_b.a_id ORDER BY dj_b.y, dj_b.id LIMIT 2;
+    CREATE MATERIALIZED VIEW dj_distinct AS
+      SELECT DISTINCT y FROM dj_b ORDER BY y DESC LIMIT 2;
+    SELECT 'join', x, y FROM dj_join ORDER BY y;
+    SELECT 'distinct', y FROM dj_distinct ORDER BY y DESC;
+    DELETE FROM dj_b WHERE id = 2;
+    INSERT INTO dj_b VALUES (5, 3, 9);
+    SELECT 'join', x, y FROM dj_join ORDER BY y;
+    SELECT 'distinct', y FROM dj_distinct ORDER BY y DESC;
+}
+expect {
+    join|20|5
+    join|30|6
+    distinct|7
+    distinct|6
+    join|30|6
+    join|10|7
+    distinct|9
+    distinct|7
+}
+
+# An index that gives the order lets the query planner drop the sort; the
+# view must keep its window anyway.
+test matview-limit-order-from-index {
+    CREATE TABLE oi(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE INDEX oi_x ON oi(x);
+    INSERT INTO oi VALUES (1, 3), (2, 1), (3, 2);
+    CREATE MATERIALIZED VIEW oi_x_v AS SELECT x FROM oi ORDER BY x LIMIT 2;
+    CREATE MATERIALIZED VIEW oi_rowid_v AS SELECT id FROM oi ORDER BY id DESC LIMIT 1;
+    INSERT INTO oi VALUES (4, 0);
+    SELECT 'x', x FROM oi_x_v ORDER BY x;
+    SELECT 'rowid', id FROM oi_rowid_v;
+}
+expect {
+    x|0
+    x|1
+    rowid|4
+}
+
+# A view over a LIMIT view sees only the rows inside the window.
+test matview-limit-chained-view {
+    CREATE TABLE cv(id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO cv VALUES (1, 1), (2, 2), (3, 3), (4, 4);
+    CREATE MATERIALIZED VIEW cv_top AS SELECT x FROM cv ORDER BY x DESC LIMIT 2;
+    CREATE MATERIALIZED VIEW cv_sum AS SELECT count(*) AS n, sum(x) AS s FROM cv_top;
+    SELECT 'init', n, s FROM cv_sum;
+    INSERT INTO cv VALUES (5, 10);
+    SELECT 'insert', n, s FROM cv_sum;
+    DELETE FROM cv WHERE x >= 4;
+    SELECT 'delete', n, s FROM cv_sum;
+}
+expect {
+    init|2|7
+    insert|2|14
+    delete|2|5
+}
+
+test matview-limit-transaction-rollback {
+    CREATE TABLE tr(id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO tr VALUES (1, 1), (2, 2), (3, 3);
+    CREATE MATERIALIZED VIEW tr_v AS SELECT x FROM tr ORDER BY x LIMIT 2;
+    BEGIN;
+    INSERT INTO tr VALUES (4, 0);
+    SELECT 'in-txn', group_concat(x) FROM (SELECT x FROM tr_v ORDER BY x);
+    DELETE FROM tr WHERE x = 1;
+    SELECT 'in-txn', group_concat(x) FROM (SELECT x FROM tr_v ORDER BY x);
+    ROLLBACK;
+    SELECT 'after', group_concat(x) FROM (SELECT x FROM tr_v ORDER BY x);
+    DELETE FROM tr WHERE x = 1;
+    SELECT 'after', group_concat(x) FROM (SELECT x FROM tr_v ORDER BY x);
+}
+expect {
+    in-txn|0,1
+    in-txn|0,2
+    after|1,2
+    after|2,3
+}
+
+# An aggregate without GROUP BY has one row, so its order is defined
+# without ORDER BY, and the query planner drops any ORDER BY it has.
+test matview-limit-single-row-aggregate {
+    CREATE TABLE sr(id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO sr VALUES (1, 1), (2, 2);
+    CREATE MATERIALIZED VIEW sr_ordered AS SELECT count(*) AS n FROM sr ORDER BY n LIMIT 1;
+    CREATE MATERIALIZED VIEW sr_plain AS SELECT count(*) AS n FROM sr LIMIT 1;
+    CREATE MATERIALIZED VIEW sr_offset AS SELECT count(*) AS n FROM sr LIMIT 1 OFFSET 1;
+    INSERT INTO sr VALUES (3, 3);
+    SELECT 'ordered', n FROM sr_ordered;
+    SELECT 'plain', n FROM sr_plain;
+    SELECT 'offset', count(*) FROM sr_offset;
+}
+expect {
+    ordered|3
+    plain|3
+    offset|0
+}
+
+test matview-limit-order-by-collate {
+    CREATE TABLE oc(id INTEGER PRIMARY KEY, s TEXT);
+    INSERT INTO oc VALUES (1, 'b'), (2, 'A'), (3, 'c');
+    CREATE MATERIALIZED VIEW oc_v AS SELECT s FROM oc ORDER BY s COLLATE NOCASE DESC LIMIT 2;
+    SELECT 'init', s FROM oc_v ORDER BY s COLLATE NOCASE DESC;
+    INSERT INTO oc VALUES (4, 'D');
+    SELECT 'insert', s FROM oc_v ORDER BY s COLLATE NOCASE DESC;
+}
+expect {
+    init|c
+    init|b
+    insert|D
+    insert|c
+}
+
+test matview-limit-hex-constant {
+    CREATE TABLE hx(id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO hx VALUES (1, 1), (2, 2), (3, 3);
+    CREATE MATERIALIZED VIEW hx_v AS SELECT x FROM hx ORDER BY x LIMIT 0x2 OFFSET 0x1;
+    SELECT x FROM hx_v ORDER BY x;
+}
+expect {
+    2
+    3
+}
+
+test matview-limit-without-order-by-rejected {
+    CREATE TABLE rj(x INTEGER);
+    CREATE MATERIALIZED VIEW rj_v AS SELECT x FROM rj LIMIT 1;
+}
+expect error {
+    materialized views with LIMIT or OFFSET without ORDER BY are not yet supported
+}
+
+test matview-limit-order-by-non-result-column-rejected {
+    CREATE TABLE rn(x INTEGER, y INTEGER);
+    CREATE MATERIALIZED VIEW rn_v AS SELECT x FROM rn ORDER BY y LIMIT 1;
+}
+expect error {
+    materialized views with ORDER BY terms that are not result columns are not yet supported
+}
+
+test matview-limit-nulls-last-ascending-rejected {
+    CREATE TABLE rl(x INTEGER);
+    CREATE MATERIALIZED VIEW rl_v AS SELECT x FROM rl ORDER BY x NULLS LAST LIMIT 1;
+}
+expect error {
+    materialized views with NULLS FIRST or NULLS LAST against the default order are not yet supported
+}
+
+test matview-limit-expression-rejected {
+    CREATE TABLE re(x INTEGER);
+    CREATE MATERIALIZED VIEW re_v AS SELECT x FROM re ORDER BY x LIMIT 1 + 1;
+}
+expect error {
+    materialized views with LIMIT or OFFSET values other than integer constants are not yet supported
+}
+
+test matview-limit-in-subquery-rejected {
+    CREATE TABLE rs(x INTEGER);
+    CREATE MATERIALIZED VIEW rs_v AS SELECT x FROM (SELECT x FROM rs ORDER BY x LIMIT 1);
+}
+expect error {
+    materialized views with LIMIT or OFFSET are not yet supported
+}
