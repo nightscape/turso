@@ -1954,6 +1954,9 @@ pub enum Insn {
     PopulateMaterializedViews {
         /// Mapping of view name to cursor_id for writing to the view's btree
         cursors: Vec<(String, usize)>,
+        /// REFRESH reports the rows it writes to change callbacks; CREATE does
+        /// not, because a new view has no rows a consumer could know about.
+        report_row_changes: bool,
     },
 
     /// Place the result of lhs >> rhs in dest register.

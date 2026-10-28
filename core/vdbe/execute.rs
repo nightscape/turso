@@ -16185,7 +16185,13 @@ pub fn op_populate_materialized_views(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(PopulateMaterializedViews { cursors }, insn);
+    load_insn!(
+        PopulateMaterializedViews {
+            cursors,
+            report_row_changes
+        },
+        insn
+    );
 
     let conn = program.connection.clone();
 
@@ -16209,7 +16215,9 @@ pub fn op_populate_materialized_views(
         let view_idx = populate_state.view_idx;
 
         if view_idx >= cursors.len() {
-            conn.truncate_staged_row_changes(populate_state.staged_row_changes_mark);
+            if !*report_row_changes {
+                conn.truncate_staged_row_changes(populate_state.staged_row_changes_mark);
+            }
             state.populate_matviews_state = None;
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);

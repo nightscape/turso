@@ -282,6 +282,7 @@ pub fn translate_create_materialized_view(
     let cursor_info = vec![(normalized_view_name.clone(), view_cursor_id)];
     program.emit_insn(Insn::PopulateMaterializedViews {
         cursors: cursor_info,
+        report_row_changes: false,
     });
 
     program.epilogue(resolver.schema());
@@ -353,6 +354,7 @@ pub fn translate_refresh_materialized_view(
 
     program.emit_insn(Insn::PopulateMaterializedViews {
         cursors: vec![(normalized_view_name, view_cursor_id)],
+        report_row_changes: true,
     });
 
     program.epilogue(resolver.schema());
