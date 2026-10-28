@@ -1874,6 +1874,39 @@ fn test_matview_derived_union_aggregate_survives_reopen(
     Ok(())
 }
 
+/// A LIMIT window keeps every base row in its hidden state, so a delete
+/// inside the window after reopen refills it from the persisted rows.
+#[turso_macros::test(views)]
+fn test_matview_limit_window_survives_reopen(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    {
+        let conn = tmp_db.connect_limbo();
+        conn.execute("CREATE TABLE window_base(id INTEGER PRIMARY KEY, x INTEGER)")?;
+        conn.execute("INSERT INTO window_base VALUES (1, 10), (2, 20), (3, 30), (4, 40)")?;
+        conn.execute(
+            "CREATE MATERIALIZED VIEW window_top AS
+             SELECT id, x FROM window_base ORDER BY x DESC LIMIT 2",
+        )?;
+        conn.close()?;
+    }
+
+    let reopened = TempDatabase::new_with_existent_with_opts(&tmp_db.path, tmp_db.db_opts);
+    let conn = reopened.connect_limbo();
+    conn.execute("DELETE FROM window_base WHERE id = 4")?;
+    conn.execute("INSERT INTO window_base VALUES (5, 25)")?;
+
+    let rows = limbo_exec_rows(&conn, "SELECT id, x FROM window_top ORDER BY x DESC");
+    assert_eq!(
+        rows,
+        vec![
+            vec![RValue::Integer(3), RValue::Integer(30)],
+            vec![RValue::Integer(5), RValue::Integer(25)],
+        ]
+    );
+    let integrity = limbo_exec_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(integrity, vec![vec![RValue::Text("ok".into())]]);
+    Ok(())
+}
+
 /// Schema reload must reconstruct materialized views in dependency order, and
 /// commit maintenance must preserve that order after reopening the database.
 #[turso_macros::test(views)]
