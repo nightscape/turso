@@ -606,7 +606,7 @@ fn generate_definition(schema: &Schema, rng: &mut ChaCha8Rng) -> Option<Generate
     }
 
     let table = tables[rng.random_range(0..tables.len())];
-    let (sql, must_create) = match rng.random_range(0..42u32) {
+    let (sql, must_create) = match rng.random_range(0..44u32) {
         0..=2 => (Some(projection(table, rng, false)), false),
         3..=4 => (Some(projection(table, rng, true)), false),
         5..=7 => (Some(aggregate(table, rng)), false),
@@ -647,6 +647,8 @@ fn generate_definition(schema: &Schema, rng: &mut ChaCha8Rng) -> Option<Generate
             natural_or_cross_join(&tables, rng).or_else(|| Some(projection(table, rng, true))),
             true,
         ),
+        // ORDER BY ... LIMIT ... OFFSET window.
+        42..=43 => (Some(window_view(table, rng)), true),
         _ => (full_outer_composition(&tables, rng, false), true),
     };
     sql.map(|sql| GeneratedDefinition { sql, must_create })
@@ -1135,6 +1137,22 @@ fn projection(table: &Table, rng: &mut ChaCha8Rng, with_filter: bool) -> String 
     if with_filter {
         let col = &table.columns[rng.random_range(0..table.columns.len())];
         let _ = write!(sql, " WHERE {}", predicate(col, rng));
+    }
+    sql
+}
+
+/// A LIMIT window over one table. The rowid is the last ORDER BY term, so no
+/// two rows tie and the fresh query selects the same rows as the view.
+fn window_view(table: &Table, rng: &mut ChaCha8Rng) -> String {
+    let col = quoted(&table.columns[rng.random_range(0..table.columns.len())].name);
+    let direction = if rng.random_bool(0.5) { " DESC" } else { "" };
+    let mut sql = format!(
+        "SELECT rowid AS rid, {col} FROM {} ORDER BY {col}{direction}, rid LIMIT {}",
+        quoted(&table.name),
+        rng.random_range(0..6)
+    );
+    if rng.random_bool(0.5) {
+        let _ = write!(sql, " OFFSET {}", rng.random_range(0..4));
     }
     sql
 }

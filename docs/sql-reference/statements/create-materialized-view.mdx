@@ -33,10 +33,17 @@ When you modify data in a table that underlies a materialized view, Turso increm
 - Changes to the materialized view are committed or rolled back together with the changes to the base tables.
 - Aggregations like `COUNT`, `SUM`, and `AVG` are maintained efficiently — Turso does not recompute the entire result set on each change.
 
+## ORDER BY and LIMIT
+
+A materialized view with `ORDER BY ... LIMIT n OFFSET m` holds only the rows inside that window, and a view that reads it sees only those rows. When a row inside the window is deleted, the next row in sort order takes its place. Rows that are equal in all `ORDER BY` terms are ordered by row identity, so the window can differ from a query that reads the rows through an index.
+
+A materialized view does not keep its rows in `ORDER BY` order: a query that needs an order must write its own `ORDER BY`. `ORDER BY` without `LIMIT` or `OFFSET` does not change which rows the view holds.
+
 ## Current Limitations
 
 - Supported aggregate functions are `COUNT`, `SUM`, `TOTAL`, `AVG`, `MIN`, and `MAX`, including `DISTINCT` arguments and `FILTER (WHERE ...)`. Other aggregate functions are not yet supported.
-- `FULL OUTER JOIN`, window functions, and `ORDER BY`, `LIMIT`, or `OFFSET` in the defining query are not yet supported.
+- `FULL OUTER JOIN` and window functions are not yet supported.
+- `LIMIT` and `OFFSET` are supported on the top-level `SELECT` only, with an `ORDER BY` whose terms are result columns (optionally with a `COLLATE` clause), or on an aggregate without `GROUP BY`, and with integer constants as values. A negative `LIMIT` means no limit and a negative `OFFSET` means no offset, as in SQLite. `LIMIT` or `OFFSET` in a subquery, a CTE, or a compound `SELECT`, and `NULLS FIRST`/`NULLS LAST` against the default order, are not yet supported.
 - Scalar and correlated subqueries are not yet supported. FROM-clause derived tables and non-recursive CTEs are supported.
 - Virtual-table sources, virtual generated columns, non-deterministic expressions, bound parameters, and custom collations on grouping or deduplication keys are not yet supported.
 - Materialized views on attached databases and materialized views under experimental MVCC mode are not yet supported.
