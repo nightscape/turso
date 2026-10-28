@@ -593,8 +593,8 @@ fn emit_append(
 /// `frontier` (as `R` rowids, values and round) and to `changes` (as `R`
 /// rowids and values).
 ///
-/// A key holds at most one row, of the current round, with weight 1. A key
-/// whose values change keeps its rowid, so the rows derived from it keep
+/// A key and round hold at most one row, with weight 1. A key whose values
+/// change keeps its rowid, so the rows derived from it keep
 /// their keys too: the old and new children cancel in the next round. The
 /// merge applies the retractions first and the insertions second, and
 /// deletes the retracted rows that were not written again last, so a rowid
@@ -642,9 +642,10 @@ fn emit_round_merge(
     let row_start = program.alloc_registers(row_width);
     let values_start = row_start + key_width;
     let row_round_reg = values_start + rows.width;
-    // [key.., rowid]: the index entry.
-    let entry_start = program.alloc_registers(key_width + 1);
-    let rowid_reg = entry_start + key_width;
+    // [key.., round, rowid]: the index entry.
+    let entry_start = program.alloc_registers(key_width + 2);
+    let entry_round_reg = entry_start + key_width;
+    let rowid_reg = entry_round_reg + 1;
     let weight_reg = program.alloc_register();
     let zero_reg = program.alloc_register();
     let one_reg = program.alloc_register();
@@ -681,6 +682,16 @@ fn emit_round_merge(
             dest_reg: to_u32(record_reg),
             index_name: None,
             affinity_str: None,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: row_start,
+            dst_reg: entry_start,
+            extra_amount: key_width - 1,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: row_round_reg,
+            dst_reg: entry_round_reg,
+            extra_amount: 0,
         });
     };
     let emit_change = |program: &mut ProgramBuilder| {
@@ -730,8 +741,8 @@ fn emit_round_merge(
     program.emit_insn(Insn::Found {
         cursor_id: index_cursor,
         target_pc: retraction_found_label,
-        record_reg: row_start,
-        num_regs: key_width,
+        record_reg: entry_start,
+        num_regs: key_width + 1,
     });
     program.emit_insn(Insn::Goto {
         target_pc: corrupt_label,
@@ -825,8 +836,8 @@ fn emit_round_merge(
     program.emit_insn(Insn::Found {
         cursor_id: index_cursor,
         target_pc: rewrite_label,
-        record_reg: row_start,
-        num_regs: key_width,
+        record_reg: entry_start,
+        num_regs: key_width + 1,
     });
     program.emit_insn(Insn::NewRowid {
         cursor: table_cursor,
@@ -834,14 +845,9 @@ fn emit_round_merge(
         prev_largest_reg: 0,
     });
     emit_row_write(program, table_cursor, &table_name, rowid_reg, record_reg);
-    program.emit_insn(Insn::Copy {
-        src_reg: row_start,
-        dst_reg: entry_start,
-        extra_amount: key_width - 1,
-    });
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u32(entry_start),
-        count: to_u32(key_width + 1),
+        count: to_u32(key_width + 2),
         dest_reg: to_u32(stored_record_reg),
         index_name: Some(rows.index.name.clone()),
         affinity_str: None,
@@ -850,7 +856,7 @@ fn emit_round_merge(
         cursor_id: index_cursor,
         record_reg: stored_record_reg,
         unpacked_start: Some(entry_start),
-        unpacked_count: Some(to_u32(key_width + 1)),
+        unpacked_count: Some(to_u32(key_width + 2)),
         flags: IdxInsertFlags::new(),
     });
     program.emit_insn(Insn::Goto {
@@ -913,9 +919,15 @@ fn emit_round_merge(
             default: None,
         });
     }
+    program.emit_insn(Insn::Column {
+        cursor_id: table_cursor,
+        column: key_width + rows.width,
+        dest: entry_round_reg,
+        default: None,
+    });
     program.emit_insn(Insn::IdxDelete {
         start_reg: entry_start,
-        num_regs: key_width + 1,
+        num_regs: key_width + 2,
         cursor_id: index_cursor,
         raise_error_if_no_matching_entry: true,
     });
