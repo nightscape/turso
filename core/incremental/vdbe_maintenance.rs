@@ -75,6 +75,9 @@ mod members;
 mod arrangement;
 use arrangement::publish_node_output;
 
+mod top_k;
+use top_k::emit_top_k;
+
 /// What the maintenance program reads as its input relation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum MaintenanceInput {
@@ -485,6 +488,32 @@ fn emit_plan_nodes(
                     operator_state,
                     schema,
                     connection,
+                )?
+            }
+            dag::OpNode::TopK {
+                input: upstream,
+                sort_keys,
+                limit,
+                offset,
+            } => {
+                let upstream_id = *upstream;
+                let upstream = outputs[upstream_id].as_ref().ok_or_else(|| {
+                    LimboError::InternalError(format!(
+                        "top-k DAG node {node_id} input {upstream} was not compiled"
+                    ))
+                })?;
+                let upstream =
+                    materialize_node_output(program, view_name, upstream_id, upstream, input)?;
+                emit_top_k(
+                    program,
+                    view_name,
+                    node_id,
+                    &upstream,
+                    sort_keys,
+                    *limit,
+                    *offset,
+                    operator_state,
+                    schema,
                 )?
             }
         };
