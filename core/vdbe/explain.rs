@@ -2170,7 +2170,7 @@ pub fn insn_to_row(
                 0,
                 where_clause.clone().unwrap_or_else(|| "NULL".to_string()),
             ),
-            Insn::PopulateMaterializedViews { cursors } => (
+            Insn::PopulateMaterializedViews { cursors, .. } => (
                 "PopulateMaterializedViews",
                 0,
                 0,

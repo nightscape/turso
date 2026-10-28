@@ -41,7 +41,8 @@ A materialized view does not keep its rows in `ORDER BY` order: a query that nee
 
 ## Current Limitations
 
-- Supported aggregate functions are `COUNT`, `SUM`, `TOTAL`, `AVG`, `MIN`, and `MAX`, including `DISTINCT` arguments and `FILTER (WHERE ...)`. Other aggregate functions are not yet supported.
+- Supported aggregate functions are `COUNT`, `SUM`, `TOTAL`, `AVG`, `MIN`, `MAX`, `json_group_array`, and `group_concat`, including `DISTINCT` arguments and `FILTER (WHERE ...)`. Other aggregate functions are not yet supported.
+- `json_group_array` and `group_concat` list their elements in value order, not in the order the rows were read, so an `ORDER BY` in a FROM-clause subquery does not change the element order.
 - `FULL OUTER JOIN` and window functions are not yet supported.
 - `LIMIT` and `OFFSET` are supported on the top-level `SELECT` only, with an `ORDER BY` whose terms are result columns (optionally with a `COLLATE` clause), or on an aggregate without `GROUP BY`, and with integer constants as values. A negative `LIMIT` means no limit and a negative `OFFSET` means no offset, as in SQLite. `LIMIT` or `OFFSET` in a subquery, a CTE, or a compound `SELECT`, and `NULLS FIRST`/`NULLS LAST` against the default order, are not yet supported.
 - Scalar and correlated subqueries are not yet supported. FROM-clause derived tables and CTEs are supported. For recursive CTEs, see [Recursive CTEs](#recursive-ctes).
