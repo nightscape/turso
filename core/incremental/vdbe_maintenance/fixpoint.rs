@@ -18,17 +18,19 @@
 //! the CTE ends; a CTE that does not end fails the statement.
 
 use super::consolidate::{consolidate_delta, ConsolidatedDelta};
+use super::join::reads_binding;
 use super::output::{DeltaSource, EmittedNodeOutput, NodeOutput};
 use super::plan::MaintenancePlan;
 use super::source::{materialize_node_output, scan_node_output};
 use super::stream::{
     btree_arrangement, emit_ephemeral_delta_row, emit_operator_rowid_delta, open_ephemeral_delta,
     scratch_table, ArrangementHandle, ArrangementIdentityColumn, DeltaIdentity, EphemeralDelta,
+    ProbeIndex,
 };
 use super::{emit_node, MaintenanceInput};
 use crate::incremental::dag;
 use crate::namespace::NamespaceId;
-use crate::schema::{BTreeTable, Index, Schema};
+use crate::schema::{BTreeTable, Index, IndexColumn, Schema};
 use crate::sync::Arc;
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
@@ -36,6 +38,7 @@ use crate::vdbe::insn::{
     to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral,
 };
 use crate::{Connection, LimboError, Result};
+use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 /// A statement fails when its change of a recursive CTE needs more rounds.
 const MAX_ROUNDS: i64 = 10_000;
@@ -65,10 +68,7 @@ pub(super) fn emit_fixpoint(
             "maintenance DAG node {node_id} is not a fixpoint"
         )));
     };
-    let body = Body {
-        nodes: body_start..=step,
-        outputs,
-    };
+    let body = Body::new(program, dag, body_start..=step, outputs)?;
     let contract = &plan.operator_states().for_node(node_id)?.output;
     let rows = RowsTable::open(plan, node_id, schema)?;
     let step_schema = dag.output_schema(step).clone();
@@ -289,9 +289,72 @@ impl RowsTable {
 struct Body<'a> {
     nodes: std::ops::RangeInclusive<dag::NodeId>,
     outputs: &'a [Option<NodeOutput>],
+    /// Per node of the arm: the probe index of a base table scan that a join
+    /// of the arm compares for equality.
+    probe_indexes: Vec<Option<ProbeIndex>>,
 }
 
-impl Body<'_> {
+impl<'a> Body<'a> {
+    /// Must be emitted before the round loop: every round reuses the probe
+    /// indexes, as the base tables do not change in the loop.
+    fn new(
+        program: &mut ProgramBuilder,
+        dag: &dag::MaintenanceDag,
+        nodes: std::ops::RangeInclusive<dag::NodeId>,
+        outputs: &'a [Option<NodeOutput>],
+    ) -> Result<Self> {
+        let probe_indexes = nodes
+            .clone()
+            .map(|node| {
+                let dag::OpNode::Scan {
+                    table, logical_id, ..
+                } = &dag.nodes[node]
+                else {
+                    return Ok(None);
+                };
+                let Some(column) = probed_column(dag, nodes.clone(), node, *logical_id)? else {
+                    return Ok(None);
+                };
+                let table_column = &table.columns()[column];
+                let index = Arc::new(Index {
+                    name: format!("ephemeral_probe_{}_{column}", table.name),
+                    columns: vec![IndexColumn {
+                        name: table_column.name.clone().unwrap_or_default(),
+                        order: SortOrder::Asc,
+                        nulls_order: None,
+                        pos_in_table: column,
+                        collation: Some(table_column.collation()),
+                        default: None,
+                        expr: None,
+                    }],
+                    unique: false,
+                    ephemeral: true,
+                    table_name: table.name.clone(),
+                    root_page: 0,
+                    where_clause: None,
+                    has_rowid: true,
+                    index_method: None,
+                    on_conflict: None,
+                    constraint_name: None,
+                });
+                let probe_index = ProbeIndex {
+                    column,
+                    cursor_id: program.alloc_cursor_id(CursorType::BTreeIndex(index)),
+                    probe_count_reg: program.alloc_register(),
+                    built_reg: program.alloc_register(),
+                };
+                program.emit_int(0, probe_index.probe_count_reg);
+                program.emit_int(0, probe_index.built_reg);
+                Ok(Some(probe_index))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            nodes,
+            outputs,
+            probe_indexes,
+        })
+    }
+
     fn declared_output(&self, node_id: dag::NodeId) -> Result<&NodeOutput> {
         self.outputs[node_id].as_ref().ok_or_else(|| {
             LimboError::InternalError(format!("fixpoint input {node_id} was not compiled"))
@@ -343,6 +406,12 @@ impl Body<'_> {
                 dag::OpNode::Scan { .. } if !base_changes => {
                     let (_, arrangement) =
                         scan_node_output(dag, node_id, contract, schema)?.into_parts();
+                    let arrangement = match self.probe_indexes[node_id - self.nodes.start()] {
+                        Some(probe_index) => {
+                            arrangement.map(|arrangement| arrangement.with_probe_index(probe_index))
+                        }
+                        None => arrangement,
+                    };
                     let no_change = open_ephemeral_delta(
                         program,
                         &format!("{view_name}_no_change_{node_id}"),
@@ -382,6 +451,37 @@ impl Body<'_> {
             MaintenanceInput::TransactionDelta,
         )
     }
+}
+
+/// The column of the scan `scan` that a join of the arm compares for
+/// equality with an expression over the join's other input.
+fn probed_column(
+    dag: &dag::MaintenanceDag,
+    nodes: std::ops::RangeInclusive<dag::NodeId>,
+    scan: dag::NodeId,
+    binding: TableInternalId,
+) -> Result<Option<usize>> {
+    for node in nodes {
+        let dag::OpNode::Join { inputs, on, .. } = &dag.nodes[node] else {
+            continue;
+        };
+        if !inputs.contains(&scan) {
+            continue;
+        }
+        for term in on {
+            let ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) = term else {
+                continue;
+            };
+            for (column_side, other) in [(lhs, rhs), (rhs, lhs)] {
+                if let ast::Expr::Column { table, column, .. } = column_side.as_ref() {
+                    if *table == binding && !reads_binding(other, binding)? {
+                        return Ok(Some(*column));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Append every row of `rows` to `keyed` as

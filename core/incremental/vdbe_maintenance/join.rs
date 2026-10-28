@@ -10,14 +10,22 @@ use crate::incremental::dag;
 use crate::namespace::NamespaceId;
 use crate::schema::Schema;
 use crate::sync::Arc;
+use crate::translate::collate::resolve_comparison_collseq;
 use crate::translate::emitter::Resolver;
+use crate::translate::expr::{comparison_affinity, translate_expr, WalkControl};
 use crate::translate::expr::{translate_condition_expr, ConditionMetadata};
 use crate::translate::plan::TableReferences;
 use crate::turso_assert;
+use crate::util::walk_expr_with_subqueries;
+use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::{to_u32, CmpInsFlags, InsertFlags, Insn, RegisterOrLiteral};
+use crate::vdbe::insn::{
+    to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, NullMatchingMask, RegisterOrLiteral,
+};
+use crate::vdbe::BranchOffset;
 use crate::{Connection, LimboError, Result};
-use turso_parser::ast;
+use std::num::NonZeroUsize;
+use turso_parser::ast::{self, TableInternalId};
 
 const JOIN_ARITY: usize = 2;
 
@@ -332,16 +340,49 @@ fn emit_join_phase(
         .then(|| program.alloc_register())
     });
 
+    // Each input's values are bound at its own loop depth, so a seek of the
+    // inner input can use the outer input's values as its key.
+    resolver.enable_expr_to_reg_cache();
+    let mut probe_loops: [Option<ProbeLoop>; JOIN_ARITY] = [None, None];
     for (depth, &pos) in order.iter().enumerate() {
-        program.emit_insn(Insn::Rewind {
-            cursor_id: cursor_ids[pos],
-            pc_if_empty: if depth == 0 {
-                phase_done_label
+        let skip_label = if depth == 0 {
+            phase_done_label
+        } else {
+            next_labels[depth - 1]
+        };
+        let probe =
+            if depth == 1 && sides[pos] == JoinSide::Btree && sides[order[0]] == JoinSide::Delta {
+                index_probe(
+                    &contract.inputs[pos],
+                    &contract.on,
+                    &binding_remap,
+                    &table_references,
+                    resolver,
+                )?
             } else {
-                next_labels[depth - 1]
-            },
-        });
-        program.preassign_label_to_next_insn(loop_labels[depth]);
+                None
+            };
+        match probe {
+            Some(probe) => {
+                probe_loops[depth] = Some(emit_index_probe(
+                    program,
+                    &contract.inputs[pos].arrangement,
+                    cursor_ids[pos],
+                    &probe,
+                    &table_references,
+                    resolver,
+                    skip_label,
+                    loop_labels[depth],
+                )?);
+            }
+            None => {
+                program.emit_insn(Insn::Rewind {
+                    cursor_id: cursor_ids[pos],
+                    pc_if_empty: skip_label,
+                });
+                program.preassign_label_to_next_insn(loop_labels[depth]);
+            }
+        }
         if let Some(w) = delta_w_regs[pos] {
             let weight_column = match &contract.inputs[pos].delta {
                 DeltaSource::BaseTable { .. } => contract.inputs[pos].schema.len(),
@@ -365,69 +406,15 @@ fn emit_join_phase(
                 default: None,
             });
         }
-    }
-
-    // Bind every logical column to the physical arrangement/delta slot used
-    // in this phase. This keeps expression translation independent of record
-    // layout (aggregate arrangements can project away accumulator payloads,
-    // while ephemeral deltas carry identity before their values).
-    resolver.enable_expr_to_reg_cache();
-    for pos in 0..JOIN_ARITY {
-        let input = &contract.inputs[pos];
-        for (logical_column, column) in input.schema.columns.iter().enumerate() {
-            let Some(expr) = column else {
-                continue;
-            };
-            let physical_column = match (&sides[pos], &input.delta) {
-                (JoinSide::Delta, DeltaSource::Ephemeral(channel)) => {
-                    channel.value_start + logical_column
-                }
-                (JoinSide::Delta, DeltaSource::BaseTable { .. }) => logical_column,
-                (JoinSide::Btree, _) => input.arrangement.value_columns()[logical_column],
-            };
-            let value_reg = program.alloc_register();
-            match (&sides[pos], &input.delta) {
-                (JoinSide::Delta, DeltaSource::Ephemeral(_)) => {
-                    program.emit_insn(Insn::Column {
-                        cursor_id: cursor_ids[pos],
-                        column: physical_column,
-                        dest: value_reg,
-                        default: None,
-                    });
-                }
-                _ => program.emit_column_or_rowid(cursor_ids[pos], physical_column, value_reg),
-            }
-            let bound = remap_bound_expr(expr, &binding_remap)?;
-            cache_stream_expr_reg(&mut *resolver, bound, value_reg, &table_references)?;
-        }
-        for (binding_index, binding) in input.schema.bindings.iter().enumerate() {
-            let rowid_reg = program.alloc_register();
-            if !emit_join_input_binding_rowid(
-                program,
-                sides[pos],
-                &input.delta,
-                &input.arrangement,
-                cursor_ids[pos],
-                binding_index,
-                rowid_reg,
-            ) {
-                continue;
-            }
-            let phase_id = *binding_remap.get(&binding.logical_id).ok_or_else(|| {
-                LimboError::InternalError(
-                    "join binding rowid has no phase-local binding".to_string(),
-                )
-            })?;
-            resolver.cache_expr_reg(
-                std::borrow::Cow::Owned(ast::Expr::RowId {
-                    database: None,
-                    table: phase_id,
-                }),
-                rowid_reg,
-                false,
-                None,
-            );
-        }
+        bind_join_input(
+            program,
+            resolver,
+            &contract.inputs[pos],
+            sides[pos],
+            cursor_ids[pos],
+            &binding_remap,
+            &table_references,
+        )?;
     }
 
     // ON predicates and WHERE: a FALSE or NULL result means this combination
@@ -472,15 +459,347 @@ fn emit_join_phase(
 
     for depth in (0..JOIN_ARITY).rev() {
         program.preassign_label_to_next_insn(next_labels[depth]);
-        program.emit_insn(Insn::Next {
-            cursor_id: cursor_ids[order[depth]],
-            pc_if_next: loop_labels[depth],
-            fullscan: false,
-            is_index: false,
-        });
+        let cursor_id = cursor_ids[order[depth]];
+        match &probe_loops[depth] {
+            Some(probe_loop) => probe_loop.emit_next(program, cursor_id, loop_labels[depth]),
+            None => program.emit_insn(Insn::Next {
+                cursor_id,
+                pc_if_next: loop_labels[depth],
+                fullscan: false,
+                is_index: false,
+            }),
+        }
     }
     program.preassign_label_to_next_insn(phase_done_label);
     Ok(())
+}
+
+/// Bind every logical column of one join input to the physical
+/// arrangement/delta slot used in this phase. This keeps expression
+/// translation independent of record layout (aggregate arrangements can
+/// project away accumulator payloads, while ephemeral deltas carry identity
+/// before their values).
+fn bind_join_input(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    input: &JoinInputContract,
+    side: JoinSide,
+    cursor_id: usize,
+    binding_remap: &BindingRemap,
+    table_references: &TableReferences,
+) -> Result<()> {
+    for (logical_column, column) in input.schema.columns.iter().enumerate() {
+        let Some(expr) = column else {
+            continue;
+        };
+        let value_reg = program.alloc_register();
+        match (side, &input.delta) {
+            (JoinSide::Delta, DeltaSource::Ephemeral(channel)) => {
+                program.emit_insn(Insn::Column {
+                    cursor_id,
+                    column: channel.value_start + logical_column,
+                    dest: value_reg,
+                    default: None,
+                });
+            }
+            (JoinSide::Delta, DeltaSource::BaseTable { .. }) => {
+                program.emit_column_or_rowid(cursor_id, logical_column, value_reg)
+            }
+            (JoinSide::Btree, _) => program.emit_column_or_rowid(
+                cursor_id,
+                input.arrangement.value_columns()[logical_column],
+                value_reg,
+            ),
+        }
+        let bound = remap_bound_expr(expr, binding_remap)?;
+        cache_stream_expr_reg(&mut *resolver, bound, value_reg, table_references)?;
+    }
+    for (binding_index, binding) in input.schema.bindings.iter().enumerate() {
+        let rowid_reg = program.alloc_register();
+        if !emit_join_input_binding_rowid(
+            program,
+            side,
+            &input.delta,
+            &input.arrangement,
+            cursor_id,
+            binding_index,
+            rowid_reg,
+        ) {
+            continue;
+        }
+        let phase_id = *binding_remap.get(&binding.logical_id).ok_or_else(|| {
+            LimboError::InternalError("join binding rowid has no phase-local binding".to_string())
+        })?;
+        resolver.cache_expr_reg(
+            std::borrow::Cow::Owned(ast::Expr::RowId {
+                database: None,
+                table: phase_id,
+            }),
+            rowid_reg,
+            false,
+            None,
+        );
+    }
+    Ok(())
+}
+
+/// An ON term `column = key` that lets a join seek the [`ProbeIndex`] on
+/// `column` instead of scanning the btree: `key` reads only the outer input,
+/// and the comparison's affinity and collation agree with the index.
+struct IndexProbe {
+    key: ast::Expr,
+    affinity: Affinity,
+}
+
+/// The first ON term the inner input of a phase can seek its probe index
+/// with.
+fn index_probe(
+    input: &JoinInputContract,
+    on: &[ast::Expr],
+    binding_remap: &BindingRemap,
+    table_references: &TableReferences,
+    resolver: &Resolver,
+) -> Result<Option<IndexProbe>> {
+    let Some(probe_index) = input.arrangement.probe_index() else {
+        return Ok(None);
+    };
+    let [binding] = input.schema.bindings.as_slice() else {
+        return Err(LimboError::InternalError(
+            "an indexable join input must be one base table".to_string(),
+        ));
+    };
+    let phase_id = *binding_remap.get(&binding.logical_id).ok_or_else(|| {
+        LimboError::InternalError("join input has no phase-local binding".to_string())
+    })?;
+    for condition in on {
+        let bound = remap_bound_expr(condition, binding_remap)?;
+        let ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) = &bound else {
+            continue;
+        };
+        for (column_side, key) in [(lhs, rhs), (rhs, lhs)] {
+            let ast::Expr::Column { table, column, .. } = column_side.as_ref() else {
+                continue;
+            };
+            if *table != phase_id || *column != probe_index.column || reads_binding(key, phase_id)?
+            {
+                continue;
+            }
+            let table_column = &binding.table.columns()[*column];
+            let affinity = comparison_affinity(
+                lhs.as_ref(),
+                rhs.as_ref(),
+                Some(table_references),
+                Some(resolver),
+            );
+            let collation = resolve_comparison_collseq(lhs, rhs, table_references)?;
+            if !table_column.affinity().index_affinity_ok(affinity)
+                || collation != table_column.collation()
+            {
+                continue;
+            }
+            return Ok(Some(IndexProbe {
+                key: key.as_ref().clone(),
+                affinity,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+pub(super) fn reads_binding(expr: &ast::Expr, binding: TableInternalId) -> Result<bool> {
+    let mut reads = false;
+    walk_expr_with_subqueries(expr, &mut |node| {
+        if let ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } = node {
+            reads |= *table == binding;
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(reads)
+}
+
+/// Joins build a probe index only after this many probes of its btree in one
+/// run of the maintenance program; until then, scanning the btree costs less
+/// than building the index.
+const PROBES_BEFORE_INDEX: i64 = 32;
+
+/// The inner loop of a join phase over a btree with a probe index: it seeks
+/// the index once the index is built and scans the btree before that.
+struct ProbeLoop {
+    index_cursor: usize,
+    probe_count_reg: usize,
+    probes_before_index_reg: usize,
+    seek_loop: BranchOffset,
+}
+
+impl ProbeLoop {
+    fn emit_next(
+        &self,
+        program: &mut ProgramBuilder,
+        btree_cursor: usize,
+        scan_loop: BranchOffset,
+    ) {
+        let next_scan = program.allocate_label();
+        let done = program.allocate_label();
+        program.emit_insn(Insn::Le {
+            lhs: self.probe_count_reg,
+            rhs: self.probes_before_index_reg,
+            target_pc: next_scan,
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        program.emit_insn(Insn::Next {
+            cursor_id: self.index_cursor,
+            pc_if_next: self.seek_loop,
+            fullscan: false,
+            is_index: true,
+        });
+        program.emit_insn(Insn::Goto { target_pc: done });
+        program.preassign_label_to_next_insn(next_scan);
+        program.emit_insn(Insn::Next {
+            cursor_id: btree_cursor,
+            pc_if_next: scan_loop,
+            fullscan: false,
+            is_index: false,
+        });
+        program.preassign_label_to_next_insn(done);
+    }
+}
+
+/// Position `btree_cursor` on each row whose probed column may equal the
+/// probe key. The probe that passes [`PROBES_BEFORE_INDEX`] builds the probe
+/// index unless it is built; from then on the loop seeks the index. Before,
+/// it scans the btree. Both continue at `loop_label`.
+#[allow(clippy::too_many_arguments)]
+fn emit_index_probe(
+    program: &mut ProgramBuilder,
+    arrangement: &ArrangementHandle,
+    btree_cursor: usize,
+    probe: &IndexProbe,
+    table_references: &TableReferences,
+    resolver: &Resolver,
+    skip_label: BranchOffset,
+    loop_label: BranchOffset,
+) -> Result<ProbeLoop> {
+    let probe_index = *arrangement
+        .probe_index()
+        .expect("a probed arrangement has a probe index");
+    let probes_before_index_reg = program.alloc_register();
+
+    let scan = program.allocate_label();
+    let seek = program.allocate_label();
+    let seek_loop = program.allocate_label();
+    let build_loop = program.allocate_label();
+    program.emit_insn(Insn::AddImm {
+        register: probe_index.probe_count_reg,
+        value: 1,
+    });
+    program.emit_int(PROBES_BEFORE_INDEX, probes_before_index_reg);
+    program.emit_insn(Insn::Le {
+        lhs: probe_index.probe_count_reg,
+        rhs: probes_before_index_reg,
+        target_pc: scan,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::If {
+        reg: probe_index.built_reg,
+        target_pc: seek,
+        jump_if_null: false,
+    });
+    program.emit_int(1, probe_index.built_reg);
+    program.emit_insn(Insn::OpenAutoindex {
+        cursor_id: probe_index.cursor_id,
+    });
+    program.emit_insn(Insn::Rewind {
+        cursor_id: btree_cursor,
+        pc_if_empty: seek,
+    });
+    program.preassign_label_to_next_insn(build_loop);
+    let entry_start = program.alloc_registers(2);
+    program.emit_column_or_rowid(
+        btree_cursor,
+        arrangement.value_columns()[probe_index.column],
+        entry_start,
+    );
+    program.emit_insn(Insn::RowId {
+        cursor_id: btree_cursor,
+        dest: entry_start + 1,
+    });
+    let entry_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u32(entry_start),
+        count: 2,
+        dest_reg: to_u32(entry_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+    program.emit_insn(Insn::IdxInsert {
+        cursor_id: probe_index.cursor_id,
+        record_reg: entry_reg,
+        unpacked_start: Some(entry_start),
+        unpacked_count: Some(2),
+        flags: IdxInsertFlags::new().use_seek(false),
+    });
+    program.emit_insn(Insn::Next {
+        cursor_id: btree_cursor,
+        pc_if_next: build_loop,
+        fullscan: false,
+        is_index: false,
+    });
+
+    program.preassign_label_to_next_insn(seek);
+    let key_reg = program.alloc_register();
+    translate_expr(
+        program,
+        Some(table_references),
+        &probe.key,
+        key_reg,
+        resolver,
+    )?;
+    if !matches!(probe.affinity, Affinity::Blob | Affinity::None) {
+        program.emit_insn(Insn::Affinity {
+            start_reg: key_reg,
+            count: NonZeroUsize::MIN,
+            affinities: probe.affinity.aff_mask().to_string(),
+        });
+    }
+    program.emit_insn(Insn::IsNull {
+        reg: key_reg,
+        target_pc: skip_label,
+    });
+    program.emit_insn(Insn::SeekGE {
+        is_index: true,
+        cursor_id: probe_index.cursor_id,
+        start_reg: key_reg,
+        num_regs: 1,
+        target_pc: skip_label,
+        eq_only: false,
+        null_matching_mask: NullMatchingMask::default(),
+    });
+    program.preassign_label_to_next_insn(seek_loop);
+    program.emit_insn(Insn::IdxGT {
+        cursor_id: probe_index.cursor_id,
+        start_reg: key_reg,
+        num_regs: 1,
+        target_pc: skip_label,
+    });
+    program.emit_deferred_seek(probe_index.cursor_id, btree_cursor);
+    program.emit_insn(Insn::Goto {
+        target_pc: loop_label,
+    });
+
+    program.preassign_label_to_next_insn(scan);
+    program.emit_insn(Insn::Rewind {
+        cursor_id: btree_cursor,
+        pc_if_empty: skip_label,
+    });
+    program.preassign_label_to_next_insn(loop_label);
+    Ok(ProbeLoop {
+        index_cursor: probe_index.cursor_id,
+        probe_count_reg: probe_index.probe_count_reg,
+        probes_before_index_reg,
+        seek_loop,
+    })
 }
 
 /// Emit a join's natural delta row into a typed ephemeral stream. The join
