@@ -108,10 +108,86 @@ fn test_nested_matview_join_without_cdc_no_panic(tmp_db: TempDatabase) -> anyhow
     Ok(())
 }
 
-/// Reproducer from holon PKMS app: recursive CTE matview + JOIN matview + watch matviews + CDC.
-/// The combination of a recursive CTE matview (blocks_with_paths) alongside chained JOIN
-/// matviews (current_focus -> watch_view) with CDC callbacks triggers cursor corruption
-/// during cascading IVM updates.
+/// A recursive view next to a view that joins another view, with a change
+/// callback registered, while inserts and navigation changes cascade.
+#[turso_macros::test(views)]
+fn test_holon_full_schema_with_recursive_cte_and_cdc(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Base tables (mirrors holon schema)
+    conn.execute("CREATE TABLE blocks (id TEXT PRIMARY KEY, parent_id TEXT, content TEXT)")?;
+    conn.execute(
+        "CREATE TABLE navigation_history (id INTEGER PRIMARY KEY AUTOINCREMENT, region TEXT, block_id TEXT)",
+    )?;
+    conn.execute("CREATE TABLE navigation_cursor (region TEXT PRIMARY KEY, history_id INTEGER)")?;
+    conn.execute("INSERT INTO navigation_cursor (region, history_id) VALUES ('main', NULL)")?;
+
+    // Recursive CTE matview — this is the key ingredient missing from simpler tests
+    conn.execute(
+        "CREATE MATERIALIZED VIEW blocks_with_paths AS
+         WITH RECURSIVE paths AS (
+             SELECT id, parent_id, content, '/' || id as path
+             FROM blocks
+             WHERE parent_id LIKE 'doc:%'
+                OR parent_id = '__no_parent__'
+             UNION ALL
+             SELECT b.id, b.parent_id, b.content, p.path || '/' || b.id as path
+             FROM blocks b
+             INNER JOIN paths p ON b.parent_id = p.id
+         )
+         SELECT * FROM paths",
+    )?;
+
+    // JOIN matview on base tables
+    conn.execute(
+        "CREATE MATERIALIZED VIEW current_focus AS
+         SELECT nc.region, nh.block_id
+         FROM navigation_cursor nc
+         JOIN navigation_history nh ON nc.history_id = nh.id",
+    )?;
+
+    // Chained matview: JOIN with current_focus
+    conn.execute(
+        "CREATE MATERIALIZED VIEW watch_view AS
+         SELECT blocks.id, blocks.content
+         FROM blocks
+         INNER JOIN current_focus cf ON blocks.parent_id = cf.block_id
+         WHERE cf.region = 'main'",
+    )?;
+
+    // CDC callback — triggers re-entrancy during cascading IVM updates
+    conn.set_change_callback(|event| {
+        println!(
+            "CDC callback: {} changes to {}",
+            event.changes.len(),
+            event.relation_name
+        );
+    })
+    .unwrap();
+
+    // Insert blocks that will be picked up by blocks_with_paths
+    conn.execute("INSERT INTO blocks VALUES ('root-1', 'doc:test.org', 'Root content')")?;
+    conn.execute("INSERT INTO blocks VALUES ('child-1', 'root-1', 'Child content')")?;
+    conn.execute("INSERT INTO blocks VALUES ('child-2', 'root-1', 'Child 2')")?;
+
+    // Navigate: insert history + update cursor.
+    // This triggers cascading IVM:
+    //   1. blocks_with_paths updates (blocks changed)
+    //   2. current_focus updates (navigation_cursor changed)
+    //   3. watch_view updates (current_focus changed)
+    //   4. CDC fires during cascade
+    // The combination can corrupt BTree cursors during re-entrant commit.
+    conn.execute("INSERT INTO navigation_history (region, block_id) VALUES ('main', 'root-1')")?;
+    conn.execute("UPDATE navigation_cursor SET history_id = 1 WHERE region = 'main'")?;
+
+    // Insert more blocks after navigation is active — stresses the cascade further
+    conn.execute("INSERT INTO blocks VALUES ('grandchild-1', 'child-1', 'Grandchild')")?;
+    conn.execute("INSERT INTO blocks VALUES ('child-3', 'root-1', 'Child 3')")?;
+    conn.execute("INSERT INTO blocks VALUES ('child-4', 'root-1', 'Child 4')")?;
+
+    Ok(())
+}
+
 /// Test with multiple watch views - closer to the real app scenario
 #[turso_macros::test(views)]
 fn test_multiple_nested_matviews_with_cdc(tmp_db: TempDatabase) -> anyhow::Result<()> {

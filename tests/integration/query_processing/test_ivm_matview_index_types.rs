@@ -43,3 +43,31 @@ fn an_index_on_a_count_column(tmp_db: TempDatabase) -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[turso_macros::test(views)]
+fn an_index_on_an_integer_recursive_view(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE edges (src INTEGER, dst INTEGER)")?;
+    conn.execute("CREATE TABLE root (node INTEGER)")?;
+    conn.execute("INSERT INTO root VALUES (1)")?;
+    conn.execute(
+        "CREATE MATERIALIZED VIEW reach AS \
+         WITH RECURSIVE r(node) AS (SELECT node FROM root UNION ALL SELECT e.dst FROM edges e JOIN r ON e.src = r.node) \
+         SELECT node FROM r",
+    )?;
+    conn.execute("CREATE INDEX idx_reach_node ON reach(node)")?;
+    conn.execute("INSERT INTO edges VALUES (1, 2), (2, 3)")?;
+    for node in 1..4 {
+        assert_index_matches_scan(
+            &conn,
+            &format!("SELECT node FROM reach WHERE node = {node}"),
+            &format!("SELECT node FROM reach NOT INDEXED WHERE node = {node}"),
+        );
+    }
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT count(*) FROM reach WHERE node = 1"),
+        vec![vec![rusqlite::types::Value::Integer(1)]],
+        "fixture: node 1 is reachable"
+    );
+    Ok(())
+}
