@@ -54,6 +54,51 @@ fn an_index_on_a_chained_view(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Inside a transaction, a recursive view loses and gains rows far from the
+/// changed edge.
+#[turso_macros::test(views)]
+fn an_index_on_a_recursive_view(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE edges (src TEXT, dst TEXT)")?;
+    conn.execute("CREATE TABLE root (node TEXT)")?;
+    conn.execute("INSERT INTO root VALUES ('n1')")?;
+    conn.execute(
+        "CREATE MATERIALIZED VIEW reach AS \
+         WITH RECURSIVE r(node) AS (SELECT node FROM root UNION ALL SELECT e.dst FROM edges e JOIN r ON e.src = r.node) \
+         SELECT node FROM r",
+    )?;
+    conn.execute("CREATE INDEX idx_reach_node ON reach(node)")?;
+    conn.execute("INSERT INTO edges VALUES ('n1', 'n2'), ('n2', 'n3')")?;
+
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO edges VALUES ('n3', 'n4')")?;
+    conn.execute("DELETE FROM edges WHERE src = 'n1'")?;
+    for node in ["n1", "n2", "n3", "n4"] {
+        assert_index_matches_scan(
+            &conn,
+            &format!("SELECT node FROM reach WHERE node = '{node}'"),
+            &format!("SELECT node FROM reach NOT INDEXED WHERE node = '{node}'"),
+        );
+    }
+    assert_index_matches_scan(
+        &conn,
+        "SELECT node FROM reach ORDER BY node",
+        "SELECT node FROM reach NOT INDEXED ORDER BY node",
+    );
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT count(*) FROM reach NOT INDEXED"),
+        vec![vec![rusqlite::types::Value::Integer(1)]],
+        "fixture: inside the transaction only n1 is reachable"
+    );
+    conn.execute("COMMIT")?;
+    assert_index_matches_scan(
+        &conn,
+        "SELECT node FROM reach ORDER BY node",
+        "SELECT node FROM reach NOT INDEXED ORDER BY node",
+    );
+    Ok(())
+}
+
 /// Under NOCASE, 'a' and 'A' are the same key but different values. A covering
 /// read returns the value from the index entry, so the base table is the
 /// oracle.
