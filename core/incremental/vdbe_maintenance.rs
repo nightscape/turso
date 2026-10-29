@@ -151,16 +151,24 @@ pub(crate) fn compile_maintenance_program(
     if let Some(prepared) = connection.maintenance_program_cache.get(&key, connection) {
         return Ok(prepared.bind(connection.clone()));
     }
-    let plan = build_plan_for_connection(view_name, select, schema, connection)?;
-    let program = compile_maintenance_plan(
-        view_name,
-        view_root_page,
-        num_view_columns,
-        input,
-        &plan,
-        schema,
-        connection,
-    )?;
+    let program = build_plan_for_connection(view_name, select, schema, connection)
+        .and_then(|plan| {
+            compile_maintenance_plan(
+                view_name,
+                view_root_page,
+                num_view_columns,
+                input,
+                &plan,
+                schema,
+                connection,
+            )
+        })
+        .map_err(|e| match e {
+            LimboError::ParseError(msg) => LimboError::ParseError(format!(
+                "materialized view '{view_name}' cannot be maintained: {msg}"
+            )),
+            e => e,
+        })?;
     connection
         .maintenance_program_cache
         .insert(key, program.prepared().clone());
