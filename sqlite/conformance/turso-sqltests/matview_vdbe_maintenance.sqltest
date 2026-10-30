@@ -688,6 +688,29 @@ expect {
     real|1
 }
 
+# A REAL SUM/TOTAL/AVG must not keep rounding residue from retracted rows.
+test matview-vdbe-real-sum-no-residue-after-retraction {
+    CREATE TABLE real_residue(id INTEGER PRIMARY KEY, g INTEGER, x);
+    CREATE MATERIALIZED VIEW real_residue_view AS
+      SELECT g, SUM(x) AS s, TOTAL(x) AS t, AVG(x) AS a
+        FROM real_residue GROUP BY g;
+    INSERT INTO real_residue VALUES
+      (1, 1, 0.001), (2, 1, 1e20), (3, 1, 1e20), (4, 1, 0.3),
+      (5, 2, 7), (6, 2, 0.001), (7, 2, 1e20), (8, 2, 0.5);
+    DELETE FROM real_residue WHERE id = 4;
+    DELETE FROM real_residue WHERE id IN (2, 3);
+    UPDATE real_residue SET x = NULL WHERE id IN (7, 8);
+    SELECT v.g, v.s = d.s, v.t = d.t, v.a = d.a
+      FROM real_residue_view AS v
+      JOIN (SELECT g, SUM(x) AS s, TOTAL(x) AS t, AVG(x) AS a
+              FROM real_residue GROUP BY g) AS d USING (g)
+     ORDER BY v.g;
+}
+expect {
+    1|1|1|1
+    2|1|1|1
+}
+
 # Deferring finalization must not suppress a genuine final overflow.
 test matview-vdbe-sum-final-integer-overflow-errors {
     CREATE TABLE sum_final_overflow(x);
