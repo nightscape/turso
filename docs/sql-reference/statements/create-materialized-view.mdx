@@ -61,6 +61,14 @@ without that function, reads still work, but a write that would change the
 view fails with an error that names the view, until the function is registered
 again or the view is dropped.
 
+A materialized view can call the date and time functions (`date`, `time`,
+`datetime`, `julianday`, `unixepoch`, `strftime`, `timediff`) when they read
+their time value from their arguments, for example `strftime('%Y', ts)`. As
+with expression indexes, a call that reads the current time (no time value,
+`'now'`, `CURRENT_TIMESTAMP`) or uses the `localtime` or `utc` modifier is
+refused. A column value of `'now'` is not detected: the view keeps the value
+computed when the row was written.
+
 ## Recursive CTEs
 
 A materialized view can use `WITH RECURSIVE` with `UNION ALL`. Turso maintains it incrementally, like any other materialized view.
