@@ -32,6 +32,7 @@ When you modify data in a table that underlies a materialized view, Turso increm
 
 - Changes to the materialized view are committed or rolled back together with the changes to the base tables.
 - Aggregations like `COUNT`, `SUM`, and `AVG` are maintained efficiently — Turso does not recompute the entire result set on each change.
+- `SUM`, `TOTAL`, and `AVG` keep an exact sum of `REAL` values, so a deleted or updated row leaves no rounding error in the result. A view created by an earlier Turso version that kept an approximate sum fails on the next write to its tables with an error that asks you to run `REFRESH MATERIALIZED VIEW` on it.
 
 ## ORDER BY and LIMIT
 

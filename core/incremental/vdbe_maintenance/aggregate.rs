@@ -13,6 +13,7 @@ use super::stream::{
     ArrangementIdentityColumn, DeltaIdentity, EphemeralDelta,
 };
 use super::MaintenanceInput;
+use crate::alloc::TursoAllocExt;
 use crate::function::{AccumulatorFunc, AggFunc};
 use crate::incremental::dag;
 use crate::namespace::NamespaceId;
@@ -140,8 +141,7 @@ fn emit_group_aggregate_rows(
         .map(|agg| ivm_payload_width(&agg.func))
         .collect();
     let main_payload: usize = payload_widths.iter().flatten().sum();
-    // SUM/TOTAL/AVG infinity counts follow every aggregate's main slots, so
-    // state rows written without them keep every main slot where it was.
+    // SUM/TOTAL/AVG infinity counts follow every aggregate's main slots.
     let mut next_inf_counts_offset = main_payload;
     let inf_counts_offsets: Vec<Option<usize>> = aggregates
         .iter()
@@ -941,10 +941,9 @@ fn emit_group_aggregate_rows(
                         kind,
                         int_wrapped_reg: regs.main,
                         int_wrap_count_reg: regs.main + 1,
-                        float_sum_reg: regs.main + 2,
-                        float_err_reg: regs.main + 3,
-                        non_int_count_reg: regs.main + 4,
-                        non_null_count_reg: regs.main + 5,
+                        exact_sum_reg: regs.main + 2,
+                        non_int_count_reg: regs.main + 3,
+                        non_null_count_reg: regs.main + 4,
                         pos_inf_count_reg: inf_counts,
                         neg_inf_count_reg: inf_counts + 1,
                         dest_reg: value_reg,
@@ -1364,8 +1363,8 @@ fn ivm_sum_kind(func: &AggFunc) -> Option<IvmSumKind> {
 }
 
 /// Registers SUM/TOTAL/AVG's IVM state occupies: int_wrapped, int_wrap_count,
-/// float_sum, float_err, non_int_count, non_null_count (see `IvmSumData`).
-const IVM_SUM_PAYLOAD_WIDTH: usize = 6;
+/// exact_sum, non_int_count, non_null_count (see `IvmSumData`).
+const IVM_SUM_PAYLOAD_WIDTH: usize = 5;
 
 /// Registers SUM/TOTAL/AVG's +Infinity and -Infinity counts occupy, stored
 /// after every aggregate's `ivm_payload_width` slots.
@@ -1416,16 +1415,12 @@ fn emit_payload_zero_init(program: &mut ProgramBuilder, agg: &Aggregate, regs: P
     }
     program.emit_int(0, base); // int_wrapped
     program.emit_int(0, base + 1); // int_wrap_count
-    program.emit_insn(Insn::Real {
-        value: 0.0,
-        dest: base + 2, // float_sum
+    program.emit_insn(Insn::Blob {
+        value: TursoAllocExt::new(),
+        dest: base + 2, // exact_sum
     });
-    program.emit_insn(Insn::Real {
-        value: 0.0,
-        dest: base + 3, // float_err
-    });
-    program.emit_int(0, base + 4); // non_int_count
-    program.emit_int(0, base + 5); // non_null_count
+    program.emit_int(0, base + 3); // non_int_count
+    program.emit_int(0, base + 4); // non_null_count
     let inf_counts = regs.inf_counts.expect("SUM/TOTAL/AVG have infinity counts");
     program.emit_int(0, inf_counts); // pos_inf_count
     program.emit_int(0, inf_counts + 1); // neg_inf_count
@@ -1470,10 +1465,9 @@ fn emit_weighted_apply(
                 weight_reg,
                 int_wrapped_reg: payload_start,
                 int_wrap_count_reg: payload_start + 1,
-                float_sum_reg: payload_start + 2,
-                float_err_reg: payload_start + 3,
-                non_int_count_reg: payload_start + 4,
-                non_null_count_reg: payload_start + 5,
+                exact_sum_reg: payload_start + 2,
+                non_int_count_reg: payload_start + 3,
+                non_null_count_reg: payload_start + 4,
                 pos_inf_count_reg: inf_counts,
                 neg_inf_count_reg: inf_counts + 1,
             }),

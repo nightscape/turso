@@ -396,17 +396,15 @@ pub enum IvmSumKind {
 /// - `int_wrapped`/`int_wrap_count`: the exact sum of every live INTEGER (or
 ///   integer-valued TEXT) contribution, stored as `int_wrapped + int_wrap_count
 ///   * 2^64` so an i64 overflow is still exactly undone by a later retraction.
-/// - `float_sum`/`float_err`: the Kahan-Babuska-Neumaier running sum of every
-///   live non-integer contribution (REAL, or TEXT/BLOB that sum() treats as
-///   approximate).
+/// - `exact_sum`: the exact sum of every live finite non-integer contribution
+///   (REAL, or TEXT/BLOB that sum() treats as approximate), as a `DyadicSum`
+///   BLOB, so a retraction leaves no rounding residue.
 /// - `non_int_count`: count of live non-integer contributions; decides
 ///   whether SUM's result is INTEGER or REAL.
 /// - `non_null_count`: count of live non-NULL contributions; decides the
 ///   empty-group result and AVG's divisor.
 /// - `pos_inf_count`/`neg_inf_count`: count of live +Infinity and -Infinity
-///   contributions, kept out of `float_sum` so that retracting one of them
-///   restores the sum. They are stored after every aggregate's other slots, so
-///   state rows written without them read as NULL, which means zero.
+///   contributions, which `exact_sum` cannot hold.
 #[derive(Debug, Clone)]
 pub struct IvmSumData {
     pub arg_reg: usize,
@@ -414,8 +412,7 @@ pub struct IvmSumData {
     pub weight_reg: usize,
     pub int_wrapped_reg: usize,
     pub int_wrap_count_reg: usize,
-    pub float_sum_reg: usize,
-    pub float_err_reg: usize,
+    pub exact_sum_reg: usize,
     pub non_int_count_reg: usize,
     pub non_null_count_reg: usize,
     pub pos_inf_count_reg: usize,
@@ -430,8 +427,7 @@ pub struct IvmSumFinalizeData {
     pub kind: IvmSumKind,
     pub int_wrapped_reg: usize,
     pub int_wrap_count_reg: usize,
-    pub float_sum_reg: usize,
-    pub float_err_reg: usize,
+    pub exact_sum_reg: usize,
     pub non_int_count_reg: usize,
     pub non_null_count_reg: usize,
     pub pos_inf_count_reg: usize,

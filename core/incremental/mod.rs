@@ -1,5 +1,6 @@
 pub mod cursor;
 mod dag;
+pub(crate) mod exact_sum;
 pub mod vdbe_maintenance;
 pub mod view;
 

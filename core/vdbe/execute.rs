@@ -5,6 +5,7 @@ use crate::alloc::{
 use crate::cdc::TURSO_CDC_VERSION_TABLE_NAME;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
+use crate::incremental::exact_sum::DyadicSum;
 use crate::io::TempFile;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::{
@@ -8115,6 +8116,7 @@ fn ivm_sum_apply(state: &mut ProgramState, data: &crate::vdbe::insn::IvmSumData)
 
     let weight = reg_int(state, data.weight_reg, "weight")?;
     let arg = state.registers[data.arg_reg].get_value().clone();
+    ivm_exact_sum_blob(state, data.exact_sum_reg)?;
     match classify_numeric_arg(&arg) {
         NumericArg::Null => {}
         NumericArg::Integer(i) => {
@@ -8126,20 +8128,20 @@ fn ivm_sum_apply(state: &mut ProgramState, data: &crate::vdbe::insn::IvmSumData)
             state.registers[data.int_wrap_count_reg].set_int(new_wrap_count);
             add_to_count(state, data.non_null_count_reg, weight)?;
         }
+        NumericArg::Float(f) if f.is_infinite() => {
+            let reg = if f > 0.0 {
+                data.pos_inf_count_reg
+            } else {
+                data.neg_inf_count_reg
+            };
+            add_to_count(state, reg, weight)?;
+            add_to_count(state, data.non_null_count_reg, weight)?;
+            add_to_count(state, data.non_int_count_reg, weight)?;
+        }
         NumericArg::Float(f) => {
-            if !(f.is_infinite() && ivm_sum_count_infinity(state, data, f, weight)?) {
-                let mut acc = state.registers[data.float_sum_reg].get_value().clone();
-                let r_err = state.registers[data.float_err_reg]
-                    .get_value()
-                    .to_float_or_zero();
-                let mut sum_state = SumAggState {
-                    r_err,
-                    ..Default::default()
-                };
-                apply_kbn_step(&mut acc, f * weight as f64, &mut sum_state);
-                state.registers[data.float_sum_reg].set_value(acc);
-                state.registers[data.float_err_reg].set_value(Value::from_f64(sum_state.r_err));
-            }
+            let mut sum = DyadicSum::from_blob(ivm_exact_sum_blob(state, data.exact_sum_reg)?)?;
+            sum.add(f, weight);
+            state.registers[data.exact_sum_reg].set_value(sum.to_value()?);
             add_to_count(state, data.non_null_count_reg, weight)?;
             add_to_count(state, data.non_int_count_reg, weight)?;
         }
@@ -8147,39 +8149,16 @@ fn ivm_sum_apply(state: &mut ProgramState, data: &crate::vdbe::insn::IvmSumData)
     Ok(())
 }
 
-/// Add `weight` to the count of live +Infinity or -Infinity contributions.
-/// Returns false, leaving the state alone, for a retraction the count cannot
-/// cover: the Infinity was added to `float_sum` by a state row written before
-/// these counts existed, so it must be retracted from there.
-fn ivm_sum_count_infinity(
-    state: &mut ProgramState,
-    data: &crate::vdbe::insn::IvmSumData,
-    infinity: f64,
-    weight: i64,
-) -> Result<bool> {
-    let reg = if infinity > 0.0 {
-        data.pos_inf_count_reg
-    } else {
-        data.neg_inf_count_reg
-    };
-    let count = ivm_sum_infinity_count(state, reg)?
-        .checked_add(weight)
-        .or_overflow()?;
-    if count < 0 {
-        return Ok(false);
-    }
-    state.registers[reg].set_int(count);
-    Ok(true)
-}
-
-/// A state row written before the infinity counts existed has no value in
-/// their slots, and cannot have counted any infinity.
-fn ivm_sum_infinity_count(state: &ProgramState, reg: usize) -> Result<i64> {
+/// The exact-sum slot of a SUM/TOTAL/AVG state row. A state row written
+/// before the sum was exact holds a REAL there instead.
+fn ivm_exact_sum_blob(state: &ProgramState, reg: usize) -> Result<&[u8]> {
     match state.registers[reg].get_value() {
-        Value::Null => Ok(0),
-        value => value.as_int().ok_or_else(|| {
-            LimboError::InternalError("IVM sum: infinity count register is not an integer".into())
-        }),
+        Value::Blob(blob) => Ok(blob),
+        _ => Err(LimboError::InternalError(
+            "a materialized view's SUM/TOTAL/AVG state was written by an older version; \
+             run REFRESH MATERIALIZED VIEW on it"
+                .to_string(),
+        )),
     }
 }
 
@@ -8225,22 +8204,18 @@ pub fn op_ivm_sum_finalize(
     };
     let wrapped = int_of(data.int_wrapped_reg, "int_wrapped")?;
     let wrap_count = int_of(data.int_wrap_count_reg, "int_wrap_count")?;
-    let float_sum = state.registers[data.float_sum_reg].get_value().clone();
-    let float_err = state.registers[data.float_err_reg]
-        .get_value()
-        .to_float_or_zero();
+    let exact_sum = DyadicSum::from_blob(ivm_exact_sum_blob(state, data.exact_sum_reg)?)?;
     let non_int_count = int_of(data.non_int_count_reg, "non_int_count")?;
     let non_null_count = int_of(data.non_null_count_reg, "non_null_count")?;
-    let pos_inf_count = ivm_sum_infinity_count(state, data.pos_inf_count_reg)?;
-    let neg_inf_count = ivm_sum_infinity_count(state, data.neg_inf_count_reg)?;
+    let pos_inf_count = int_of(data.pos_inf_count_reg, "pos_inf_count")?;
+    let neg_inf_count = int_of(data.neg_inf_count_reg, "neg_inf_count")?;
 
     let result = finalize_ivm_sum(
         data.kind,
         IvmSumTotals {
             wrapped,
             wrap_count,
-            float_sum,
-            float_err,
+            exact_sum,
             non_int_count,
             non_null_count,
             pos_inf_count,
@@ -8252,16 +8227,11 @@ pub fn op_ivm_sum_finalize(
     Ok(InsnFunctionStepResult::Step)
 }
 
-/// `2^64`, used to convert an exact-integer total that overflowed i64
-/// (`wrapped + wrap_count * 2^64`) into an approximate REAL.
-const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
-
 /// The values of every field of `IvmSumData`'s state, read from its registers.
 struct IvmSumTotals {
     wrapped: i64,
     wrap_count: i64,
-    float_sum: Value,
-    float_err: f64,
+    exact_sum: DyadicSum,
     non_int_count: i64,
     non_null_count: i64,
     pos_inf_count: i64,
@@ -8269,7 +8239,7 @@ struct IvmSumTotals {
 }
 
 /// Compute SUM, TOTAL, or AVG's current result from IVM's linear state: an
-/// exact integer total, a floating-point total, and two row counts. Unlike
+/// exact integer total, an exact REAL total, and row counts. Unlike
 /// the shared window-function/regular-aggregate implementation this mirrors,
 /// every field here is a pure function of the view's current rows, so the
 /// result always matches a fresh evaluation of the defining SELECT. See
@@ -8280,8 +8250,7 @@ fn finalize_ivm_sum(kind: IvmSumKind, totals: IvmSumTotals) -> Result<Value> {
     let IvmSumTotals {
         wrapped,
         wrap_count,
-        float_sum,
-        float_err,
+        mut exact_sum,
         non_int_count,
         non_null_count,
         pos_inf_count,
@@ -8302,40 +8271,16 @@ fn finalize_ivm_sum(kind: IvmSumKind, totals: IvmSumTotals) -> Result<Value> {
         }
         return Ok(Value::from_i64(wrapped));
     }
-    let mut acc = float_sum;
-    let mut sum_state = SumAggState {
-        r_err: float_err,
-        ..Default::default()
-    };
-    if wrap_count == 0 {
-        if wrapped != 0 {
-            apply_kbn_step_int(&mut acc, wrapped, &mut sum_state);
+    let total = match (pos_inf_count > 0, neg_inf_count > 0) {
+        // "the result is NULL", matching sum()'s documented NaN rule.
+        (true, true) => return Ok(Value::Null),
+        (true, false) => f64::INFINITY,
+        (false, true) => f64::NEG_INFINITY,
+        (false, false) => {
+            exact_sum.add_integer((num_bigint::BigInt::from(wrap_count) << 64) + wrapped);
+            exact_sum.to_f64()
         }
-    } else {
-        // The exact integer total overflowed i64, but a non-integer
-        // contribution already forces a REAL result, so approximate it
-        // instead of erroring (see the module doc comment above).
-        let approx = wrap_count as f64 * TWO_POW_64 + wrapped as f64;
-        apply_kbn_step(&mut acc, approx, &mut sum_state);
-    }
-    if matches!(acc, Value::Null) {
-        return Ok(Value::Null);
-    }
-    let infinities = if pos_inf_count > 0 {
-        f64::INFINITY
-    } else {
-        0.0
-    } + if neg_inf_count > 0 {
-        f64::NEG_INFINITY
-    } else {
-        0.0
     };
-    let total = acc.to_float_or_zero() + sum_state.r_err + infinities;
-    // +Infinity and -Infinity both appear: "the result is NULL", matching
-    // sum()'s documented NaN rule.
-    if total.is_nan() {
-        return Ok(Value::Null);
-    }
     Ok(match kind {
         IvmSumKind::Sum | IvmSumKind::Total => Value::from_f64(total),
         IvmSumKind::Avg => Value::from_f64(total / non_null_count as f64),
