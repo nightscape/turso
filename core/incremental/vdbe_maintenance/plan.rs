@@ -10,7 +10,8 @@ use crate::sync::Arc;
 use crate::translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq};
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
-    expr_contains_nondeterministic_scalar_function, expr_references_any_subquery, WalkControl,
+    expr_contains_function_that_changes_between_statements, expr_references_any_subquery,
+    WalkControl,
 };
 use crate::translate::optimizer::unnest::rewrite_correlated_subqueries;
 use crate::translate::optimizer::{optimize_plan, Optimizable};
@@ -1734,12 +1735,13 @@ fn validate_planned_node(
 }
 
 /// Whether `expr` can give a different value in a later statement than it gave
-/// when a row was added to the view: a non-deterministic function, or
-/// `CURRENT_DATE`, `CURRENT_TIME` or `CURRENT_TIMESTAMP`. Those literals are
-/// fixed within one statement, so the shared helper treats them as
-/// deterministic, but a view keeps its rows across statements.
+/// when a row was added to the view: a non-deterministic function, a date
+/// and time function that reads the clock, or `CURRENT_DATE`, `CURRENT_TIME`
+/// or `CURRENT_TIMESTAMP`. Those literals are fixed within one statement, so
+/// the shared helper treats them as deterministic, but a view keeps its rows
+/// across statements.
 fn changes_between_statements(expr: &ast::Expr, resolver: &Resolver) -> Result<bool> {
-    if expr_contains_nondeterministic_scalar_function(expr, resolver)? {
+    if expr_contains_function_that_changes_between_statements(expr, resolver)? {
         return Ok(true);
     }
     let mut found = false;

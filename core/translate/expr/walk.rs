@@ -286,7 +286,25 @@ pub fn expr_contains_nondeterministic_scalar_function(
     expr: &ast::Expr,
     resolver: &Resolver<'_>,
 ) -> Result<bool> {
-    expr_contains_function(expr, resolver, is_nondeterministic_scalar_like_function)
+    expr_contains_function(expr, resolver, |func, _| {
+        is_nondeterministic_scalar_like_function(func)
+    })
+}
+
+/// Returns true if this expression calls a function that can give a different
+/// value in a later statement for the same arguments.
+///
+/// Unlike [expr_contains_nondeterministic_scalar_function], a date and time
+/// call counts only when it reads the clock or the local timezone, as in
+/// SQLite's rules for indexes and generated columns.
+pub fn expr_contains_function_that_changes_between_statements(
+    expr: &ast::Expr,
+    resolver: &Resolver<'_>,
+) -> Result<bool> {
+    expr_contains_function(expr, resolver, |func, args| {
+        is_nondeterministic_scalar_like_function(func)
+            && !crate::schema::is_deterministic_schema_function_call(func, args)
+    })
 }
 
 /// Returns true if this expression calls a scalar function that can give a
@@ -299,7 +317,7 @@ pub fn expr_contains_function_that_changes_within_statement(
     expr: &ast::Expr,
     resolver: &Resolver<'_>,
 ) -> Result<bool> {
-    expr_contains_function(expr, resolver, |func| {
+    expr_contains_function(expr, resolver, |func, _| {
         is_nondeterministic_scalar_like_function(func)
             && !matches!(func, Func::Scalar(f) if f.is_date_time_function())
     })
@@ -330,7 +348,7 @@ fn is_nondeterministic_scalar_like_function(func: &Func) -> bool {
 fn expr_contains_function(
     expr: &ast::Expr,
     resolver: &Resolver<'_>,
-    matches_function: impl Fn(&Func) -> bool,
+    matches_function: impl Fn(&Func, &[Box<ast::Expr>]) -> bool,
 ) -> Result<bool> {
     let mut found = false;
     crate::util::walk_expr_with_subqueries(expr, &mut |e| -> Result<WalkControl> {
@@ -338,18 +356,19 @@ fn expr_contains_function(
             return Ok(WalkControl::SkipChildren);
         }
 
-        let func = match e {
-            ast::Expr::FunctionCall { name, args, .. } => {
-                resolver.resolve_function(name.as_str(), args.len())?
-            }
+        let (func, args) = match e {
+            ast::Expr::FunctionCall { name, args, .. } => (
+                resolver.resolve_function(name.as_str(), args.len())?,
+                args.as_slice(),
+            ),
             ast::Expr::FunctionCallStar { name, .. } => {
-                resolver.resolve_function(name.as_str(), 0)?
+                (resolver.resolve_function(name.as_str(), 0)?, &[][..])
             }
-            _ => None,
+            _ => (None, &[][..]),
         };
 
         // If the name is unknown here, leave the error to the normal resolver.
-        if func.as_ref().is_some_and(&matches_function) {
+        if func.is_some_and(|func| matches_function(&func, args)) {
             found = true;
             return Ok(WalkControl::SkipChildren);
         }
