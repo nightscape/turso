@@ -252,3 +252,53 @@ fn same_value(a: &Value, b: &Value) -> bool {
         _ => a == b,
     }
 }
+
+/// A REAL sum must not keep rounding residue from rows that are gone: after
+/// 0.001, 1e20, 1e20 and 0.3 and the retraction of all but 0.001, sum() is
+/// 0.001 exactly.
+#[test]
+fn matview_real_sum_has_no_rounding_residue_after_retraction() {
+    let temp_dir = TempDir::new().unwrap();
+    let db = open(&temp_dir.path().join("real_sum_residue.db"));
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, x)")
+        .unwrap();
+    let views = [
+        (
+            "v_grouped",
+            "SELECT g, sum(x) AS s, total(x) AS t, avg(x) AS a, count(x) AS c FROM t GROUP BY g",
+            "g",
+        ),
+        (
+            "v_scalar",
+            "SELECT sum(x) AS s, total(x) AS t, avg(x) AS a FROM t",
+            "1",
+        ),
+    ];
+    for (name, select, _) in views {
+        conn.execute(format!("CREATE MATERIALIZED VIEW {name} AS {select}"))
+            .unwrap();
+    }
+    let writes = [
+        "INSERT INTO t VALUES (1, 1, 0.001), (2, 1, 1e20), (3, 1, 1e20), (4, 1, 0.3)",
+        "DELETE FROM t WHERE id = 4",
+        "DELETE FROM t WHERE id IN (2, 3)",
+        "INSERT INTO t VALUES (5, 2, 0.3), (6, 2, 1e-17), (7, 2, 0.2), (8, 2, 0.7), (9, 2, 1e20)",
+        "UPDATE t SET x = NULL WHERE id = 9",
+        "DELETE FROM t WHERE id = 8",
+        "UPDATE t SET x = NULL WHERE id IN (6, 7)",
+        "INSERT INTO t VALUES (10, 3, 7), (11, 3, 0.001), (12, 3, 1e16), (13, 3, 1e-17), (14, 3, 123.456)",
+        "DELETE FROM t WHERE id IN (12, 13)",
+        "UPDATE t SET g = 1 WHERE id = 14",
+        "DELETE FROM t WHERE id = 14",
+    ];
+    for (step, write) in writes.iter().enumerate() {
+        conn.execute(write).unwrap();
+        let context = || format!("after write {step}: {}", writes[..=step].join(";\n"));
+        for (name, select, order) in views {
+            let view = limbo_exec_rows(&conn, &format!("SELECT * FROM {name} ORDER BY {order}"));
+            let recompute = limbo_exec_rows(&conn, &format!("{select} ORDER BY {order}"));
+            assert_same_rows(&view, &recompute, &format!("{name} vs recompute"), &context);
+        }
+    }
+}
