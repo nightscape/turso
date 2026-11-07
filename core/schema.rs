@@ -4,7 +4,8 @@ use crate::alloc::*;
 use crate::function::{Deterministic, Func, ScalarFunc};
 use crate::incremental::view::IncrementalView;
 use crate::incremental::view::{
-    create_dbsp_state_index, dbsp_version_marker_table_name, DBSP_CIRCUIT_VERSION,
+    create_dbsp_state_index, dbsp_version_is_compatible, dbsp_version_marker_table_name,
+    DBSP_CIRCUIT_VERSION,
 };
 use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::namespace::{demangle_name, mangle_name, NamespaceId};
@@ -2542,23 +2543,35 @@ impl Schema {
         objects.incremental_views.get(&name).cloned()
     }
 
-    /// Whether the view has its current storage marker and no hidden operator
+    /// Whether the view has a compatible storage marker and no hidden operator
     /// storage from an incompatible version.
     pub fn has_compatible_materialized_view_storage(
         &self,
         namespace: NamespaceId,
         view_name: &str,
     ) -> bool {
-        let objects = self.namespace(namespace);
         let view_name = normalize_ident(view_name);
-        objects
-            .tables
-            .contains_key(&dbsp_version_marker_table_name(&view_name))
+        self.dbsp_storage_version(namespace, &view_name).is_some()
             && !self.dbsp_storage_version_mismatch(namespace, &view_name)
     }
 
+    /// The compatible storage version whose marker the view has.
+    pub(crate) fn dbsp_storage_version(
+        &self,
+        namespace: NamespaceId,
+        view_name: &str,
+    ) -> Option<u32> {
+        let objects = self.namespace(namespace);
+        let view_name = normalize_ident(view_name);
+        [DBSP_CIRCUIT_VERSION, 2].into_iter().find(|&version| {
+            objects
+                .tables
+                .contains_key(&dbsp_version_marker_table_name(version, &view_name))
+        })
+    }
+
     /// True when a metadata marker or operator table for this view exists
-    /// under a different storage version than the current one.
+    /// under a storage version this code does not maintain.
     pub(crate) fn dbsp_storage_version_mismatch(
         &self,
         namespace: NamespaceId,
@@ -2574,7 +2587,7 @@ impl Schema {
                 return stored_view_name == view_name
                     && version_str
                         .parse::<u32>()
-                        .is_ok_and(|version| version != DBSP_CIRCUIT_VERSION);
+                        .is_ok_and(|version| !dbsp_version_is_compatible(version));
             }
             table_name
                 .strip_prefix(DBSP_TABLE_PREFIX)
@@ -2587,7 +2600,7 @@ impl Schema {
                     crate::incremental::view::state_key_belongs_to_view(name, &view_name)
                         && version_str
                             .parse::<u32>()
-                            .is_ok_and(|v| v != DBSP_CIRCUIT_VERSION)
+                            .is_ok_and(|v| !dbsp_version_is_compatible(v))
                 })
         })
     }
@@ -4310,7 +4323,7 @@ impl Schema {
                             // wire the view up for live maintenance.
                             if let Ok(stored_version) = version_str.parse::<u32>() {
                                 dbsp_state_roots.insert(view_name.to_string(), root_page);
-                                if stored_version != DBSP_CIRCUIT_VERSION {
+                                if !dbsp_version_is_compatible(stored_version) {
                                     tracing::warn!(
                                         "Skipping materialized view '{}' - has version {} but current version is {}. DROP and recreate the view to use it.",
                                         view_name,
@@ -9416,7 +9429,7 @@ mod tests {
         let mut schema = Schema::new();
         assert!(!schema.has_compatible_materialized_view_storage(NamespaceId::ROOT, "stateless"));
 
-        let old_version = DBSP_CIRCUIT_VERSION - 1;
+        let old_version = 1;
         let other_view_marker = format!("{DBSP_METADATA_TABLE_PREFIX}{old_version}_stateless__n1");
         add_marker(&mut schema, &other_view_marker, 2)?;
         assert!(
@@ -9424,7 +9437,7 @@ mod tests {
             "a similarly prefixed view must not own this view's version marker"
         );
 
-        let current_marker = dbsp_version_marker_table_name("stateless");
+        let current_marker = dbsp_version_marker_table_name(DBSP_CIRCUIT_VERSION, "stateless");
         add_marker(&mut schema, &current_marker, 3)?;
         assert!(schema.has_compatible_materialized_view_storage(NamespaceId::ROOT, "stateless"));
 

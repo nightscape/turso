@@ -1,5 +1,7 @@
 use super::output::{DeltaSource, EmittedNodeOutput, NodeOutput, NodeOutputContract};
-use super::stream::{base_arrangement, open_ephemeral_delta, DeltaIdentity, EphemeralDelta};
+use super::stream::{
+    base_arrangement, open_ephemeral_delta, DeltaIdentity, EphemeralDelta, StoredIndex,
+};
 use super::MaintenanceInput;
 use crate::incremental::dag;
 use crate::namespace::NamespaceId;
@@ -26,8 +28,14 @@ pub(super) fn scan_node_output(
         .then(|| table.columns().len());
     let mut arrangement = base_arrangement(table.clone(), stored_weight_column);
     if stored_weight_column.is_none() {
-        arrangement =
-            arrangement.with_stored_indexes(schema.get_indices(NamespaceId::ROOT, &table.name));
+        arrangement = arrangement.with_stored_indexes(
+            schema
+                .get_indices(NamespaceId::ROOT, &table.name)
+                .map(|index| StoredIndex {
+                    index: index.clone(),
+                    column: index.columns[0].pos_in_table,
+                }),
+        );
     }
     EmittedNodeOutput::new(
         node_id,

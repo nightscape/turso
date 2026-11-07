@@ -25,7 +25,7 @@ use super::source::{materialize_node_output, scan_node_output};
 use super::stream::{
     btree_arrangement, emit_ephemeral_delta_row, emit_operator_rowid_delta, open_ephemeral_delta,
     scratch_table, ArrangementHandle, ArrangementIdentityColumn, DeltaIdentity, EphemeralDelta,
-    ProbeIndex,
+    ProbeIndex, StoredIndex,
 };
 use super::{emit_node, MaintenanceInput};
 use crate::incremental::dag;
@@ -234,13 +234,18 @@ pub(super) fn emit_fixpoint(
     )
 }
 
+/// The column of a recursive CTE's rows that holds the CTE column the
+/// recursive arm's join compares, converted with the comparison's affinity.
+pub(super) const PROBE_KEY_COLUMN: &str = "probe_key";
+
 /// The hidden table of a fixpoint: `(key.., values.., round)`, with an index
-/// on the key and, when the recursive arm's join compares a CTE column, an
-/// index on that column.
+/// on the key. When the recursive arm's join compares a CTE column, the table
+/// ends with [`PROBE_KEY_COLUMN`] and has an index on it.
 struct RowsTable {
     table: Arc<BTreeTable>,
     index: Arc<Index>,
-    probe_index: Option<Arc<Index>>,
+    /// The index on [`PROBE_KEY_COLUMN`] and the CTE column it converts.
+    probe: Option<(Arc<Index>, usize)>,
     key_width: usize,
     /// The number of CTE columns.
     width: usize,
@@ -257,6 +262,10 @@ impl RowsTable {
             .ok_or_else(|| {
                 LimboError::InternalError(format!("recursive CTE table {table_name} not found"))
             })?;
+        let columns = table.columns();
+        let has_probe_key =
+            columns.last().and_then(|column| column.name.as_deref()) == Some(PROBE_KEY_COLUMN);
+        let probe_key_pos = columns.len() - 1;
         let (key_indexes, probe_indexes): (Vec<_>, Vec<_>) = schema
             .get_indices(NamespaceId::ROOT, table_name)
             .cloned()
@@ -267,16 +276,45 @@ impl RowsTable {
                 indexes.len()
             ))
         })?;
-        turso_assert!(
-            probe_indexes.len() <= 1,
-            "a recursive CTE table has at most one probe index"
-        );
+        let probe_index = match <[Arc<Index>; 1]>::try_from(probe_indexes) {
+            Ok([probe_index])
+                if has_probe_key && probe_index.columns[0].pos_in_table == probe_key_pos =>
+            {
+                Some(probe_index)
+            }
+            Err(indexes) if indexes.is_empty() && !has_probe_key => None,
+            Ok(_) | Err(_) => {
+                return Err(LimboError::InternalError(format!(
+                    "recursive CTE table {table_name} must have one index on {PROBE_KEY_COLUMN} \
+                     exactly when it has that column"
+                )))
+            }
+        };
         let width = plan.dag().output_schema(node_id).len();
-        let key_width = table.columns().len() - width - 1;
+        let key_width = columns.len() - width - 1 - usize::from(has_probe_key);
+        let probe = probe_index
+            .map(|probe_index| {
+                let dag::OpNode::Fixpoint {
+                    inputs: [_, step],
+                    body_start,
+                } = plan.dag().nodes[node_id]
+                else {
+                    unreachable!("RowsTable::open is called for a fixpoint");
+                };
+                let (column, _) = recursive_probe_column(plan.dag(), body_start..=step)
+                    .ok_or_else(|| {
+                        LimboError::InternalError(format!(
+                            "recursive CTE table {table_name} has {PROBE_KEY_COLUMN}, but the \
+                             recursive arm's join compares no CTE column"
+                        ))
+                    })?;
+                Ok::<_, LimboError>((probe_index, column))
+            })
+            .transpose()?;
         Ok(Self {
             table,
             index,
-            probe_index: probe_indexes.into_iter().next(),
+            probe,
             key_width,
             width,
         })
@@ -293,7 +331,10 @@ impl RowsTable {
             (self.key_width..=self.key_width + self.width).collect(),
             None,
         )
-        .with_stored_indexes(self.probe_index.iter())
+        .with_stored_indexes(self.probe.iter().map(|(index, column)| StoredIndex {
+            index: index.clone(),
+            column: *column,
+        }))
     }
 }
 
@@ -779,7 +820,8 @@ fn emit_round_merge(
     changes: &EphemeralDelta,
 ) -> Result<()> {
     let key_width = rows.key_width;
-    let row_width = key_width + rows.width + 1;
+    let round_width = key_width + rows.width + 1;
+    let row_width = round_width + usize::from(rows.probe.is_some());
     turso_assert!(
         round.identity_width() == key_width
             && round.width == rows.width + 1
@@ -799,14 +841,14 @@ fn emit_round_merge(
         root_page: RegisterOrLiteral::Literal(rows.index.root_page),
         db: 0,
     });
-    let probe = rows.probe_index.as_ref().map(|index| {
+    let probe = rows.probe.as_ref().map(|(index, column)| {
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
         program.emit_insn(Insn::OpenWrite {
             cursor_id,
             root_page: RegisterOrLiteral::Literal(index.root_page),
             db: 0,
         });
-        (index.clone(), cursor_id)
+        (index.clone(), cursor_id, *column)
     });
     let retracted_cursor = program.alloc_cursor_id(CursorType::BTreeTable(Arc::new(
         scratch_table(&format!("{view_name}_retracted"), 1)?,
@@ -816,10 +858,11 @@ fn emit_round_merge(
         is_table: true,
     });
 
-    // [key.., values.., round]: the record of the row in `R`.
+    // [key.., values.., round, probe key?]: the record of the row in `R`.
     let row_start = program.alloc_registers(row_width);
     let values_start = row_start + key_width;
     let row_round_reg = values_start + rows.width;
+    let probe_key_reg = row_round_reg + 1;
     // [key.., round, rowid]: the index entry.
     let entry_start = program.alloc_registers(key_width + 2);
     let entry_round_reg = entry_start + key_width;
@@ -839,7 +882,7 @@ fn emit_round_merge(
     let end_label = program.allocate_label();
 
     let read_row = |program: &mut ProgramBuilder| {
-        for column in 0..row_width {
+        for column in 0..round_width {
             program.emit_insn(Insn::Column {
                 cursor_id: round.cursor_id,
                 column,
@@ -854,6 +897,21 @@ fn emit_round_merge(
             flags: CmpInsFlags::default(),
             collation: CollationSeq::for_internal_values(),
         });
+        if let Some((_, _, column)) = &probe {
+            program.emit_insn(Insn::Copy {
+                src_reg: values_start + column,
+                dst_reg: probe_key_reg,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::Affinity {
+                start_reg: probe_key_reg,
+                count: std::num::NonZeroUsize::MIN,
+                affinities: rows.table.columns()[round_width]
+                    .affinity()
+                    .aff_mask()
+                    .to_string(),
+            });
+        }
         program.emit_insn(Insn::MakeRecord {
             start_reg: to_u32(row_start),
             count: to_u32(row_width),
@@ -872,23 +930,13 @@ fn emit_round_merge(
             extra_amount: 0,
         });
     };
-    // [probed value, rowid]: the probe index entry of the row in the registers.
+    // [probe key, rowid]: the probe index entry of the row in the registers.
     let probe_entry_start = program.alloc_registers(2);
     let probe_entry = |program: &mut ProgramBuilder| {
-        let (index, _) = probe.as_ref().expect("the round has a probe index");
-        let column = index.columns[0].pos_in_table;
         program.emit_insn(Insn::Copy {
-            src_reg: row_start + column,
+            src_reg: probe_key_reg,
             dst_reg: probe_entry_start,
             extra_amount: 0,
-        });
-        program.emit_insn(Insn::Affinity {
-            start_reg: probe_entry_start,
-            count: std::num::NonZeroUsize::MIN,
-            affinities: rows.table.columns()[column]
-                .affinity()
-                .aff_mask()
-                .to_string(),
         });
         program.emit_insn(Insn::Copy {
             src_reg: rowid_reg,
@@ -897,7 +945,7 @@ fn emit_round_merge(
         });
     };
     let emit_probe_insert = |program: &mut ProgramBuilder| {
-        let Some((index, cursor_id)) = &probe else {
+        let Some((index, cursor_id, _)) = &probe else {
             return;
         };
         probe_entry(program);
@@ -1013,7 +1061,7 @@ fn emit_round_merge(
         flag: InsertFlags::new().is_ephemeral_table_insert(),
         table_name: String::new(),
     });
-    if let Some((_, cursor_id)) = &probe {
+    if let Some((_, cursor_id, _)) = &probe {
         probe_entry(program);
         program.emit_insn(Insn::IdxDelete {
             start_reg: probe_entry_start,

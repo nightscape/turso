@@ -100,7 +100,15 @@ pub(super) struct ArrangementHandle {
     probe_index: Option<ProbeIndex>,
     /// Indexes on one column each that every writer of the btree keeps in
     /// step with it; a join seeks one of them before it builds a probe index.
-    stored_indexes: Arc<[Arc<Index>]>,
+    stored_indexes: Arc<[StoredIndex]>,
+}
+
+/// An index whose first column holds the value of the arrangement's value
+/// column `column`, kept in step with the btree by every writer.
+#[derive(Debug, Clone)]
+pub(super) struct StoredIndex {
+    pub(super) index: Arc<Index>,
+    pub(super) column: usize,
 }
 
 /// An index on `(column, rowid)` of a btree that does not change while the
@@ -158,24 +166,20 @@ impl ArrangementHandle {
         }
     }
 
-    pub(super) fn stored_indexes(&self) -> &[Arc<Index>] {
+    pub(super) fn stored_indexes(&self) -> &[StoredIndex] {
         &self.stored_indexes
     }
 
     /// Keeps the indexes a join can seek: a plain column first, no WHERE and
     /// no index method.
-    pub(super) fn with_stored_indexes<'a>(
-        self,
-        indexes: impl Iterator<Item = &'a Arc<Index>>,
-    ) -> Self {
+    pub(super) fn with_stored_indexes(self, indexes: impl Iterator<Item = StoredIndex>) -> Self {
         Self {
             stored_indexes: indexes
-                .filter(|index| {
-                    index.where_clause.is_none()
-                        && index.index_method.is_none()
-                        && index.columns[0].expr.is_none()
+                .filter(|stored| {
+                    stored.index.where_clause.is_none()
+                        && stored.index.index_method.is_none()
+                        && stored.index.columns[0].expr.is_none()
                 })
-                .cloned()
                 .collect(),
             ..self
         }

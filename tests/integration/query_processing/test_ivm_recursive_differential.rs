@@ -7,9 +7,12 @@
 //! statement each view is compared, as a multiset, with its SELECT run fresh
 //! on Turso and on an in-memory SQLite database that receives the same
 //! statements. Every scenario runs once without and once with indexes on the
-//! join columns, so the views' joins both scan and seek. At the end, each view
-//! must stay equal across REFRESH, VACUUM and one more edit, must be equal
-//! when created again over the final data, and DROP must leave no storage.
+//! join columns, so the views' joins both scan and seek. Each seed declares
+//! `node`'s join columns with one of several type pairs, so a join can convert
+//! a CTE value to a value that differs from the stored one. At the end, each
+//! view must stay equal across REFRESH, VACUUM, REINDEX and edits after them,
+//! must be equal when created again over the final data, and DROP must leave no
+//! storage; `PRAGMA integrity_check` must be ok before REFRESH and after REINDEX.
 //!
 //! A failing scenario is shrunk to a short statement list. `SEED=<n>` runs
 //! one seed.
@@ -142,8 +145,60 @@ const SHAPES: &[Shape] = &[
     },
 ];
 
-const SCHEMA: &[&str] = &[
-    "CREATE TABLE node(id INTEGER PRIMARY KEY, parent INTEGER, label TEXT)",
+struct NodeSchema {
+    create: &'static str,
+    /// Write ids as text literals, so a column without affinity stores text.
+    text_ids: bool,
+    /// Turso's SELECT gives SQLite's rows. With a TEXT `parent` it does not:
+    /// it compares a recursive CTE's column without SQLite's affinity. Then
+    /// the oracle is the fresh Turso SELECT alone.
+    sqlite_oracle: bool,
+}
+
+impl NodeSchema {
+    fn id(&self, id: i64) -> String {
+        if self.text_ids {
+            format!("'{id}'")
+        } else {
+            id.to_string()
+        }
+    }
+}
+
+const NODE_SCHEMAS: &[NodeSchema] = &[
+    NodeSchema {
+        create: "CREATE TABLE node(id INTEGER PRIMARY KEY, parent INTEGER, label TEXT)",
+        text_ids: false,
+        sqlite_oracle: true,
+    },
+    NodeSchema {
+        create: "CREATE TABLE node(id TEXT, parent INTEGER, label TEXT)",
+        text_ids: false,
+        sqlite_oracle: true,
+    },
+    NodeSchema {
+        create: "CREATE TABLE node(id INTEGER, parent TEXT, label TEXT)",
+        text_ids: false,
+        sqlite_oracle: false,
+    },
+    NodeSchema {
+        create: "CREATE TABLE node(id NUMERIC, parent TEXT, label TEXT)",
+        text_ids: true,
+        sqlite_oracle: false,
+    },
+    NodeSchema {
+        create: "CREATE TABLE node(id, parent INTEGER, label TEXT)",
+        text_ids: true,
+        sqlite_oracle: true,
+    },
+    NodeSchema {
+        create: "CREATE TABLE node(id BLOB, parent INTEGER, label TEXT)",
+        text_ids: true,
+        sqlite_oracle: true,
+    },
+];
+
+const OTHER_TABLES: &[&str] = &[
     "CREATE TABLE tag(block_id INTEGER, tag TEXT)",
     "CREATE TABLE focus(watch_key TEXT, context_id INTEGER, kind TEXT)",
 ];
@@ -158,52 +213,93 @@ const INDEXES: &[&str] = &[
 
 #[test]
 fn recursive_views_match_recompute_for_random_tree_edits() {
+    for (name, schema, statements) in fixed_examples() {
+        for indexed in [false, true] {
+            if let Some(failure) = run_scenario(schema, &statements, indexed) {
+                panic!("fixed example {name}, indexed {indexed}: {failure}");
+            }
+        }
+    }
     let seeds: Vec<u64> = match std::env::var("SEED") {
         Ok(seed) => vec![seed.parse().expect("SEED must be a u64")],
         Err(_) => (0..40).collect(),
     };
     for seed in seeds {
-        let statements = random_scenario(seed, 80);
+        let schema = &NODE_SCHEMAS[seed as usize % NODE_SCHEMAS.len()];
+        let statements = random_scenario(schema, seed, 80);
         for indexed in [false, true] {
-            if let Some(failure) = run_scenario(&statements, indexed) {
-                let shrunk = shrink(statements.clone(), indexed);
+            if let Some(failure) = run_scenario(schema, &statements, indexed) {
+                let shrunk = shrink(schema, statements.clone(), indexed);
                 panic!(
-                    "seed {seed}, indexed {indexed}: {failure}\nshrunk statements:\n{}\nshrunk failure: {}",
+                    "seed {seed}, `{}`, indexed {indexed}: {failure}\nshrunk statements:\n{}\nshrunk failure: {}",
+                    schema.create,
                     shrunk.join(";\n"),
-                    run_scenario(&shrunk, indexed).unwrap()
+                    run_scenario(schema, &shrunk, indexed).unwrap()
                 );
             }
         }
     }
 }
 
-#[test]
-fn moving_a_block_under_its_own_descendant_empties_its_subtree() {
-    let statements: Vec<String> = [
-        "INSERT INTO node VALUES (1, NULL, 'a')",
-        "INSERT INTO node VALUES (2, 1, 'a')",
-        "INSERT INTO node VALUES (3, 2, 'b')",
-        "INSERT INTO focus VALUES ('k', 1, 'root')",
-        "UPDATE node SET parent = 3 WHERE id = 2",
-        "UPDATE node SET parent = 1 WHERE id = 2",
-        "UPDATE node SET parent = 2 WHERE id = 2",
-        "UPDATE node SET parent = 1 WHERE id = 2",
-        "BEGIN",
-        "UPDATE node SET parent = 3 WHERE id = 2",
-        "UPDATE node SET label = 'c' WHERE id = 3",
-        "ROLLBACK",
-    ]
-    .map(String::from)
-    .to_vec();
-    for indexed in [false, true] {
-        assert_eq!(run_scenario(&statements, indexed), None);
-    }
+/// Cases worth keeping, run before the random scenarios.
+fn fixed_examples() -> Vec<(&'static str, &'static NodeSchema, Vec<String>)> {
+    let text_id = &NODE_SCHEMAS[1];
+    let cases: [(&str, &NodeSchema, &[&str]); 3] = [
+        (
+            "moving a block under its own descendant empties its subtree",
+            &NODE_SCHEMAS[0],
+            &[
+                "INSERT INTO node VALUES (1, NULL, 'a')",
+                "INSERT INTO node VALUES (2, 1, 'a')",
+                "INSERT INTO node VALUES (3, 2, 'b')",
+                "INSERT INTO focus VALUES ('k', 1, 'root')",
+                "UPDATE node SET parent = 3 WHERE id = 2",
+                "UPDATE node SET parent = 1 WHERE id = 2",
+                "UPDATE node SET parent = 2 WHERE id = 2",
+                "UPDATE node SET parent = 1 WHERE id = 2",
+                "BEGIN",
+                "UPDATE node SET parent = 3 WHERE id = 2",
+                "UPDATE node SET label = 'c' WHERE id = 3",
+                "ROLLBACK",
+            ],
+        ),
+        // The CTE rows hold TEXT ids; the join compares them as INTEGER.
+        (
+            "an index rebuild keeps the converted join key of the CTE rows",
+            text_id,
+            &[
+                "INSERT INTO node VALUES ('1', NULL, 'a')",
+                "INSERT INTO node VALUES ('2', 1, 'b')",
+                "REINDEX",
+                "INSERT INTO node VALUES ('3', 1, 'b')",
+                "DELETE FROM node WHERE id = '2'",
+            ],
+        ),
+        (
+            "the index of converted join keys matches the CTE rows",
+            text_id,
+            &[
+                "INSERT INTO node VALUES ('1', NULL, 'a')",
+                "INSERT INTO node VALUES ('2', 1, 'b')",
+            ],
+        ),
+    ];
+    cases
+        .into_iter()
+        .map(|(name, schema, statements)| {
+            (
+                name,
+                schema,
+                statements.iter().map(|s| s.to_string()).collect(),
+            )
+        })
+        .collect()
 }
 
-fn random_scenario(seed: u64, length: usize) -> Vec<String> {
+fn random_scenario(schema: &NodeSchema, seed: u64, length: usize) -> Vec<String> {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
-    for sql in SCHEMA {
+    for sql in std::iter::once(&schema.create).chain(OTHER_TABLES) {
         sqlite.execute(sql, ()).unwrap();
     }
     let mut statements = Vec::new();
@@ -216,11 +312,14 @@ fn random_scenario(seed: u64, length: usize) -> Vec<String> {
         let parent = if id == 1 || rng.random_bool(0.2) {
             "NULL".to_string()
         } else {
-            rng.random_range(1..id).to_string()
+            schema.id(rng.random_range(1..id))
         };
         let label = if rng.random_bool(0.4) { "a" } else { "b" };
         push(
-            format!("INSERT INTO node VALUES ({id}, {parent}, '{label}')"),
+            format!(
+                "INSERT INTO node VALUES ({}, {parent}, '{label}')",
+                schema.id(id)
+            ),
             &mut statements,
         );
     }
@@ -233,25 +332,25 @@ fn random_scenario(seed: u64, length: usize) -> Vec<String> {
     let mut has_savepoint = false;
     while statements.len() < length {
         let ids: Vec<i64> = sqlite
-            .prepare("SELECT id FROM node ORDER BY id")
+            .prepare("SELECT CAST(id AS INTEGER) FROM node ORDER BY 1")
             .unwrap()
             .query_map((), |row| row.get(0))
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        let pick = |rng: &mut ChaCha8Rng| -> i64 {
-            if ids.is_empty() {
+        let pick = |rng: &mut ChaCha8Rng| -> String {
+            schema.id(if ids.is_empty() {
                 1
             } else {
                 ids[rng.random_range(0..ids.len())]
-            }
+            })
         };
-        let sql = match rng.random_range(0..100) {
+        let sql = match rng.random_range(0..102) {
             0..=14 => {
                 let id = next_id;
                 next_id += 1;
                 let parent = pick(&mut rng);
-                format!("INSERT INTO node VALUES ({id}, {parent}, 'b')")
+                format!("INSERT INTO node VALUES ({}, {parent}, 'b')", schema.id(id))
             }
             15..=21 => format!("DELETE FROM node WHERE id = {}", pick(&mut rng)),
             22..=33 => format!(
@@ -286,7 +385,7 @@ fn random_scenario(seed: u64, length: usize) -> Vec<String> {
                 let watch_key = if rng.random_bool(0.5) {
                     format!("k{}", rng.random_range(1..3))
                 } else {
-                    pick(&mut rng).to_string()
+                    pick(&mut rng).trim_matches('\'').to_string()
                 };
                 format!(
                     "INSERT INTO focus VALUES ('{watch_key}', {}, 'root')",
@@ -319,6 +418,7 @@ fn random_scenario(seed: u64, length: usize) -> Vec<String> {
                     "ROLLBACK".to_string()
                 }
             }
+            100..=101 => "REINDEX".to_string(),
             _ => continue,
         };
         push(sql, &mut statements);
@@ -330,7 +430,7 @@ fn random_scenario(seed: u64, length: usize) -> Vec<String> {
 }
 
 /// Run `statements` against SQLite and Turso; return the first disagreement.
-fn run_scenario(statements: &[String], indexed: bool) -> Option<String> {
+fn run_scenario(schema: &NodeSchema, statements: &[String], indexed: bool) -> Option<String> {
     let temp_dir = TempDir::new().unwrap();
     let path = temp_dir.path().join("recursive_differential.db");
     let db = TempDatabase::builder()
@@ -340,7 +440,10 @@ fn run_scenario(statements: &[String], indexed: bool) -> Option<String> {
     let conn = db.connect_limbo();
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
     let indexes = if indexed { INDEXES } else { &[] };
-    for sql in SCHEMA.iter().chain(indexes) {
+    for sql in std::iter::once(&schema.create)
+        .chain(OTHER_TABLES)
+        .chain(indexes)
+    {
         conn.execute(sql).unwrap();
         sqlite.execute(sql, ()).unwrap();
     }
@@ -359,11 +462,11 @@ fn run_scenario(statements: &[String], indexed: bool) -> Option<String> {
         if let Err(e) = conn.execute(sql) {
             return Some(format!("{at}: Turso failed where SQLite succeeded: {e}"));
         }
-        if let Some(failure) = compare_views(&db, &conn, &sqlite, "v_", &at) {
+        if let Some(failure) = compare_views(schema, &db, &conn, &sqlite, "v_", &at) {
             return Some(failure);
         }
     }
-    if let Some(failure) = storage_round_trip(&db, &conn, &sqlite) {
+    if let Some(failure) = storage_round_trip(schema, &db, &conn, &sqlite) {
         return Some(failure);
     }
     for shape in SHAPES {
@@ -374,6 +477,7 @@ fn run_scenario(statements: &[String], indexed: bool) -> Option<String> {
         .unwrap();
     }
     if let Some(failure) = compare_views(
+        schema,
         &db,
         &conn,
         &sqlite,
@@ -396,37 +500,83 @@ fn run_scenario(statements: &[String], indexed: bool) -> Option<String> {
     (!left.is_empty()).then(|| format!("DROP VIEW left storage behind: {left:?}"))
 }
 
-/// The views stay equal to their SELECT across REFRESH, VACUUM and an edit
-/// after them, and the database stays consistent.
+/// The views stay equal to their SELECT across REFRESH, VACUUM, REINDEX and
+/// edits after them, and the database stays consistent.
 fn storage_round_trip(
+    schema: &NodeSchema,
     db: &TempDatabase,
     conn: &Arc<turso_core::Connection>,
     sqlite: &rusqlite::Connection,
 ) -> Option<String> {
+    if let Some(failure) = integrity_check(conn, "before REFRESH") {
+        return Some(failure);
+    }
     for shape in SHAPES {
         conn.execute(format!("REFRESH MATERIALIZED VIEW v_{}", shape.name))
             .unwrap();
     }
-    if let Some(failure) = compare_views(db, conn, sqlite, "v_", "after REFRESH") {
+    if let Some(failure) = compare_views(schema, db, conn, sqlite, "v_", "after REFRESH") {
         return Some(failure);
     }
     conn.execute("VACUUM").unwrap();
-    if let Some(failure) = compare_views(db, conn, sqlite, "v_", "after VACUUM") {
+    if let Some(failure) = compare_views(schema, db, conn, sqlite, "v_", "after VACUUM") {
         return Some(failure);
     }
     let edit =
         "UPDATE node SET parent = (SELECT min(id) FROM node) WHERE id = (SELECT max(id) FROM node)";
-    sqlite.execute_batch(edit).unwrap();
-    conn.execute(edit).unwrap();
-    if let Some(failure) = compare_views(db, conn, sqlite, "v_", "after an edit after VACUUM") {
+    if let Some(failure) = edit_and_compare(schema, db, conn, sqlite, edit, "after VACUUM") {
         return Some(failure);
     }
+    conn.execute("REINDEX").unwrap();
+    if let Some(failure) = integrity_check(conn, "after REINDEX") {
+        return Some(failure);
+    }
+    if let Some(failure) = compare_views(schema, db, conn, sqlite, "v_", "after REINDEX") {
+        return Some(failure);
+    }
+    let edits = [
+        format!(
+            "INSERT INTO node VALUES ({}, (SELECT min(id) FROM node), 'b')",
+            schema.id(1000)
+        ),
+        "DELETE FROM node WHERE id = (SELECT max(id) FROM node WHERE parent IS NOT NULL)"
+            .to_string(),
+    ];
+    edits
+        .iter()
+        .find_map(|edit| edit_and_compare(schema, db, conn, sqlite, edit, "after REINDEX"))
+}
+
+fn edit_and_compare(
+    schema: &NodeSchema,
+    db: &TempDatabase,
+    conn: &Arc<turso_core::Connection>,
+    sqlite: &rusqlite::Connection,
+    edit: &str,
+    after: &str,
+) -> Option<String> {
+    sqlite.execute_batch(edit).unwrap();
+    if let Err(e) = conn.execute(edit) {
+        return Some(format!("{after}: `{edit}` failed: {e}"));
+    }
+    compare_views(
+        schema,
+        db,
+        conn,
+        sqlite,
+        "v_",
+        &format!("{after}, then `{edit}`"),
+    )
+}
+
+fn integrity_check(conn: &Arc<turso_core::Connection>, at: &str) -> Option<String> {
     let check = limbo_exec_rows(conn, "PRAGMA integrity_check");
     (check != vec![vec![Value::Text("ok".to_string())]])
-        .then(|| format!("integrity_check: {check:?}"))
+        .then(|| format!("integrity_check {at}: {check:?}"))
 }
 
 fn compare_views(
+    schema: &NodeSchema,
     db: &TempDatabase,
     conn: &Arc<turso_core::Connection>,
     sqlite: &rusqlite::Connection,
@@ -434,8 +584,12 @@ fn compare_views(
     at: &str,
 ) -> Option<String> {
     for shape in SHAPES {
-        let expected = sorted(sqlite_rows(sqlite, shape.select));
         let fresh = sorted(limbo_exec_rows(conn, shape.select));
+        let expected = if schema.sqlite_oracle {
+            sorted(sqlite_rows(sqlite, shape.select))
+        } else {
+            fresh.clone()
+        };
         if fresh != expected {
             return Some(format!(
                 "{at}: fresh Turso SELECT of {} differs from SQLite\nturso:  {fresh:?}\nsqlite: {expected:?}",
@@ -457,14 +611,14 @@ fn compare_views(
     None
 }
 
-fn shrink(mut statements: Vec<String>, indexed: bool) -> Vec<String> {
+fn shrink(schema: &NodeSchema, mut statements: Vec<String>, indexed: bool) -> Vec<String> {
     let mut chunk = statements.len() / 2;
     while chunk >= 1 {
         let mut start = 0;
         while start < statements.len() {
             let mut candidate = statements.clone();
             candidate.drain(start..(start + chunk).min(candidate.len()));
-            if run_scenario(&candidate, indexed).is_some() {
+            if run_scenario(schema, &candidate, indexed).is_some() {
                 statements = candidate;
             } else {
                 start += chunk;

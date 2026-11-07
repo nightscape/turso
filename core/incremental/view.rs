@@ -17,12 +17,20 @@ use turso_parser::{
 /// Version of the materialized-view storage format embedded in every hidden
 /// table name. Version 1 is the interpreter layout released on `main`;
 /// version 2 is the VDBE-maintained operator-DAG layout developed on this
-/// branch. Bump this only after a layout has shipped or been shared.
-pub const DBSP_CIRCUIT_VERSION: u32 = 2;
+/// branch. Version 3 adds, to a recursive CTE whose join seeks its rows, a
+/// column with the converted join key and an index on it. A view without such
+/// a column is still created as version 2, so an older reader keeps it. Bump
+/// this only after a layout has shipped or been shared.
+pub const DBSP_CIRCUIT_VERSION: u32 = 3;
 
-pub(crate) fn dbsp_version_marker_table_name(view_name: &str) -> String {
+/// Whether this code maintains views stored with `version`.
+pub(crate) fn dbsp_version_is_compatible(version: u32) -> bool {
+    matches!(version, 2 | DBSP_CIRCUIT_VERSION)
+}
+
+pub(crate) fn dbsp_version_marker_table_name(version: u32, view_name: &str) -> String {
     format!(
-        "{}{DBSP_CIRCUIT_VERSION}_{view_name}",
+        "{}{version}_{view_name}",
         crate::schema::DBSP_METADATA_TABLE_PREFIX
     )
 }

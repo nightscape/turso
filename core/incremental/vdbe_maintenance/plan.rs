@@ -1425,14 +1425,35 @@ pub(crate) fn plan_view(
         connection,
     )?;
     let dag = build_dag_from_plan(&relational_plan, window, resolver)?;
-    let operator_states = plan_operator_states(view_name, &dag, resolver)?;
+    let version = resolver
+        .schema()
+        .dbsp_storage_version(crate::namespace::NamespaceId::ROOT, view_name)
+        .unwrap_or_else(|| {
+            if seeks_recursive_rows(&dag) {
+                crate::incremental::view::DBSP_CIRCUIT_VERSION
+            } else {
+                2
+            }
+        });
+    let operator_states = plan_operator_states(view_name, version, &dag, resolver)?;
     let output_arity = dag.root_schema().len();
-    let version_marker = version_marker_table(view_name);
+    let version_marker = version_marker_table(version, view_name);
     Ok(MaintenancePlan {
         dag,
         operator_states,
         output_arity,
         version_marker,
+    })
+}
+
+/// Whether a recursive CTE's join seeks the CTE's rows: such a view needs
+/// storage version 3.
+fn seeks_recursive_rows(dag: &dag::MaintenanceDag) -> bool {
+    dag.nodes.iter().any(|node| match node {
+        dag::OpNode::Fixpoint { inputs, body_start } => {
+            super::fixpoint::recursive_probe_column(dag, *body_start..=inputs[1]).is_some()
+        }
+        _ => false,
     })
 }
 
@@ -1481,8 +1502,8 @@ fn unnest_select_subqueries(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
     Ok(())
 }
 
-fn version_marker_table(view_name: &str) -> HiddenTableDef {
-    let table_name = crate::incremental::view::dbsp_version_marker_table_name(view_name);
+fn version_marker_table(version: u32, view_name: &str) -> HiddenTableDef {
+    let table_name = crate::incremental::view::dbsp_version_marker_table_name(version, view_name);
     let table_ident = crate::util::quote_identifier(&table_name);
     HiddenTableDef {
         create_sql: format!("CREATE TABLE {table_ident} (version INTEGER)"),
@@ -2012,11 +2033,10 @@ fn node_requires_output_arrangement(
 /// storage selection depends only on node and edge contracts.
 fn plan_operator_states(
     view_name: &str,
+    version: u32,
     dag: &dag::MaintenanceDag,
     resolver: &Resolver,
 ) -> Result<OperatorStateCatalog> {
-    use crate::incremental::view::DBSP_CIRCUIT_VERSION;
-
     let mut catalog = OperatorStateCatalog {
         nodes: Vec::with_capacity(dag.nodes.len()),
     };
@@ -2027,7 +2047,7 @@ fn plan_operator_states(
         let needs_state = node_requires_primary_state(dag, node_id);
         let state_table = if needs_state {
             let table_name = format!(
-                "{}{DBSP_CIRCUIT_VERSION}_{view_name}__n{node_id}",
+                "{}{version}_{view_name}__n{node_id}",
                 crate::schema::DBSP_TABLE_PREFIX,
             );
             let (create_sql, index) = match node {
@@ -2037,13 +2057,19 @@ fn plan_operator_states(
                     let key_width = 1 + identity_width(inputs[0]).max(identity_width(inputs[1]));
                     let width = dag.output_schema(node_id).len();
                     let probe =
-                        super::fixpoint::recursive_probe_column(dag, *body_start..=inputs[1]);
+                        super::fixpoint::recursive_probe_column(dag, *body_start..=inputs[1])
+                            .filter(|_| version == crate::incremental::view::DBSP_CIRCUIT_VERSION);
                     if let Some((column, _)) = probe {
                         turso_assert!(column < width, "a recursive CTE join seeks a CTE column");
                     }
                     (
-                        fixpoint_table_sql(&table_name, key_width, width, probe),
-                        probe.map(|(column, _)| fixpoint_probe_index(&table_name, column)),
+                        fixpoint_table_sql(
+                            &table_name,
+                            key_width,
+                            width,
+                            probe.map(|(_, affinity)| affinity),
+                        ),
+                        probe.map(|_| fixpoint_probe_index(&table_name)),
                     )
                 }
                 _ => (
@@ -2067,6 +2093,7 @@ fn plan_operator_states(
         };
         let auxiliary_tables = plan_auxiliary_tables(
             view_name,
+            version,
             node_id,
             node,
             dag.output_schema(node_id).len(),
@@ -2076,7 +2103,7 @@ fn plan_operator_states(
             if node_requires_output_arrangement(dag, node_id, output.emitted_identity) {
                 let identity_width = output.emitted_identity.width();
                 let table_name = format!(
-                    "{}{DBSP_CIRCUIT_VERSION}_{view_name}__n{node_id}",
+                    "{}{version}_{view_name}__n{node_id}",
                     crate::schema::DBSP_ARRANGEMENT_TABLE_PREFIX,
                 );
                 Some(HiddenTableDef {
@@ -2125,16 +2152,15 @@ fn plan_operator_states(
 
 fn plan_auxiliary_tables(
     view_name: &str,
+    version: u32,
     node_id: dag::NodeId,
     node: &dag::OpNode,
     output_width: usize,
     binding_rowids: &[bool],
 ) -> Vec<AuxiliaryTableDef> {
-    use crate::incremental::view::DBSP_CIRCUIT_VERSION;
-
     let table_name = |suffix: &str| {
         format!(
-            "{}{DBSP_CIRCUIT_VERSION}_{view_name}__n{node_id}{suffix}",
+            "{}{version}_{view_name}__n{node_id}{suffix}",
             crate::schema::DBSP_MULTISET_TABLE_PREFIX,
         )
     };
@@ -2397,31 +2423,33 @@ fn state_table_sql(
 /// tag (0 for seed rows, 1 for recursive rows) and the identity of the
 /// row's derivation, padded with zeros. The primary key is the key and the
 /// round, because an operator rowid freed in one round can name another row
-/// in a different round of the same statement. The column `probe` names has
-/// the affinity of its probe index's entries; the rows keep the CTE values.
+/// in a different round of the same statement. With `probe_key`, the last
+/// column holds the value of the CTE column the recursive arm's join compares,
+/// converted with the affinity the comparison applies.
 fn fixpoint_table_sql(
     table_name: &str,
     key_width: usize,
     value_width: usize,
-    probe: Option<(usize, Affinity)>,
+    probe_key: Option<Affinity>,
 ) -> String {
     let table_ident = crate::util::quote_identifier(table_name);
     let key = (0..key_width).map(|i| format!("k{i}")).collect::<Vec<_>>();
-    let column_type = |i: usize| match probe {
-        Some((column, affinity)) if column == i => match affinity {
-            Affinity::Integer => " INTEGER",
-            Affinity::Text => " TEXT",
-            Affinity::Real => " REAL",
-            Affinity::Numeric => " NUMERIC",
-            Affinity::Blob | Affinity::None => " BLOB",
-        },
-        _ => "",
-    };
+    let probe_key = probe_key.map(|affinity| {
+        let column_type = match affinity {
+            Affinity::Integer => "INTEGER",
+            Affinity::Text => "TEXT",
+            Affinity::Real => "REAL",
+            Affinity::Numeric => "NUMERIC",
+            Affinity::Blob | Affinity::None => "BLOB",
+        };
+        format!("{} {column_type}", super::fixpoint::PROBE_KEY_COLUMN)
+    });
     let columns = key
         .iter()
         .cloned()
-        .chain((0..value_width).map(|i| format!("c{i}{}", column_type(i))))
+        .chain((0..value_width).map(|i| format!("c{i}")))
         .chain(std::iter::once("round".to_string()))
+        .chain(probe_key)
         .collect::<Vec<_>>();
     format!(
         "CREATE TABLE {table_ident} ({}, PRIMARY KEY ({}, round))",
@@ -2430,17 +2458,16 @@ fn fixpoint_table_sql(
     )
 }
 
-/// The index on the column of a recursive CTE's rows that the recursive arm's
-/// join compares, so a change of the arm's base tables seeks the rows.
-/// `column` is a CTE column; [`fixpoint_table_sql`] names it `c{column}`.
-fn fixpoint_probe_index(table_name: &str, column: usize) -> HiddenIndexDef {
+/// The index on the converted join key of a recursive CTE's rows, so a
+/// change of the arm's base tables seeks the rows.
+fn fixpoint_probe_index(table_name: &str) -> HiddenIndexDef {
     let name = format!("{table_name}__probe");
     HiddenIndexDef {
         create_sql: format!(
-            "CREATE INDEX {} ON {}(c{})",
+            "CREATE INDEX {} ON {}({})",
             crate::util::quote_identifier(&name),
             crate::util::quote_identifier(table_name),
-            column
+            super::fixpoint::PROBE_KEY_COLUMN
         ),
         name,
     }

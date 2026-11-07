@@ -609,13 +609,13 @@ fn index_probe(
             let context = ExprContext::new(Some(table_references), resolver);
             let affinity = comparison_affinity(lhs.as_ref(), rhs.as_ref(), &context);
             let collation = comparison_collation(lhs, rhs, &context)?;
-            let physical_column = arrangement.value_columns()[*column];
-            let stored = arrangement.stored_indexes().iter().find(|index| {
-                index.columns[0].pos_in_table == physical_column
-                    && index.columns[0].collation == collation
+            let stored = arrangement.stored_indexes().iter().find(|stored| {
+                let index_column = &stored.index.columns[0];
+                stored.column == *column
+                    && index_column.collation == collation
                     && stored_index_affinity_ok(
                         table_column.affinity(),
-                        arrangement.table().columns()[physical_column].affinity(),
+                        arrangement.table().columns()[index_column.pos_in_table].affinity(),
                         affinity,
                     )
             });
@@ -623,7 +623,7 @@ fn index_probe(
                 continue;
             }
             let target = match (stored, arrangement.probe_index()) {
-                (Some(index), _) => ProbeTarget::Stored(index.clone()),
+                (Some(stored), _) => ProbeTarget::Stored(stored.index.clone()),
                 (None, Some(probe_index))
                     if probe_index.column == *column && collation == table_column.collation() =>
                 {
