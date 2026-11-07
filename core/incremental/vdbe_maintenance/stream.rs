@@ -1,6 +1,6 @@
 use crate::alloc::{TursoIteratorExt, TursoVecExt};
 use crate::incremental::dag;
-use crate::schema::{BTreeCharacteristics, BTreeTable, Column};
+use crate::schema::{BTreeCharacteristics, BTreeTable, Column, Index};
 use crate::sync::Arc;
 use crate::turso_assert;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
@@ -98,6 +98,9 @@ pub(super) struct ArrangementHandle {
     /// Set when joins may build an index on this btree and seek it instead of
     /// scanning the btree.
     probe_index: Option<ProbeIndex>,
+    /// Indexes on one column each that every writer of the btree keeps in
+    /// step with it; a join seeks one of them before it builds a probe index.
+    stored_indexes: Arc<[Arc<Index>]>,
 }
 
 /// An index on `(column, rowid)` of a btree that does not change while the
@@ -154,6 +157,29 @@ impl ArrangementHandle {
             ..self
         }
     }
+
+    pub(super) fn stored_indexes(&self) -> &[Arc<Index>] {
+        &self.stored_indexes
+    }
+
+    /// Keeps the indexes a join can seek: a plain column first, no WHERE and
+    /// no index method.
+    pub(super) fn with_stored_indexes<'a>(
+        self,
+        indexes: impl Iterator<Item = &'a Arc<Index>>,
+    ) -> Self {
+        Self {
+            stored_indexes: indexes
+                .filter(|index| {
+                    index.where_clause.is_none()
+                        && index.index_method.is_none()
+                        && index.columns[0].expr.is_none()
+                })
+                .cloned()
+                .collect(),
+            ..self
+        }
+    }
 }
 
 pub(super) fn btree_arrangement(
@@ -176,6 +202,7 @@ pub(super) fn btree_arrangement(
         value_columns: value_columns.into(),
         count_column,
         probe_index: None,
+        stored_indexes: Arc::new([]),
     }
 }
 

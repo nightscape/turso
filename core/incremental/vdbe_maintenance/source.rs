@@ -24,13 +24,18 @@ pub(super) fn scan_node_output(
     let stored_weight_column = schema
         .is_materialized_view(NamespaceId::ROOT, &table.name)
         .then(|| table.columns().len());
+    let mut arrangement = base_arrangement(table.clone(), stored_weight_column);
+    if stored_weight_column.is_none() {
+        arrangement =
+            arrangement.with_stored_indexes(schema.get_indices(NamespaceId::ROOT, &table.name));
+    }
     EmittedNodeOutput::new(
         node_id,
         DeltaSource::BaseTable {
             table: table.clone(),
             stored_weight_column,
         },
-        Some(base_arrangement(table.clone(), stored_weight_column)),
+        Some(arrangement),
         contract,
     )
 }
