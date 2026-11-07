@@ -1632,12 +1632,17 @@ mod tests {
     fn join_insert_costs(
         n: usize,
         with_view: bool,
+        indexed: bool,
     ) -> (Vec<std::time::Duration>, Vec<std::time::Duration>) {
-        let conn = open(&format!("bench-join-{n}-{with_view}.db"));
+        let conn = open(&format!("bench-join-{n}-{with_view}-{indexed}.db"));
         conn.execute("CREATE TABLE a(id INTEGER PRIMARY KEY, k INTEGER, v TEXT)")
             .unwrap();
         conn.execute("CREATE TABLE b(id INTEGER PRIMARY KEY, k INTEGER, w TEXT)")
             .unwrap();
+        if indexed {
+            conn.execute("CREATE INDEX a_k ON a(k)").unwrap();
+            conn.execute("CREATE INDEX b_k ON b(k)").unwrap();
+        }
         const SELECT: &str = "SELECT a.id AS aid, b.id AS bid, a.v, b.w FROM a JOIN b ON a.k = b.k";
         if with_view {
             conn.execute(format!("CREATE MATERIALIZED VIEW ab AS {SELECT}"))
@@ -1680,12 +1685,20 @@ mod tests {
          SELECT * FROM paths";
 
     /// Ten roots; every later row gets a random parent among the earlier rows of depth < 8.
-    fn recursive_insert_costs(n: usize, with_view: bool) -> Vec<std::time::Duration> {
-        let conn = open(&format!("bench-recursive-{n}-{with_view}.db"));
+    fn recursive_insert_costs(
+        n: usize,
+        with_view: bool,
+        indexed: bool,
+    ) -> Vec<std::time::Duration> {
+        let conn = open(&format!("bench-recursive-{n}-{with_view}-{indexed}.db"));
         conn.execute(
             "CREATE TABLE blocks(id INTEGER PRIMARY KEY, parent_id INTEGER, content TEXT)",
         )
         .unwrap();
+        if indexed {
+            conn.execute("CREATE INDEX blocks_parent ON blocks(parent_id)")
+                .unwrap();
+        }
         if with_view {
             conn.execute(format!(
                 "CREATE MATERIALIZED VIEW block_with_path AS {PATHS}"
@@ -1727,16 +1740,19 @@ mod tests {
     #[ignore = "timing of single-row inserts into views over growing tables"]
     fn single_row_insert_cost_by_table_size() {
         for n in bench_sizes() {
-            let (view_a, view_b) = join_insert_costs(n, true);
-            let (base_a, base_b) = join_insert_costs(n, false);
-            report("J into a", n, view_a, base_a);
-            report("J into b", n, view_b, base_b);
-            report(
-                "R",
-                n,
-                recursive_insert_costs(n, true),
-                recursive_insert_costs(n, false),
-            );
+            for indexed in [true, false] {
+                let suffix = if indexed { "+idx" } else { "" };
+                let (view_a, view_b) = join_insert_costs(n, true, indexed);
+                let (base_a, base_b) = join_insert_costs(n, false, indexed);
+                report(&format!("J a{suffix}"), n, view_a, base_a);
+                report(&format!("J b{suffix}"), n, view_b, base_b);
+                report(
+                    &format!("R{suffix}"),
+                    n,
+                    recursive_insert_costs(n, true, indexed),
+                    recursive_insert_costs(n, false, indexed),
+                );
+            }
         }
     }
 }
