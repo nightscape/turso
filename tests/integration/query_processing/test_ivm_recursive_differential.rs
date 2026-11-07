@@ -244,7 +244,7 @@ fn recursive_views_match_recompute_for_random_tree_edits() {
 /// Cases worth keeping, run before the random scenarios.
 fn fixed_examples() -> Vec<(&'static str, &'static NodeSchema, Vec<String>)> {
     let text_id = &NODE_SCHEMAS[1];
-    let cases: [(&str, &NodeSchema, &[&str]); 3] = [
+    let cases: [(&str, &NodeSchema, &[&str]); 4] = [
         (
             "moving a block under its own descendant empties its subtree",
             &NODE_SCHEMAS[0],
@@ -281,6 +281,17 @@ fn fixed_examples() -> Vec<(&'static str, &'static NodeSchema, Vec<String>)> {
             &[
                 "INSERT INTO node VALUES ('1', NULL, 'a')",
                 "INSERT INTO node VALUES ('2', 1, 'b')",
+            ],
+        ),
+        (
+            "deleting one of two ids with the same join key keeps the other's children",
+            text_id,
+            &[
+                "INSERT INTO node VALUES ('1', NULL, 'a')",
+                "INSERT INTO node VALUES ('01', NULL, 'a')",
+                "INSERT INTO focus VALUES ('k', 1, 'root')",
+                "DELETE FROM node WHERE id = '01'",
+                "INSERT INTO node VALUES ('c', 1, 'b')",
             ],
         ),
     ];
