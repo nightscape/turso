@@ -6,7 +6,10 @@
 //! inside and outside transactions with ROLLBACK and ROLLBACK TO. After every
 //! statement each view is compared, as a multiset, with its SELECT run fresh
 //! on Turso and on an in-memory SQLite database that receives the same
-//! statements. At the end, each view is created again over the final data.
+//! statements. Every scenario runs once without and once with indexes on the
+//! join columns, so the views' joins both scan and seek. At the end, each view
+//! must stay equal across REFRESH, VACUUM and one more edit, must be equal
+//! when created again over the final data, and DROP must leave no storage.
 //!
 //! A failing scenario is shrunk to a short statement list. `SEED=<n>` runs
 //! one seed.
@@ -101,6 +104,35 @@ const SHAPES: &[Shape] = &[
              SELECT src, node_id, depth FROM w WHERE depth >= 1",
     },
     Shape {
+        name: "block_with_path",
+        select: "WITH RECURSIVE paths AS ( \
+             SELECT id, parent, label, '/' || id AS path FROM node WHERE parent IS NULL \
+             UNION ALL \
+             SELECT b.id, b.parent, b.label, p.path || '/' || b.id \
+             FROM node b JOIN paths p ON b.parent = p.id) \
+             SELECT * FROM paths",
+    },
+    Shape {
+        name: "siblings",
+        select: "SELECT a.id AS aid, b.id AS bid, a.label, b.label AS blabel \
+             FROM node a JOIN node b ON a.parent = b.parent",
+    },
+    Shape {
+        name: "tagged",
+        select: "SELECT n.id, n.label, t.tag FROM node n JOIN tag t ON t.block_id = n.id",
+    },
+    // The NOCASE comparison does not fit the BINARY index on tag(tag).
+    Shape {
+        name: "nocase",
+        select: "SELECT n.id, t.tag FROM node n JOIN tag t ON t.tag = n.label COLLATE NOCASE",
+    },
+    // The comparison applies NUMERIC affinity to the TEXT column watch_key,
+    // so its index does not fit; the INTEGER index on node(parent) does.
+    Shape {
+        name: "affinity",
+        select: "SELECT n.id, f.watch_key FROM node n JOIN focus f ON f.watch_key = n.parent",
+    },
+    Shape {
         name: "depth",
         select: "WITH RECURSIVE d(id, depth) AS ( \
              SELECT id, 0 FROM node WHERE parent IS NULL \
@@ -116,6 +148,14 @@ const SCHEMA: &[&str] = &[
     "CREATE TABLE focus(watch_key TEXT, context_id INTEGER, kind TEXT)",
 ];
 
+const INDEXES: &[&str] = &[
+    "CREATE INDEX node_parent ON node(parent)",
+    "CREATE INDEX node_label ON node(label)",
+    "CREATE INDEX tag_block ON tag(block_id)",
+    "CREATE INDEX tag_tag ON tag(tag)",
+    "CREATE INDEX focus_key ON focus(watch_key)",
+];
+
 #[test]
 fn recursive_views_match_recompute_for_random_tree_edits() {
     let seeds: Vec<u64> = match std::env::var("SEED") {
@@ -124,13 +164,15 @@ fn recursive_views_match_recompute_for_random_tree_edits() {
     };
     for seed in seeds {
         let statements = random_scenario(seed, 80);
-        if let Some(failure) = run_scenario(&statements) {
-            let shrunk = shrink(statements);
-            panic!(
-                "seed {seed}: {failure}\nshrunk statements:\n{}\nshrunk failure: {}",
-                shrunk.join(";\n"),
-                run_scenario(&shrunk).unwrap()
-            );
+        for indexed in [false, true] {
+            if let Some(failure) = run_scenario(&statements, indexed) {
+                let shrunk = shrink(statements.clone(), indexed);
+                panic!(
+                    "seed {seed}, indexed {indexed}: {failure}\nshrunk statements:\n{}\nshrunk failure: {}",
+                    shrunk.join(";\n"),
+                    run_scenario(&shrunk, indexed).unwrap()
+                );
+            }
         }
     }
 }
@@ -153,7 +195,9 @@ fn moving_a_block_under_its_own_descendant_empties_its_subtree() {
     ]
     .map(String::from)
     .to_vec();
-    assert_eq!(run_scenario(&statements), None);
+    for indexed in [false, true] {
+        assert_eq!(run_scenario(&statements, indexed), None);
+    }
 }
 
 fn random_scenario(seed: u64, length: usize) -> Vec<String> {
@@ -229,16 +273,26 @@ fn random_scenario(seed: u64, length: usize) -> Vec<String> {
                 pick(&mut rng),
                 pick(&mut rng)
             ),
-            64..=69 => format!("INSERT INTO tag VALUES ({}, 'Page')", pick(&mut rng)),
+            64..=69 => format!(
+                "INSERT INTO tag VALUES ({}, '{}')",
+                pick(&mut rng),
+                ["Page", "Page", "a", "A"][rng.random_range(0..4)]
+            ),
             70..=73 => format!(
                 "DELETE FROM tag WHERE rowid = (SELECT min(rowid) FROM tag WHERE block_id = {})",
                 pick(&mut rng)
             ),
-            74..=77 => format!(
-                "INSERT INTO focus VALUES ('k{}', {}, 'root')",
-                rng.random_range(1..3),
-                pick(&mut rng)
-            ),
+            74..=77 => {
+                let watch_key = if rng.random_bool(0.5) {
+                    format!("k{}", rng.random_range(1..3))
+                } else {
+                    pick(&mut rng).to_string()
+                };
+                format!(
+                    "INSERT INTO focus VALUES ('{watch_key}', {}, 'root')",
+                    pick(&mut rng)
+                )
+            }
             78..=79 => format!("DELETE FROM focus WHERE context_id = {}", pick(&mut rng)),
             80..=85 if !in_transaction => {
                 in_transaction = true;
@@ -276,7 +330,7 @@ fn random_scenario(seed: u64, length: usize) -> Vec<String> {
 }
 
 /// Run `statements` against SQLite and Turso; return the first disagreement.
-fn run_scenario(statements: &[String]) -> Option<String> {
+fn run_scenario(statements: &[String], indexed: bool) -> Option<String> {
     let temp_dir = TempDir::new().unwrap();
     let path = temp_dir.path().join("recursive_differential.db");
     let db = TempDatabase::builder()
@@ -285,7 +339,8 @@ fn run_scenario(statements: &[String]) -> Option<String> {
         .build();
     let conn = db.connect_limbo();
     let sqlite = rusqlite::Connection::open_in_memory().unwrap();
-    for sql in SCHEMA {
+    let indexes = if indexed { INDEXES } else { &[] };
+    for sql in SCHEMA.iter().chain(indexes) {
         conn.execute(sql).unwrap();
         sqlite.execute(sql, ()).unwrap();
     }
@@ -308,6 +363,9 @@ fn run_scenario(statements: &[String]) -> Option<String> {
             return Some(failure);
         }
     }
+    if let Some(failure) = storage_round_trip(&db, &conn, &sqlite) {
+        return Some(failure);
+    }
     for shape in SHAPES {
         conn.execute(format!(
             "CREATE MATERIALIZED VIEW late_{} AS {}",
@@ -315,13 +373,57 @@ fn run_scenario(statements: &[String]) -> Option<String> {
         ))
         .unwrap();
     }
-    compare_views(
+    if let Some(failure) = compare_views(
         &db,
         &conn,
         &sqlite,
         "late_",
         "after creating the views last",
-    )
+    ) {
+        return Some(failure);
+    }
+    for shape in SHAPES {
+        for prefix in ["v_", "late_"] {
+            conn.execute(format!("DROP VIEW {prefix}{}", shape.name))
+                .unwrap();
+        }
+    }
+    let left = limbo_exec_rows(
+        &conn,
+        "SELECT type, name FROM sqlite_schema WHERE name LIKE '__turso_internal_dbsp%' \
+         OR tbl_name LIKE '__turso_internal_dbsp%'",
+    );
+    (!left.is_empty()).then(|| format!("DROP VIEW left storage behind: {left:?}"))
+}
+
+/// The views stay equal to their SELECT across REFRESH, VACUUM and an edit
+/// after them, and the database stays consistent.
+fn storage_round_trip(
+    db: &TempDatabase,
+    conn: &Arc<turso_core::Connection>,
+    sqlite: &rusqlite::Connection,
+) -> Option<String> {
+    for shape in SHAPES {
+        conn.execute(format!("REFRESH MATERIALIZED VIEW v_{}", shape.name))
+            .unwrap();
+    }
+    if let Some(failure) = compare_views(db, conn, sqlite, "v_", "after REFRESH") {
+        return Some(failure);
+    }
+    conn.execute("VACUUM").unwrap();
+    if let Some(failure) = compare_views(db, conn, sqlite, "v_", "after VACUUM") {
+        return Some(failure);
+    }
+    let edit =
+        "UPDATE node SET parent = (SELECT min(id) FROM node) WHERE id = (SELECT max(id) FROM node)";
+    sqlite.execute_batch(edit).unwrap();
+    conn.execute(edit).unwrap();
+    if let Some(failure) = compare_views(db, conn, sqlite, "v_", "after an edit after VACUUM") {
+        return Some(failure);
+    }
+    let check = limbo_exec_rows(conn, "PRAGMA integrity_check");
+    (check != vec![vec![Value::Text("ok".to_string())]])
+        .then(|| format!("integrity_check: {check:?}"))
 }
 
 fn compare_views(
@@ -355,14 +457,14 @@ fn compare_views(
     None
 }
 
-fn shrink(mut statements: Vec<String>) -> Vec<String> {
+fn shrink(mut statements: Vec<String>, indexed: bool) -> Vec<String> {
     let mut chunk = statements.len() / 2;
     while chunk >= 1 {
         let mut start = 0;
         while start < statements.len() {
             let mut candidate = statements.clone();
             candidate.drain(start..(start + chunk).min(candidate.len()));
-            if run_scenario(&candidate).is_some() {
+            if run_scenario(&candidate, indexed).is_some() {
                 statements = candidate;
             } else {
                 start += chunk;

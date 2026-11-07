@@ -1306,6 +1306,131 @@ mod tests {
         assert!(elapsed < std::time::Duration::from_secs(60));
     }
 
+    /// The root pages of the btrees that the maintenance program of `view`
+    /// scans from the start, and of the indexes it seeks.
+    fn maintenance_access(conn: &Arc<Connection>, view: &str) -> (Vec<i64>, Vec<i64>) {
+        use crate::vdbe::insn::{Insn, RegisterOrLiteral};
+        let schema = conn.schema.read();
+        let view_mutex = schema
+            .get_materialized_view(crate::namespace::NamespaceId::ROOT, view)
+            .unwrap();
+        let (select, root_page, num_view_columns) = {
+            let view = view_mutex.lock();
+            (
+                view.select_stmt.clone(),
+                view.get_root_page(),
+                view.column_schema.flat_columns().unwrap().len(),
+            )
+        };
+        let program = super::super::compile_maintenance_program(
+            view,
+            &select,
+            root_page,
+            num_view_columns,
+            super::super::MaintenanceInput::TransactionDelta,
+            &schema,
+            conn,
+        )
+        .unwrap();
+        let mut roots = std::collections::HashMap::new();
+        let (mut rewound, mut seeked) = (Vec::new(), Vec::new());
+        for (insn, _) in &program.prepared.insns {
+            match insn {
+                Insn::OpenRead {
+                    cursor_id,
+                    root_page,
+                    ..
+                }
+                | Insn::OpenWrite {
+                    cursor_id,
+                    root_page: RegisterOrLiteral::Literal(root_page),
+                    ..
+                } => {
+                    roots.insert(*cursor_id, *root_page);
+                }
+                Insn::Rewind { cursor_id, .. } => rewound.extend(roots.get(cursor_id)),
+                Insn::SeekGE {
+                    is_index: true,
+                    cursor_id,
+                    ..
+                } => seeked.extend(roots.get(cursor_id)),
+                _ => {}
+            }
+        }
+        (rewound, seeked)
+    }
+
+    fn root_page(conn: &Arc<Connection>, kind: &str, name_pattern: &str) -> i64 {
+        let found = rows(
+            conn,
+            &format!(
+                "SELECT rootpage FROM sqlite_schema WHERE type = '{kind}' AND name LIKE '{name_pattern}'"
+            ),
+        );
+        assert_eq!(found.len(), 1, "one {kind} named like {name_pattern}");
+        found[0][0].parse().unwrap()
+    }
+
+    #[test]
+    fn a_join_seeks_the_indexes_of_its_base_tables() {
+        let conn = open("join-seeks-indexes.db");
+        conn.execute("CREATE TABLE a(id INTEGER PRIMARY KEY, k INTEGER, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE b(id INTEGER PRIMARY KEY, k INTEGER, w TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX a_k ON a(k)").unwrap();
+        conn.execute("CREATE INDEX b_k ON b(k)").unwrap();
+        conn.execute(
+            "CREATE MATERIALIZED VIEW ab AS \
+             SELECT a.id AS aid, b.id AS bid, a.v, b.w FROM a JOIN b ON a.k = b.k",
+        )
+        .unwrap();
+        let (rewound, seeked) = maintenance_access(&conn, "ab");
+        for table in ["a", "b"] {
+            assert!(
+                !rewound.contains(&root_page(&conn, "table", table)),
+                "maintenance scans {table}"
+            );
+        }
+        for index in ["a_k", "b_k"] {
+            assert!(
+                seeked.contains(&root_page(&conn, "index", index)),
+                "maintenance does not seek {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_view_seeks_the_parent_index_and_its_cte_rows() {
+        let conn = open("path-view-seeks.db");
+        conn.execute(
+            "CREATE TABLE blocks(id INTEGER PRIMARY KEY, parent_id INTEGER, content TEXT)",
+        )
+        .unwrap();
+        conn.execute("CREATE INDEX blocks_parent ON blocks(parent_id)")
+            .unwrap();
+        conn.execute(format!(
+            "CREATE MATERIALIZED VIEW block_with_path AS {PATHS}"
+        ))
+        .unwrap();
+        let (rewound, seeked) = maintenance_access(&conn, "block_with_path");
+        let cte_rows = root_page(
+            &conn,
+            "table",
+            "__turso_internal_dbsp_state_v%_block_with_path__n%",
+        );
+        for (name, root) in [
+            ("blocks", root_page(&conn, "table", "blocks")),
+            ("the CTE rows", cte_rows),
+        ] {
+            assert!(!rewound.contains(&root), "maintenance scans {name}");
+        }
+        assert!(
+            seeked.contains(&root_page(&conn, "index", "blocks_parent")),
+            "maintenance does not seek blocks_parent"
+        );
+    }
+
     const MEASURED_INSERTS: usize = 200;
 
     struct XorShift(u64);
