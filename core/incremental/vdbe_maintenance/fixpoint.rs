@@ -1305,4 +1305,182 @@ mod tests {
         );
         assert!(elapsed < std::time::Duration::from_secs(60));
     }
+
+    const MEASURED_INSERTS: usize = 200;
+
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+    }
+
+    fn bench_sizes() -> Vec<usize> {
+        std::env::var("IVM_BENCH_SIZES")
+            .unwrap_or_else(|_| "1000,4000,16000".to_string())
+            .split(',')
+            .map(|n| n.parse().unwrap())
+            .collect()
+    }
+
+    fn insert_in_batches(conn: &Arc<Connection>, table: &str, rows: &[String]) {
+        for batch in rows.chunks(500) {
+            conn.execute(format!("INSERT INTO {table} VALUES {}", batch.join(",")))
+                .unwrap();
+        }
+    }
+
+    fn time_each(conn: &Arc<Connection>, statements: &[String]) -> Vec<std::time::Duration> {
+        statements
+            .iter()
+            .map(|sql| {
+                let started = std::time::Instant::now();
+                conn.execute(sql).unwrap();
+                started.elapsed()
+            })
+            .collect()
+    }
+
+    fn median_p90(mut samples: Vec<std::time::Duration>) -> String {
+        samples.sort();
+        let at =
+            |q: f64| samples[((samples.len() - 1) as f64 * q).round() as usize].as_secs_f64() * 1e3;
+        format!("{:9.3} {:9.3}", at(0.5), at(0.9))
+    }
+
+    fn sorted_rows(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<String>> {
+        let mut result = rows(conn, sql);
+        result.sort();
+        result
+    }
+
+    fn report(
+        scenario: &str,
+        n: usize,
+        view: Vec<std::time::Duration>,
+        base: Vec<std::time::Duration>,
+    ) {
+        eprintln!(
+            "IVM-BENCH {scenario:<8} N={n:<6} view median/p90 ms {}  no-view median/p90 ms {}",
+            median_p90(view),
+            median_p90(base)
+        );
+    }
+
+    /// Each table holds `n` rows with `k = id % (n / 4)`, so every key has four rows
+    /// per side and one new row joins four rows of the other side.
+    fn join_insert_costs(
+        n: usize,
+        with_view: bool,
+    ) -> (Vec<std::time::Duration>, Vec<std::time::Duration>) {
+        let conn = open(&format!("bench-join-{n}-{with_view}.db"));
+        conn.execute("CREATE TABLE a(id INTEGER PRIMARY KEY, k INTEGER, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE TABLE b(id INTEGER PRIMARY KEY, k INTEGER, w TEXT)")
+            .unwrap();
+        const SELECT: &str = "SELECT a.id AS aid, b.id AS bid, a.v, b.w FROM a JOIN b ON a.k = b.k";
+        if with_view {
+            conn.execute(format!("CREATE MATERIALIZED VIEW ab AS {SELECT}"))
+                .unwrap();
+        }
+        let keys = n / 4;
+        let fill = |prefix: &str| -> Vec<String> {
+            (1..=n)
+                .map(|id| format!("({id}, {}, '{prefix}{id}')", id % keys))
+                .collect()
+        };
+        insert_in_batches(&conn, "a", &fill("v"));
+        insert_in_batches(&conn, "b", &fill("w"));
+        let single = |table: &str, prefix: &str| -> Vec<String> {
+            (n + 1..=n + MEASURED_INSERTS)
+                .map(|id| {
+                    format!(
+                        "INSERT INTO {table} VALUES ({id}, {}, '{prefix}{id}')",
+                        id % keys
+                    )
+                })
+                .collect()
+        };
+        let into_a = time_each(&conn, &single("a", "v"));
+        let into_b = time_each(&conn, &single("b", "w"));
+        if with_view {
+            assert_eq!(
+                sorted_rows(&conn, "SELECT * FROM ab"),
+                sorted_rows(&conn, SELECT)
+            );
+        }
+        (into_a, into_b)
+    }
+
+    const PATHS: &str = "WITH RECURSIVE paths AS ( \
+           SELECT id, parent_id, content, '/' || id AS path FROM blocks WHERE parent_id IS NULL \
+           UNION ALL \
+           SELECT b.id, b.parent_id, b.content, p.path || '/' || b.id \
+           FROM blocks b JOIN paths p ON b.parent_id = p.id) \
+         SELECT * FROM paths";
+
+    /// Ten roots; every later row gets a random parent among the earlier rows of depth < 8.
+    fn recursive_insert_costs(n: usize, with_view: bool) -> Vec<std::time::Duration> {
+        let conn = open(&format!("bench-recursive-{n}-{with_view}.db"));
+        conn.execute(
+            "CREATE TABLE blocks(id INTEGER PRIMARY KEY, parent_id INTEGER, content TEXT)",
+        )
+        .unwrap();
+        if with_view {
+            conn.execute(format!(
+                "CREATE MATERIALIZED VIEW block_with_path AS {PATHS}"
+            ))
+            .unwrap();
+        }
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        let mut open_parents: Vec<usize> = Vec::new();
+        let mut depth = vec![0usize; n + MEASURED_INSERTS + 1];
+        let mut row = |id: usize| -> String {
+            let parent = if id <= 10 {
+                None
+            } else {
+                Some(open_parents[rng.below(open_parents.len())])
+            };
+            depth[id] = parent.map_or(0, |p| depth[p] + 1);
+            if depth[id] < 8 {
+                open_parents.push(id);
+            }
+            let parent = parent.map_or("NULL".to_string(), |p| p.to_string());
+            format!("({id}, {parent}, 'b{id}')")
+        };
+        let fill: Vec<String> = (1..=n).map(&mut row).collect();
+        insert_in_batches(&conn, "blocks", &fill);
+        let single: Vec<String> = (n + 1..=n + MEASURED_INSERTS)
+            .map(|id| format!("INSERT INTO blocks VALUES {}", row(id)))
+            .collect();
+        let costs = time_each(&conn, &single);
+        if with_view {
+            assert_eq!(
+                sorted_rows(&conn, "SELECT * FROM block_with_path"),
+                sorted_rows(&conn, PATHS)
+            );
+        }
+        costs
+    }
+
+    #[test]
+    #[ignore = "timing of single-row inserts into views over growing tables"]
+    fn single_row_insert_cost_by_table_size() {
+        for n in bench_sizes() {
+            let (view_a, view_b) = join_insert_costs(n, true);
+            let (base_a, base_b) = join_insert_costs(n, false);
+            report("J into a", n, view_a, base_a);
+            report("J into b", n, view_b, base_b);
+            report(
+                "R",
+                n,
+                recursive_insert_costs(n, true),
+                recursive_insert_costs(n, false),
+            );
+        }
+    }
 }
