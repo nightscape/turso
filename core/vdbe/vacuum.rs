@@ -171,6 +171,8 @@ pub(crate) fn classify_schema_entries(
                     tables_to_copy.push(idx);
                 }
             }
+            SchemaEntryType::Index
+                if crate::schema::is_materialized_view_state_table(&entry.tbl_name) => {}
             SchemaEntryType::Index if view_names.contains(entry.tbl_name.as_str()) => {
                 post_data_entries.push(idx);
             }

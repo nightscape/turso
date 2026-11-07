@@ -34,6 +34,7 @@ use crate::schema::{BTreeTable, Index, IndexColumn, Schema};
 use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::turso_assert;
+use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
     to_u32, CmpInsFlags, IdxInsertFlags, InsertFlags, Insn, RegisterOrLiteral,
@@ -234,10 +235,12 @@ pub(super) fn emit_fixpoint(
 }
 
 /// The hidden table of a fixpoint: `(key.., values.., round)`, with an index
-/// on the key.
+/// on the key and, when the recursive arm's join compares a CTE column, an
+/// index on that column.
 struct RowsTable {
     table: Arc<BTreeTable>,
     index: Arc<Index>,
+    probe_index: Option<Arc<Index>>,
     key_width: usize,
     /// The number of CTE columns.
     width: usize,
@@ -254,18 +257,26 @@ impl RowsTable {
             .ok_or_else(|| {
                 LimboError::InternalError(format!("recursive CTE table {table_name} not found"))
             })?;
-        let index = schema
+        let (key_indexes, probe_indexes): (Vec<_>, Vec<_>) = schema
             .get_indices(NamespaceId::ROOT, table_name)
-            .next()
             .cloned()
-            .ok_or_else(|| {
-                LimboError::InternalError(format!("recursive CTE table {table_name} has no index"))
-            })?;
+            .partition(|index| index.columns[0].pos_in_table == 0);
+        let [index] = <[Arc<Index>; 1]>::try_from(key_indexes).map_err(|indexes| {
+            LimboError::InternalError(format!(
+                "recursive CTE table {table_name} has {} key indexes",
+                indexes.len()
+            ))
+        })?;
+        turso_assert!(
+            probe_indexes.len() <= 1,
+            "a recursive CTE table has at most one probe index"
+        );
         let width = plan.dag().output_schema(node_id).len();
         let key_width = table.columns().len() - width - 1;
         Ok(Self {
             table,
             index,
+            probe_index: probe_indexes.into_iter().next(),
             key_width,
             width,
         })
@@ -282,6 +293,7 @@ impl RowsTable {
             (self.key_width..=self.key_width + self.width).collect(),
             None,
         )
+        .with_stored_indexes(self.probe_index.iter())
     }
 }
 
@@ -453,6 +465,61 @@ impl<'a> Body<'a> {
             MaintenanceInput::TransactionDelta,
         )
     }
+}
+
+/// The CTE column that a join of the recursive arm `nodes` compares for
+/// equality with a column of a base table, and that column's affinity: the
+/// affinity the comparison applies to the CTE column.
+pub(super) fn recursive_probe_column(
+    dag: &dag::MaintenanceDag,
+    nodes: std::ops::RangeInclusive<dag::NodeId>,
+) -> Option<(usize, Affinity)> {
+    let base_column = |binding: TableInternalId, column: usize| {
+        nodes.clone().find_map(|node| match &dag.nodes[node] {
+            dag::OpNode::Scan {
+                table, logical_id, ..
+            } if *logical_id == binding => Some(table.columns()[column].affinity()),
+            _ => None,
+        })
+    };
+    for node in nodes.clone() {
+        let dag::OpNode::RecursiveInput { logical_id, .. } = &dag.nodes[node] else {
+            continue;
+        };
+        for join in nodes.clone() {
+            let dag::OpNode::Join { inputs, on, .. } = &dag.nodes[join] else {
+                continue;
+            };
+            if !inputs.contains(&node) {
+                continue;
+            }
+            for term in on {
+                let ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) = term else {
+                    continue;
+                };
+                for (cte_side, other) in [(lhs, rhs), (rhs, lhs)] {
+                    let (
+                        ast::Expr::Column { table, column, .. },
+                        ast::Expr::Column {
+                            table: other_table,
+                            column: other_column,
+                            ..
+                        },
+                    ) = (cte_side.as_ref(), other.as_ref())
+                    else {
+                        continue;
+                    };
+                    if *table != *logical_id {
+                        continue;
+                    }
+                    if let Some(affinity) = base_column(*other_table, *other_column) {
+                        return Some((*column, affinity));
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The column of the scan `scan` that a join of the arm compares for
@@ -732,6 +799,15 @@ fn emit_round_merge(
         root_page: RegisterOrLiteral::Literal(rows.index.root_page),
         db: 0,
     });
+    let probe = rows.probe_index.as_ref().map(|index| {
+        let cursor_id = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id,
+            root_page: RegisterOrLiteral::Literal(index.root_page),
+            db: 0,
+        });
+        (index.clone(), cursor_id)
+    });
     let retracted_cursor = program.alloc_cursor_id(CursorType::BTreeTable(Arc::new(
         scratch_table(&format!("{view_name}_retracted"), 1)?,
     )));
@@ -794,6 +870,50 @@ fn emit_round_merge(
             src_reg: row_round_reg,
             dst_reg: entry_round_reg,
             extra_amount: 0,
+        });
+    };
+    // [probed value, rowid]: the probe index entry of the row in the registers.
+    let probe_entry_start = program.alloc_registers(2);
+    let probe_entry = |program: &mut ProgramBuilder| {
+        let (index, _) = probe.as_ref().expect("the round has a probe index");
+        let column = index.columns[0].pos_in_table;
+        program.emit_insn(Insn::Copy {
+            src_reg: row_start + column,
+            dst_reg: probe_entry_start,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Affinity {
+            start_reg: probe_entry_start,
+            count: std::num::NonZeroUsize::MIN,
+            affinities: rows.table.columns()[column]
+                .affinity()
+                .aff_mask()
+                .to_string(),
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: rowid_reg,
+            dst_reg: probe_entry_start + 1,
+            extra_amount: 0,
+        });
+    };
+    let emit_probe_insert = |program: &mut ProgramBuilder| {
+        let Some((index, cursor_id)) = &probe else {
+            return;
+        };
+        probe_entry(program);
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(probe_entry_start),
+            count: 2,
+            dest_reg: to_u32(stored_record_reg),
+            index_name: Some(index.name.clone()),
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: *cursor_id,
+            record_reg: stored_record_reg,
+            unpacked_start: Some(probe_entry_start),
+            unpacked_count: Some(2),
+            flags: IdxInsertFlags::new(),
         });
     };
     let emit_change = |program: &mut ProgramBuilder| {
@@ -893,6 +1013,15 @@ fn emit_round_merge(
         flag: InsertFlags::new().is_ephemeral_table_insert(),
         table_name: String::new(),
     });
+    if let Some((_, cursor_id)) = &probe {
+        probe_entry(program);
+        program.emit_insn(Insn::IdxDelete {
+            start_reg: probe_entry_start,
+            num_regs: 2,
+            cursor_id: *cursor_id,
+            raise_error_if_no_matching_entry: true,
+        });
+    }
     emit_change(program);
     program.preassign_label_to_next_insn(retraction_next_label);
     program.emit_insn(Insn::Next {
@@ -961,6 +1090,7 @@ fn emit_round_merge(
         unpacked_count: Some(to_u32(key_width + 2)),
         flags: IdxInsertFlags::new(),
     });
+    emit_probe_insert(program);
     program.emit_insn(Insn::Goto {
         target_pc: insertion_emit_label,
     });
@@ -985,6 +1115,7 @@ fn emit_round_merge(
         target_pc: corrupt_label,
     });
     emit_row_write(program, table_cursor, &table_name, rowid_reg, record_reg);
+    emit_probe_insert(program);
     program.preassign_label_to_next_insn(insertion_emit_label);
     emit_change(program);
     program.preassign_label_to_next_insn(insertion_next_label);

@@ -609,14 +609,19 @@ fn index_probe(
             let context = ExprContext::new(Some(table_references), resolver);
             let affinity = comparison_affinity(lhs.as_ref(), rhs.as_ref(), &context);
             let collation = comparison_collation(lhs, rhs, &context)?;
-            if !table_column.affinity().index_affinity_ok(affinity) {
-                continue;
-            }
             let physical_column = arrangement.value_columns()[*column];
             let stored = arrangement.stored_indexes().iter().find(|index| {
                 index.columns[0].pos_in_table == physical_column
                     && index.columns[0].collation == collation
+                    && stored_index_affinity_ok(
+                        table_column.affinity(),
+                        arrangement.table().columns()[physical_column].affinity(),
+                        affinity,
+                    )
             });
+            if stored.is_none() && !table_column.affinity().index_affinity_ok(affinity) {
+                continue;
+            }
             let target = match (stored, arrangement.probe_index()) {
                 (Some(index), _) => ProbeTarget::Stored(index.clone()),
                 (None, Some(probe_index))
@@ -634,6 +639,22 @@ fn index_probe(
         }
     }
     Ok(None)
+}
+
+/// Whether an index whose entries have `index_affinity` finds every row the
+/// comparison with `comparison_affinity` matches. A column without affinity
+/// gets the comparison's affinity, so its index must hold converted values.
+fn stored_index_affinity_ok(
+    column_affinity: Affinity,
+    index_affinity: Affinity,
+    comparison_affinity: Affinity,
+) -> bool {
+    if column_affinity == index_affinity {
+        return column_affinity.index_affinity_ok(comparison_affinity);
+    }
+    column_affinity == Affinity::Blob
+        && !matches!(comparison_affinity, Affinity::Blob | Affinity::None)
+        && index_affinity.index_affinity_ok(comparison_affinity)
 }
 
 pub(super) fn reads_binding(expr: &ast::Expr, binding: TableInternalId) -> Result<bool> {

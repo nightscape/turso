@@ -22,6 +22,7 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::resolve_window_and_aggregate_functions;
 use crate::translate::select::prepare_select_plan;
+use crate::turso_assert;
 use crate::util::walk_expr_with_subqueries;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
@@ -1013,6 +1014,14 @@ pub(crate) struct HiddenTableDef {
     pub(crate) table_name: String,
     pub(crate) create_sql: String,
     pub(crate) primary_key_index: bool,
+    /// An index the CREATE program adds with its SQL.
+    pub(crate) index: Option<HiddenIndexDef>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HiddenIndexDef {
+    pub(crate) name: String,
+    pub(crate) create_sql: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1479,6 +1488,7 @@ fn version_marker_table(view_name: &str) -> HiddenTableDef {
         create_sql: format!("CREATE TABLE {table_ident} (version INTEGER)"),
         table_name,
         primary_key_index: false,
+        index: None,
     }
 }
 
@@ -2020,28 +2030,37 @@ fn plan_operator_states(
                 "{}{DBSP_CIRCUIT_VERSION}_{view_name}__n{node_id}",
                 crate::schema::DBSP_TABLE_PREFIX,
             );
-            let create_sql = match node {
-                dag::OpNode::Fixpoint { inputs, .. } => {
+            let (create_sql, index) = match node {
+                dag::OpNode::Fixpoint { inputs, body_start } => {
                     let identity_width =
                         |input: dag::NodeId| catalog.nodes[input].output.published_identity.width();
-                    let identity_width = identity_width(inputs[0]).max(identity_width(inputs[1]));
-                    fixpoint_table_sql(
-                        &table_name,
-                        1 + identity_width,
-                        dag.output_schema(node_id).len(),
+                    let key_width = 1 + identity_width(inputs[0]).max(identity_width(inputs[1]));
+                    let width = dag.output_schema(node_id).len();
+                    let probe =
+                        super::fixpoint::recursive_probe_column(dag, *body_start..=inputs[1]);
+                    if let Some((column, _)) = probe {
+                        turso_assert!(column < width, "a recursive CTE join seeks a CTE column");
+                    }
+                    (
+                        fixpoint_table_sql(&table_name, key_width, width, probe),
+                        probe.map(|(column, _)| fixpoint_probe_index(&table_name, column)),
                     )
                 }
-                _ => state_table_sql(
-                    &table_name,
-                    node,
-                    output.emitted_identity.width(),
-                    dag.output_schema(node_id).len(),
-                )?,
+                _ => (
+                    state_table_sql(
+                        &table_name,
+                        node,
+                        output.emitted_identity.width(),
+                        dag.output_schema(node_id).len(),
+                    )?,
+                    None,
+                ),
             };
             Some(HiddenTableDef {
                 create_sql,
                 table_name,
                 primary_key_index: true,
+                index,
             })
         } else {
             None
@@ -2072,6 +2091,7 @@ fn plan_operator_states(
                     )?,
                     table_name,
                     primary_key_index: true,
+                    index: None,
                 })
             } else {
                 None
@@ -2124,6 +2144,7 @@ fn plan_auxiliary_tables(
             table_name,
             create_sql,
             primary_key_index: true,
+            index: None,
         },
     };
 
@@ -2183,6 +2204,7 @@ fn plan_auxiliary_tables(
                     // Rows are keyed by the input row's rowid, which is also
                     // this table's rowid.
                     primary_key_index: false,
+                    index: None,
                 },
             }]
         }
@@ -2375,14 +2397,30 @@ fn state_table_sql(
 /// tag (0 for seed rows, 1 for recursive rows) and the identity of the
 /// row's derivation, padded with zeros. The primary key is the key and the
 /// round, because an operator rowid freed in one round can name another row
-/// in a different round of the same statement.
-fn fixpoint_table_sql(table_name: &str, key_width: usize, value_width: usize) -> String {
+/// in a different round of the same statement. The column `probe` names has
+/// the affinity of its probe index's entries; the rows keep the CTE values.
+fn fixpoint_table_sql(
+    table_name: &str,
+    key_width: usize,
+    value_width: usize,
+    probe: Option<(usize, Affinity)>,
+) -> String {
     let table_ident = crate::util::quote_identifier(table_name);
     let key = (0..key_width).map(|i| format!("k{i}")).collect::<Vec<_>>();
+    let column_type = |i: usize| match probe {
+        Some((column, affinity)) if column == i => match affinity {
+            Affinity::Integer => " INTEGER",
+            Affinity::Text => " TEXT",
+            Affinity::Real => " REAL",
+            Affinity::Numeric => " NUMERIC",
+            Affinity::Blob | Affinity::None => " BLOB",
+        },
+        _ => "",
+    };
     let columns = key
         .iter()
         .cloned()
-        .chain((0..value_width).map(|i| format!("c{i}")))
+        .chain((0..value_width).map(|i| format!("c{i}{}", column_type(i))))
         .chain(std::iter::once("round".to_string()))
         .collect::<Vec<_>>();
     format!(
@@ -2390,6 +2428,22 @@ fn fixpoint_table_sql(table_name: &str, key_width: usize, value_width: usize) ->
         columns.join(", "),
         key.join(", ")
     )
+}
+
+/// The index on the column of a recursive CTE's rows that the recursive arm's
+/// join compares, so a change of the arm's base tables seeks the rows.
+/// `column` is a CTE column; [`fixpoint_table_sql`] names it `c{column}`.
+fn fixpoint_probe_index(table_name: &str, column: usize) -> HiddenIndexDef {
+    let name = format!("{table_name}__probe");
+    HiddenIndexDef {
+        create_sql: format!(
+            "CREATE INDEX {} ON {}(c{})",
+            crate::util::quote_identifier(&name),
+            crate::util::quote_identifier(table_name),
+            column
+        ),
+        name,
+    }
 }
 
 /// Whether an aggregate keeps per-value state in the multiset table: MIN/MAX

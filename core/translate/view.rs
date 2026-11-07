@@ -263,6 +263,26 @@ pub fn translate_create_materialized_view(
             )?;
             parse_schema_names.push(escape_sql_string_literal(&index_name));
         }
+        if let Some(index) = &hidden.index {
+            let index_root_reg = program.alloc_register();
+            program.emit_insn(Insn::CreateBtree {
+                db: database_id,
+                root: index_root_reg,
+                flags: CreateBTreeFlags::new_index(),
+            });
+            emit_schema_entry(
+                program,
+                resolver,
+                sqlite_schema_cursor_id,
+                None,
+                SchemaEntryType::Index,
+                &index.name,
+                &hidden.table_name,
+                index_root_reg,
+                Some(index.create_sql.clone()),
+            )?;
+            parse_schema_names.push(escape_sql_string_literal(&index.name));
+        }
     }
 
     // Parse schema to load the new view (and its state table, if any)
@@ -924,13 +944,6 @@ pub fn translate_drop_view(
             dest: index_type_reg_2,
             value: "index".to_string(),
         });
-        let dbsp_index_name_reg_2 = program.alloc_register();
-        let dbsp_index_name_2 =
-            format!("{PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX}{dbsp_table_name}_1");
-        program.emit_insn(Insn::String8 {
-            dest: dbsp_index_name_reg_2,
-            value: dbsp_index_name_2,
-        });
 
         // Allocate column registers once (outside the loop)
         let dbsp_col0_reg = program.alloc_register();
@@ -982,7 +995,7 @@ pub fn translate_drop_view(
             target_pc: dbsp_skip_delete_label,
         });
 
-        // Check if this is the DBSP index entry (type='index' and name=dbsp_index_name)
+        // Check if this is an index of the DBSP table (type='index' and tbl_name=dbsp_table_name)
         program.preassign_label_to_next_insn(check_dbsp_index_label);
         program.emit_insn(Insn::Ne {
             lhs: dbsp_col0_reg,
@@ -991,9 +1004,10 @@ pub fn translate_drop_view(
             flags: CmpInsFlags::default(),
             collation: CollationSeq::for_internal_values(),
         });
+        program.emit_column_or_rowid(sqlite_schema_cursor_id, 2, dbsp_col1_reg);
         program.emit_insn(Insn::Ne {
             lhs: dbsp_col1_reg,
-            rhs: dbsp_index_name_reg_2,
+            rhs: dbsp_table_name_reg_2,
             target_pc: dbsp_skip_delete_label,
             flags: CmpInsFlags::default(),
             collation: CollationSeq::for_internal_values(),
