@@ -2000,6 +2000,33 @@ fn prepare_lateral_subquery_plan(
     Ok(plan)
 }
 
+/// A statement that reads a materialized view this engine cannot maintain
+/// fails. The view is read as a table, so every read passes here.
+fn refuse_unmaintained_view_read(
+    resolver: &Resolver,
+    namespace: NamespaceRef,
+    name: &str,
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    let Some(view) = resolver.with_schema(namespace.database_id, |schema| {
+        schema.get_materialized_view(namespace.id, name)
+    }) else {
+        return Ok(());
+    };
+    let (select, view_name) = {
+        let view = view.lock();
+        (view.select_stmt.clone(), view.name().to_string())
+    };
+    crate::incremental::vdbe_maintenance::refuse_unmaintained_view_read(
+        namespace,
+        &view_name,
+        &select,
+        resolver.with_schema(namespace.database_id, |schema| schema.schema_version),
+        resolver,
+        connection,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn parse_table(
     table_references: &mut TableReferences,
@@ -2178,6 +2205,7 @@ fn parse_table(
             if !args.is_empty() {
                 crate::bail_parse_error!("'{}' is not a function", table_name.as_str());
             }
+            refuse_unmaintained_view_read(resolver, namespace, table_name.as_str(), connection)?;
             Table::BTree(table.clone())
         } else {
             return Err(crate::LimboError::InvalidArgument(
@@ -2264,6 +2292,8 @@ fn parse_table(
                  Please DROP and recreate the view to use it."
             )));
         }
+
+        refuse_unmaintained_view_read(resolver, namespace, table_name.as_str(), connection)?;
 
         // Check if this materialized view has persistent storage
         let view_guard = view.lock();

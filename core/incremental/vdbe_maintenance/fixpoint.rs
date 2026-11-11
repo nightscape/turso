@@ -32,7 +32,8 @@ use crate::incremental::dag;
 use crate::namespace::NamespaceId;
 use crate::schema::{BTreeTable, Index, IndexColumn, Schema};
 use crate::sync::Arc;
-use crate::translate::collate::CollationSeq;
+use crate::translate::collate::{column_collation, CollationSeq, TextCollation};
+use crate::translate::expr::do_comparison_affinity;
 use crate::turso_assert;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
@@ -301,13 +302,14 @@ impl RowsTable {
                 else {
                     unreachable!("RowsTable::open is called for a fixpoint");
                 };
-                let (column, _) = recursive_probe_column(plan.dag(), body_start..=step)
+                let column = recursive_probe_column(plan.dag(), body_start..=step)
                     .ok_or_else(|| {
                         LimboError::InternalError(format!(
                             "recursive CTE table {table_name} has {PROBE_KEY_COLUMN}, but the \
                              recursive arm's join compares no CTE column"
                         ))
-                    })?;
+                    })?
+                    .column;
                 Ok::<_, LimboError>((probe_index, column))
             })
             .transpose()?;
@@ -508,23 +510,38 @@ impl<'a> Body<'a> {
     }
 }
 
-/// The CTE column that a join of the recursive arm `nodes` compares for
-/// equality with a column of a base table, and that column's affinity: the
-/// affinity the comparison applies to the CTE column.
+/// The CTE column that a join of the recursive arm compares for equality
+/// with a column of a base table.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RecursiveProbe {
+    pub(super) column: usize,
+    /// The affinity the comparison applies to the CTE column.
+    pub(super) affinity: Affinity,
+    /// The text collation of the comparison: the left column's, as for any
+    /// comparison of two columns.
+    pub(super) collation: TextCollation,
+}
+
+/// The [`RecursiveProbe`] of the recursive arm `nodes`, if it has one.
 pub(super) fn recursive_probe_column(
     dag: &dag::MaintenanceDag,
     nodes: std::ops::RangeInclusive<dag::NodeId>,
-) -> Option<(usize, Affinity)> {
+) -> Option<RecursiveProbe> {
     let base_column = |binding: TableInternalId, column: usize| {
         nodes.clone().find_map(|node| match &dag.nodes[node] {
             dag::OpNode::Scan {
                 table, logical_id, ..
-            } if *logical_id == binding => Some(table.columns()[column].affinity()),
+            } if *logical_id == binding => Some(table.columns()[column].clone()),
             _ => None,
         })
     };
     for node in nodes.clone() {
-        let dag::OpNode::RecursiveInput { logical_id, .. } = &dag.nodes[node] else {
+        let dag::OpNode::RecursiveInput {
+            table: cte,
+            logical_id,
+            ..
+        } = &dag.nodes[node]
+        else {
             continue;
         };
         for join in nodes.clone() {
@@ -538,7 +555,7 @@ pub(super) fn recursive_probe_column(
                 let ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) = term else {
                     continue;
                 };
-                for (cte_side, other) in [(lhs, rhs), (rhs, lhs)] {
+                for (cte_side, other, cte_is_left) in [(lhs, rhs, true), (rhs, lhs, false)] {
                     let (
                         ast::Expr::Column { table, column, .. },
                         ast::Expr::Column {
@@ -553,8 +570,28 @@ pub(super) fn recursive_probe_column(
                     if *table != *logical_id {
                         continue;
                     }
-                    if let Some(affinity) = base_column(*other_table, *other_column) {
-                        return Some((*column, affinity));
+                    if let Some(base) = base_column(*other_table, *other_column) {
+                        let cte_column = &cte.columns()[*column];
+                        let affinity =
+                            match do_comparison_affinity(cte_column.affinity(), base.affinity()) {
+                                // Converting with the base column's own numeric affinity keeps
+                                // the probe key column of views that already seek.
+                                affinity if affinity.is_numeric() => base.affinity(),
+                                affinity => affinity,
+                            };
+                        let (left, right) = if cte_is_left {
+                            (cte_column, &base)
+                        } else {
+                            (&base, cte_column)
+                        };
+                        let collation = column_collation(left)
+                            .or_else(|| column_collation(right))
+                            .unwrap_or(TextCollation::Binary);
+                        return Some(RecursiveProbe {
+                            column: *column,
+                            affinity,
+                            collation,
+                        });
                     }
                 }
             }
@@ -1800,6 +1837,171 @@ mod tests {
                     recursive_insert_costs(n, true, indexed),
                     recursive_insert_costs(n, false, indexed),
                 );
+            }
+        }
+    }
+
+    /// A key column type of the path benches and how its values are written.
+    struct KeyType {
+        name: &'static str,
+        sql_type: &'static str,
+        /// The parent of a root block in the application's view shape.
+        sentinel: &'static str,
+        roots: &'static str,
+        quoted: bool,
+    }
+
+    const KEY_TYPES: [KeyType; 2] = [
+        KeyType {
+            name: "int",
+            sql_type: "INTEGER",
+            sentinel: "-1",
+            roots: "parent_id = -1",
+            quoted: false,
+        },
+        KeyType {
+            name: "text",
+            sql_type: "TEXT",
+            sentinel: "'sentinel:no_parent'",
+            roots: "parent_id LIKE 'sentinel:%'",
+            quoted: true,
+        },
+    ];
+
+    impl KeyType {
+        fn value(&self, id: usize) -> String {
+            if self.quoted {
+                format!("'b{id}'")
+            } else {
+                id.to_string()
+            }
+        }
+    }
+
+    /// The parent of each block `1..=count`: ten roots, and every later block
+    /// below a random earlier block of depth < 8.
+    fn random_tree(count: usize) -> Vec<Option<usize>> {
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        let mut open_parents: Vec<usize> = Vec::new();
+        let mut depth = vec![0usize; count + 1];
+        let mut parents = vec![None];
+        for id in 1..=count {
+            let parent = (id > 10).then(|| open_parents[rng.below(open_parents.len())]);
+            depth[id] = parent.map_or(0, |p| depth[p] + 1);
+            if depth[id] < 8 {
+                open_parents.push(id);
+            }
+            parents.push(parent);
+        }
+        parents
+    }
+
+    /// The application's path view: its CTE reads the `block` matview (a
+    /// matview on a matview) and its roots point at a sentinel parent.
+    fn app_paths(key: &KeyType) -> String {
+        format!(
+            "WITH RECURSIVE paths AS ( \
+               SELECT id, parent_id, content, '/' || id AS path, id AS root_id \
+               FROM block WHERE {} \
+               UNION ALL \
+               SELECT b.id, b.parent_id, b.content, p.path || '/' || b.id AS path, p.root_id \
+               FROM block b INNER JOIN paths p ON b.parent_id = p.id) \
+             SELECT * FROM paths",
+            key.roots
+        )
+    }
+
+    fn create_app_path_view(conn: &Arc<Connection>, key: &KeyType) {
+        let (t, sentinel) = (key.sql_type, key.sentinel);
+        for sql in [
+            format!("CREATE TABLE block_raw(id {t} PRIMARY KEY, parent_id {t} NOT NULL, content TEXT)"),
+            format!("INSERT INTO block_raw VALUES ({sentinel}, {sentinel}, NULL)"),
+            "CREATE INDEX idx_block_raw_parent_id ON block_raw(parent_id)".to_string(),
+            format!("CREATE TABLE block_tags(block_id {t} NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(block_id, tag))"),
+            "CREATE MATERIALIZED VIEW block_tags_agg AS \
+             SELECT block_id AS source_id, json_group_array(tag) AS vals FROM block_tags GROUP BY block_id"
+                .to_string(),
+            "CREATE INDEX idx_block_tags_agg_source_id ON block_tags_agg(source_id)".to_string(),
+            format!(
+                "CREATE MATERIALIZED VIEW block AS \
+                 SELECT b.id, b.parent_id, b.content, COALESCE(block_tags_agg.vals, '[]') AS tags \
+                 FROM block_raw b LEFT OUTER JOIN block_tags_agg ON block_tags_agg.source_id = b.id \
+                 WHERE b.id != {sentinel}"
+            ),
+            "CREATE INDEX idx_block_parent_id ON block(parent_id)".to_string(),
+            format!("CREATE MATERIALIZED VIEW block_with_path AS {}", app_paths(key)),
+        ] {
+            conn.execute(sql).unwrap();
+        }
+    }
+
+    /// Single-row inserts into a path view over `n` blocks with keys of type
+    /// `key`. `app_shape` takes the view of [`create_app_path_view`];
+    /// otherwise the view of [`PATHS`] reads the indexed table `blocks`.
+    fn path_view_insert_costs(
+        n: usize,
+        key: &KeyType,
+        app_shape: bool,
+    ) -> Vec<std::time::Duration> {
+        let shape = if app_shape { "app" } else { "plain" };
+        let conn = open(&format!("bench-path-{shape}-{}-{n}.db", key.name));
+        let (table, paths, root_parent) = if app_shape {
+            create_app_path_view(&conn, key);
+            ("block_raw", app_paths(key), key.sentinel)
+        } else {
+            let t = key.sql_type;
+            conn.execute(format!(
+                "CREATE TABLE blocks(id {t} PRIMARY KEY, parent_id {t}, content TEXT)"
+            ))
+            .unwrap();
+            conn.execute("CREATE INDEX blocks_parent ON blocks(parent_id)")
+                .unwrap();
+            conn.execute(format!(
+                "CREATE MATERIALIZED VIEW block_with_path AS {PATHS}"
+            ))
+            .unwrap();
+            ("blocks", PATHS.to_string(), "NULL")
+        };
+        let parents = random_tree(n + MEASURED_INSERTS);
+        let row = |id: usize| {
+            let parent = parents[id].map_or(root_parent.to_string(), |p| key.value(p));
+            format!("({}, {parent}, 'b{id}')", key.value(id))
+        };
+        let fill: Vec<String> = (1..=n).map(row).collect();
+        insert_in_batches(&conn, table, &fill);
+        if app_shape {
+            let tags: Vec<String> = (1..=n)
+                .step_by(5)
+                .map(|id| format!("({}, 't{}')", key.value(id), id % 7))
+                .collect();
+            insert_in_batches(&conn, "block_tags", &tags);
+        }
+        let single: Vec<String> = (n + 1..=n + MEASURED_INSERTS)
+            .map(|id| format!("INSERT INTO {table} VALUES {}", row(id)))
+            .collect();
+        let costs = time_each(&conn, &single);
+        assert_eq!(
+            sorted_rows(&conn, "SELECT * FROM block_with_path"),
+            sorted_rows(&conn, &paths)
+        );
+        costs
+    }
+
+    #[test]
+    #[ignore = "timing of single-row inserts into path views by key type"]
+    fn path_view_insert_cost_by_key_type() {
+        for app_shape in [false, true] {
+            for key in &KEY_TYPES {
+                for n in bench_sizes() {
+                    let mut costs = path_view_insert_costs(n, key, app_shape);
+                    costs.sort();
+                    eprintln!(
+                        "PATH-BENCH shape={} key={} n={n} median_ms={:.4}",
+                        if app_shape { "app" } else { "plain" },
+                        key.name,
+                        costs[costs.len() / 2].as_secs_f64() * 1e3
+                    );
+                }
             }
         }
     }

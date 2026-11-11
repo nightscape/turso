@@ -6517,7 +6517,7 @@ fn push_on_conflict_clause(sql: &mut String, conflict_clause: Option<ResolveType
     });
 }
 
-fn push_collation(sql: &mut String, collation: Option<TextCollation>) {
+pub(crate) fn push_collation(sql: &mut String, collation: Option<TextCollation>) {
     let Some(collation) = collation else {
         return;
     };
@@ -7969,6 +7969,10 @@ pub struct Column {
     /// Keys on the column use it instead of `collation`. Set from the schema's
     /// types by `BTreeTable::resolve_custom_types`, never stored in the SQL.
     type_ordering: Option<TypeOrdering>,
+    /// For a materialized view's column, or a derived column copying one: the
+    /// order of the source type whose stored form it holds. Keys on it still
+    /// compare that form by `collation`, as existing indexes were built.
+    stored_type_ordering: Option<TypeOrdering>,
     /// The affinity of the values a custom-type column reads as, which
     /// comparisons use. `affinity()` is that of the stored form. None for a
     /// column without a custom type or array type, which compares by `affinity()`.
@@ -8127,6 +8131,7 @@ impl Column {
             info,
             collation: col,
             type_ordering: None,
+            stored_type_ordering: None,
             value_affinity: None,
             explicit_notnull: coldef.flags.contains(ColDefFlags::ExplicitNotNull),
             notnull_conflict_clause: coldef.notnull_conflict_clause,
@@ -8436,6 +8441,14 @@ impl Column {
     #[inline]
     pub fn set_type_ordering(&mut self, ordering: Option<TypeOrdering>) {
         self.type_ordering = ordering;
+    }
+    #[inline]
+    pub fn stored_type_ordering(&self) -> Option<TypeOrdering> {
+        self.stored_type_ordering
+    }
+    #[inline]
+    pub fn set_stored_type_ordering(&mut self, ordering: Option<TypeOrdering>) {
+        self.stored_type_ordering = ordering;
     }
     #[inline]
     pub fn has_explicit_collation(&self) -> bool {

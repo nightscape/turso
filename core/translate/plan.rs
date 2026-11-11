@@ -3224,9 +3224,23 @@ pub(super) fn query_output_columns(
         column.set_array_dimensions(dimensions);
         column.set_collation(Some(text_collation));
         column.set_type_ordering(type_ordering(&result_type, resolver.schema()));
+        column.set_stored_type_ordering(copied_stored_type_ordering(result_expr, table_references));
         column_types.try_push(result_type)?;
     }
     Ok((columns, column_types))
+}
+
+fn copied_stored_type_ordering(
+    expr: &ast::Expr,
+    tables: &TableReferences,
+) -> Option<crate::type_ordering::TypeOrdering> {
+    let ast::Expr::Column { table, column, .. } = expr else {
+        return None;
+    };
+    let (_, table) = tables
+        .find_table_by_internal_id(*table)
+        .expect("a column reference names a table of its query");
+    table.columns()[*column].stored_type_ordering()
 }
 
 fn subquery_output_columns(

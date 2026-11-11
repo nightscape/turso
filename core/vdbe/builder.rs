@@ -409,6 +409,7 @@ impl ProgramBuilderFlags {
     const SKIP_EXPRESSION_INDEX_VALUES: u16 = 1 << 8;
     const READS_STORED_VALUES: u16 = 1 << 9;
     const WRITES_STORED_VALUES: u16 = 1 << 10;
+    const MAINTAINS_VIEW: u16 = 1 << 11;
 
     const fn new(is_subprogram: bool) -> Self {
         let mut new = Self(0);
@@ -557,6 +558,18 @@ impl ProgramBuilderFlags {
     #[inline]
     pub const fn set_suppress_column_default(&mut self, v: bool) {
         self.set(Self::SUPPRESS_COLUMN_DEFAULT, v)
+    }
+
+    #[inline]
+    /// When set, the program maintains a materialized view. It reads the
+    /// indexes of its input views as stored: the maintenance order brought
+    /// those views up to date before it runs.
+    pub const fn maintains_view(self) -> bool {
+        self.get(Self::MAINTAINS_VIEW)
+    }
+    #[inline]
+    pub const fn set_maintains_view(&mut self, v: bool) {
+        self.set(Self::MAINTAINS_VIEW, v)
     }
 
     /// Whether expression translation must ignore selected expression indexes.
@@ -2577,6 +2590,7 @@ impl ProgramBuilder {
             is_multi_write: self.flags.is_multi_write(),
             trigger: self.trigger.take(),
             is_subprogram: self.flags.is_subprogram(),
+            maintains_view: self.flags.maintains_view(),
             has_materialized_views: self.has_materialized_views,
             resolve_type: self.resolve_type,
             prepare_context,

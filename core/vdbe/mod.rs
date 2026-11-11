@@ -224,7 +224,7 @@ pub(crate) fn step_view_delta_batch(
                         )
                     };
                     let program =
-                        crate::incremental::vdbe_maintenance::compile_maintenance_program(
+                        match crate::incremental::vdbe_maintenance::compile_maintenance_program(
                             view_name,
                             &select,
                             root_page,
@@ -232,7 +232,20 @@ pub(crate) fn step_view_delta_batch(
                             crate::incremental::vdbe_maintenance::MaintenanceInput::TransactionDelta,
                             &schema,
                             connection,
-                        )?;
+                        ) {
+                            Ok(program) => program,
+                            // Every read of a refused view fails, so its rows
+                            // need no maintenance.
+                            Err(error) => match crate::incremental::vdbe_maintenance::maintenance_refusal(
+                                view_name, &select, &schema, connection,
+                            )? {
+                                Some(_) => {
+                                    *current_index += 1;
+                                    continue;
+                                }
+                                None => return Err(error),
+                            },
+                        };
                     *stmt = Some(Box::new(crate::statement::Statement::new_with_origin(
                         program,
                         pager.clone(),
@@ -2197,6 +2210,8 @@ pub struct PreparedProgram {
     pub trigger: Option<Arc<Trigger>>,
     /// Whether this program is a subprogram (trigger or FK action) that runs within a parent statement.
     pub is_subprogram: bool,
+    /// See `crate::vdbe::builder::ProgramBuilderFlags::maintains_view`.
+    pub maintains_view: bool,
     /// Whether the schema this program was translated against has any
     /// materialized views. Lets `op_insert`/`op_delete` skip change-log
     /// routing entirely for ordinary databases. A schema change always bumps

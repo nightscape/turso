@@ -8,9 +8,11 @@ use crate::namespace::NamespaceId;
 use crate::schema::{BTreeTable, Schema};
 use crate::sync::Arc;
 use crate::turso_assert;
+use crate::util::normalize_ident;
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, InsertFlags, Insn};
 use crate::{LimboError, Result};
+use turso_parser::ast;
 
 pub(super) fn scan_node_output(
     dag: &dag::MaintenanceDag,
@@ -26,17 +28,18 @@ pub(super) fn scan_node_output(
     let stored_weight_column = schema
         .is_materialized_view(NamespaceId::ROOT, &table.name)
         .then(|| table.columns().len());
-    let mut arrangement = base_arrangement(table.clone(), stored_weight_column);
-    if stored_weight_column.is_none() {
-        arrangement = arrangement.with_stored_indexes(
-            schema
-                .get_indices(NamespaceId::ROOT, &table.name)
-                .map(|index| StoredIndex {
-                    index: index.clone(),
-                    column: index.columns[0].pos_in_table,
-                }),
-        );
-    }
+    // A join seek compares the converted probe with the stored key as it is,
+    // which matches SQL only when the key is stored in its column's class.
+    let seekable = relation_stores_declared_classes(&table.name, schema);
+    let arrangement = base_arrangement(table.clone(), stored_weight_column).with_stored_indexes(
+        schema
+            .get_indices(NamespaceId::ROOT, &table.name)
+            .filter(|_| seekable)
+            .map(|index| StoredIndex {
+                index: index.clone(),
+                column: index.columns[0].pos_in_table,
+            }),
+    );
     EmittedNodeOutput::new(
         node_id,
         DeltaSource::BaseTable {
@@ -46,6 +49,75 @@ pub(super) fn scan_node_output(
         Some(arrangement),
         contract,
     )
+}
+
+/// Whether every value the relation stores is in the class of its column's
+/// declared affinity. A table converts on write; a materialized view stores
+/// what its SELECT returns, where a compound arm, a RIGHT or FULL join merge
+/// or a plain view may yield another class.
+fn relation_stores_declared_classes(name: &str, schema: &Schema) -> bool {
+    match schema.get_materialized_view(NamespaceId::ROOT, name) {
+        Some(view) => select_stores_declared_classes(&view.lock().select_stmt, schema, &[]),
+        None => schema.get_btree_table(NamespaceId::ROOT, name).is_some(),
+    }
+}
+
+fn select_stores_declared_classes(
+    select: &ast::Select,
+    schema: &Schema,
+    outer_ctes: &[String],
+) -> bool {
+    let mut ctes = outer_ctes.to_vec();
+    for cte in select.with.iter().flat_map(|with| &with.ctes) {
+        if !select_stores_declared_classes(&cte.select, schema, &ctes) {
+            return false;
+        }
+        ctes.push(normalize_ident(cte.tbl_name.as_str()));
+    }
+    let ast::OneSelect::Select { columns, from, .. } = &select.body.select else {
+        return false;
+    };
+    select.body.compounds.is_empty()
+        && from
+            .as_ref()
+            .is_none_or(|from| from_stores_declared_classes(from, schema, &ctes))
+        && columns.iter().all(|column| match column {
+            ast::ResultColumn::Expr(expr, _) => scalar_subquery(expr)
+                .is_none_or(|subquery| select_stores_declared_classes(subquery, schema, &ctes)),
+            ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => true,
+        })
+}
+
+fn from_stores_declared_classes(from: &ast::FromClause, schema: &Schema, ctes: &[String]) -> bool {
+    let merges_right = from.joins.iter().any(|join| {
+        matches!(join.operator, ast::JoinOperator::TypedJoin(Some(join_type))
+            if join_type.contains(ast::JoinType::RIGHT))
+    });
+    !merges_right
+        && std::iter::once(&from.select)
+            .chain(from.joins.iter().map(|join| &join.table))
+            .all(|table| match table.as_ref() {
+                ast::SelectTable::Table(name, _, _) => {
+                    let name = normalize_ident(name.name.as_str());
+                    ctes.contains(&name) || relation_stores_declared_classes(&name, schema)
+                }
+                ast::SelectTable::Select { select, .. } => {
+                    select_stores_declared_classes(select, schema, ctes)
+                }
+                ast::SelectTable::Sub(from, _) => from_stores_declared_classes(from, schema, ctes),
+                ast::SelectTable::TableCall(..) => false,
+            })
+}
+
+/// The subquery whose value a result column copies, as the view's column
+/// metadata reads it.
+fn scalar_subquery(expr: &ast::Expr) -> Option<&ast::Select> {
+    match expr {
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => scalar_subquery(&exprs[0]),
+        ast::Expr::Collate(inner, _) => scalar_subquery(inner),
+        ast::Expr::Subquery(select) => Some(select),
+        _ => None,
+    }
 }
 
 pub(super) fn materialize_node_output(

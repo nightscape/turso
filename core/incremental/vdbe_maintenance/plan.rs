@@ -7,8 +7,11 @@ use crate::function::{AggFunc, Func};
 use crate::incremental::dag;
 use crate::schema::BTreeTable;
 use crate::sync::Arc;
-use crate::translate::collate::{first_collation, CollationSeq};
+use crate::translate::collate::{
+    comparison_collation, first_collation, CollationSeq, TextCollation,
+};
 use crate::translate::emitter::Resolver;
+use crate::translate::expr::expr_type::without_wrappers;
 use crate::translate::expr::{
     expr_contains_function_that_changes_between_statements, expr_references_any_subquery,
     WalkControl,
@@ -682,6 +685,9 @@ fn build_joined_rows_dag(
         }
     }
 
+    for on in &on_by_step {
+        refuse_type_ordered_join_keys(on, &plan.table_references, resolver)?;
+    }
     let mut node = inputs[0];
     for step in 0..inputs.len() {
         if step > 0 {
@@ -938,6 +944,7 @@ fn key_column(
 ) -> Result<dag::KeyColumn> {
     let collation =
         supported_key_collation(ExprContext::new(Some(tables), resolver).expr_collation(expr)?)?;
+    refuse_stored_type_order(expr, tables)?;
     Ok(dag::KeyColumn {
         collation,
         ambiguous: collation != CollationSeq::BINARY || stored_affinity(expr, tables).is_none(),
@@ -959,6 +966,9 @@ fn set_op_key_column(
             ExprContext::new(Some(&branch.table_references), resolver),
         )
     }))?)?;
+    for branch in branches {
+        refuse_stored_type_order(&branch.result_columns[index].expr, &branch.table_references)?;
+    }
     let affinities = branches
         .iter()
         .map(|branch| stored_affinity(&branch.result_columns[index].expr, &branch.table_references))
@@ -979,7 +989,54 @@ fn supported_key_collation(collation: CollationSeq) -> Result<CollationSeq> {
     if collation.is_custom() {
         return unsupported("custom collations on grouping or dedup keys");
     }
+    if let CollationSeq::Type(ordering) = collation {
+        return type_ordered_key(ordering);
+    }
     Ok(collation)
+}
+
+/// Keys are matched by their stored values, and a type with its own order
+/// stores an encoded form that differs from the value the SELECT reads.
+fn refuse_type_ordered_join_keys(
+    terms: &[ast::Expr],
+    tables: &TableReferences,
+    resolver: &Resolver,
+) -> Result<()> {
+    let context = ExprContext::new(Some(tables), resolver);
+    for term in terms {
+        let ast::Expr::Binary(lhs, ast::Operator::Equals | ast::Operator::Is, rhs) = term else {
+            continue;
+        };
+        if let CollationSeq::Type(ordering) = comparison_collation(lhs, rhs, &context)? {
+            return type_ordered_key(ordering);
+        }
+        refuse_stored_type_order(lhs, tables)?;
+        refuse_stored_type_order(rhs, tables)?;
+    }
+    Ok(())
+}
+
+/// A materialized view's column, and a derived column that copies it, holds
+/// the stored form of its source column's type but compares by its declared
+/// affinity, so `expr_collation` does not show the type's order.
+fn refuse_stored_type_order(expr: &ast::Expr, tables: &TableReferences) -> Result<()> {
+    let ast::Expr::Column { table, column, .. } = without_wrappers(expr) else {
+        return Ok(());
+    };
+    let Some(joined) = tables.find_joined_table_by_internal_id(*table) else {
+        return Ok(());
+    };
+    match joined.table.columns()[*column].stored_type_ordering() {
+        Some(ordering) => type_ordered_key(ordering),
+        None => Ok(()),
+    }
+}
+
+fn type_ordered_key<T>(ordering: crate::type_ordering::TypeOrdering) -> Result<T> {
+    let name = ordering.name();
+    unsupported(&format!(
+        "a join or grouping key of type {name} (collation {name})"
+    ))
 }
 
 /// The affinity of the base-table column `expr` reads, when that affinity
@@ -2059,16 +2116,14 @@ fn plan_operator_states(
                     let probe =
                         super::fixpoint::recursive_probe_column(dag, *body_start..=inputs[1])
                             .filter(|_| version == crate::incremental::view::DBSP_CIRCUIT_VERSION);
-                    if let Some((column, _)) = probe {
-                        turso_assert!(column < width, "a recursive CTE join seeks a CTE column");
+                    if let Some(probe) = probe {
+                        turso_assert!(
+                            probe.column < width,
+                            "a recursive CTE join seeks a CTE column"
+                        );
                     }
                     (
-                        fixpoint_table_sql(
-                            &table_name,
-                            key_width,
-                            width,
-                            probe.map(|(_, affinity)| affinity),
-                        ),
+                        fixpoint_table_sql(&table_name, key_width, width, probe),
                         probe.map(|_| fixpoint_probe_index(&table_name)),
                     )
                 }
@@ -2423,26 +2478,31 @@ fn state_table_sql(
 /// tag (0 for seed rows, 1 for recursive rows) and the identity of the
 /// row's derivation, padded with zeros. The primary key is the key and the
 /// round, because an operator rowid freed in one round can name another row
-/// in a different round of the same statement. With `probe_key`, the last
-/// column holds the value of the CTE column the recursive arm's join compares,
-/// converted with the affinity the comparison applies.
+/// in a different round of the same statement. With `probe`, the last column
+/// holds the value of the CTE column the recursive arm's join compares,
+/// converted with the affinity the comparison applies and ordered by the
+/// comparison's collation.
 fn fixpoint_table_sql(
     table_name: &str,
     key_width: usize,
     value_width: usize,
-    probe_key: Option<Affinity>,
+    probe: Option<super::fixpoint::RecursiveProbe>,
 ) -> String {
     let table_ident = crate::util::quote_identifier(table_name);
     let key = (0..key_width).map(|i| format!("k{i}")).collect::<Vec<_>>();
-    let probe_key = probe_key.map(|affinity| {
-        let column_type = match affinity {
+    let probe_key = probe.map(|probe| {
+        let column_type = match probe.affinity {
             Affinity::Integer => "INTEGER",
             Affinity::Text => "TEXT",
             Affinity::Real => "REAL",
             Affinity::Numeric => "NUMERIC",
             Affinity::Blob | Affinity::None => "BLOB",
         };
-        format!("{} {column_type}", super::fixpoint::PROBE_KEY_COLUMN)
+        let mut column = format!("{} {column_type}", super::fixpoint::PROBE_KEY_COLUMN);
+        if probe.collation != TextCollation::Binary {
+            crate::schema::push_collation(&mut column, Some(probe.collation));
+        }
+        column
     });
     let columns = key
         .iter()

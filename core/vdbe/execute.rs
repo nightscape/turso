@@ -1406,9 +1406,10 @@ pub fn op_open_read(
             };
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
-            let indexes_a_view = program.connection.with_schema(*db, |schema| {
-                schema.is_materialized_view(NamespaceId::ROOT, &index.table_name)
-            });
+            let indexes_a_view = !program.maintains_view
+                && program.connection.with_schema(*db, |schema| {
+                    schema.is_materialized_view(NamespaceId::ROOT, &index.table_name)
+                });
             let cursor = if indexes_a_view {
                 Cursor::new_btree_dyn(Box::new(
                     crate::incremental::cursor::MaterializedViewCursor::new(

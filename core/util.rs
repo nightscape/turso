@@ -2444,17 +2444,24 @@ fn view_column_name(column: &ViewColumn) -> Option<&str> {
 }
 
 fn view_output_column(source: &ViewColumn) -> ViewColumn {
+    let mut column = Column::new(
+        source.column.name.clone(),
+        source.column.ty_str.clone(),
+        None,
+        None,
+        source.column.ty(),
+        source.column.text_collation(),
+        ColDef::default(),
+    );
+    column.set_stored_type_ordering(
+        source
+            .column
+            .type_ordering()
+            .or_else(|| source.column.stored_type_ordering()),
+    );
     ViewColumn {
         table_index: source.table_index,
-        column: Column::new(
-            source.column.name.clone(),
-            source.column.ty_str.clone(),
-            None,
-            None,
-            source.column.ty(),
-            source.column.text_collation(),
-            ColDef::default(),
-        ),
+        column,
     }
 }
 

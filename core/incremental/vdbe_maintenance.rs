@@ -33,7 +33,7 @@ use crate::schema::Schema;
 use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
-use crate::vdbe::{PreparedProgram, Program};
+use crate::vdbe::{PrepareContext, PreparedProgram, Program};
 use crate::{Connection, LimboError, QueryMode, Result};
 
 mod stream;
@@ -104,13 +104,32 @@ struct MaintenanceProgramCacheKey {
 /// cookie and normal prepared-statement context generation.
 pub(crate) struct MaintenanceProgramCache {
     entries: crate::sync::RwLock<FxHashMap<MaintenanceProgramCacheKey, Arc<PreparedProgram>>>,
+    refusals: crate::sync::RwLock<RefusalCache>,
 }
+
+/// Each view's planning refusal per schema version, with the context it was planned in.
+type RefusalCache = FxHashMap<(String, u32), (PrepareContext, Option<String>)>;
 
 impl MaintenanceProgramCache {
     pub(crate) fn new() -> Self {
         Self {
             entries: crate::sync::RwLock::new(FxHashMap::default()),
+            refusals: crate::sync::RwLock::new(FxHashMap::default()),
         }
+    }
+
+    fn refusal(&self, key: &(String, u32), connection: &Connection) -> Option<Option<String>> {
+        self.refusals
+            .read()
+            .get(key)
+            .filter(|(context, _)| context.matches_connection(connection))
+            .map(|(_, refusal)| refusal.clone())
+    }
+
+    fn insert_refusal(&self, key: (String, u32), connection: &Connection, refusal: Option<String>) {
+        let mut refusals = self.refusals.write();
+        refusals.retain(|existing, _| existing.1 == key.1);
+        refusals.insert(key, (PrepareContext::from_connection(connection), refusal));
     }
 
     fn get(
@@ -194,6 +213,7 @@ fn compile_maintenance_plan(
         },
         connection.mvcc_enabled(),
     );
+    program.flags.set_maintains_view(true);
     program.prologue();
     emit_plan_to_sink(
         &mut program,
@@ -253,6 +273,83 @@ impl Connection {
     }
 }
 
+/// Why this engine cannot maintain the view, when it cannot.
+///
+/// A database written by another engine can hold a view whose definition this
+/// engine refuses. The database still opens and writes to the view's inputs
+/// succeed: they leave the view's rows as they are, and every read of the view
+/// fails with this reason.
+pub(crate) fn maintenance_refusal(
+    view_name: &str,
+    select: &ast::Select,
+    schema: &Schema,
+    connection: &Arc<Connection>,
+) -> Result<Option<String>> {
+    cached_refusal(view_name, schema.schema_version, connection, || {
+        build_plan_for_connection(view_name, select, schema, connection)
+    })
+}
+
+fn cached_refusal(
+    view_name: &str,
+    schema_version: u32,
+    connection: &Arc<Connection>,
+    plan: impl FnOnce() -> Result<MaintenancePlan>,
+) -> Result<Option<String>> {
+    let key = (view_name.to_string(), schema_version);
+    if let Some(refusal) = connection
+        .maintenance_program_cache
+        .refusal(&key, connection)
+    {
+        return Ok(refusal);
+    }
+    let refusal = match plan() {
+        Ok(_) => None,
+        Err(LimboError::ParseError(msg)) => Some(format!(
+            "materialized view '{view_name}' cannot be maintained: {msg}"
+        )),
+        Err(e) => return Err(e),
+    };
+    connection
+        .maintenance_program_cache
+        .insert_refusal(key, connection, refusal.clone());
+    Ok(refusal)
+}
+
+/// [`maintenance_refusal`] as the error of a statement that reads the view.
+pub(crate) fn refuse_unmaintained_view_read(
+    namespace: NamespaceRef,
+    name: &str,
+    select: &ast::Select,
+    schema_version: u32,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let view_name = crate::namespace::mangle_name(namespace.id, name);
+    match cached_refusal(&view_name, schema_version, connection, || {
+        plan_in_view_scope(&view_name, namespace, name, select, resolver, connection)
+    })? {
+        Some(refusal) => Err(LimboError::ParseError(refusal)),
+        None => Ok(()),
+    }
+}
+
+/// Re-planning for maintenance must resolve the view's unqualified table names
+/// the same way CREATE did: within the view's own database, never through a
+/// TEMP table that happens to share a source table's name (#9456).
+fn plan_in_view_scope(
+    view_name: &str,
+    namespace: NamespaceRef,
+    name: &str,
+    select: &ast::Select,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<MaintenancePlan> {
+    resolver.with_view_scope(namespace, name.to_string(), || {
+        plan_view(view_name, select, resolver, connection)
+    })
+}
+
 /// Build the bound maintenance plan with a transient connection resolver.
 fn build_plan_for_connection(
     view_name: &str,
@@ -274,18 +371,18 @@ fn build_plan_for_connection(
         Arc::new(crate::dialect::EngineDialect),
         None,
     );
-    // Re-planning for maintenance must resolve the view's unqualified table
-    // names the same way CREATE did: within the view's own database, never
-    // through a TEMP table that happens to share a source table's name
-    // (#9456). Materialized views always live in main.
+    // Materialized views always live in main.
     let (namespace, name) = schema.demangle_name(view_name);
-    resolver.with_view_scope(
+    plan_in_view_scope(
+        view_name,
         NamespaceRef {
             database_id: crate::MAIN_DB_ID,
             id: namespace,
         },
-        name.to_string(),
-        || plan_view(view_name, select, &resolver, connection),
+        name,
+        select,
+        &resolver,
+        connection,
     )
 }
 
