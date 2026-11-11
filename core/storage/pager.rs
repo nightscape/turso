@@ -4560,6 +4560,17 @@ impl Pager {
 
             match state {
                 CommitState::PrepareWal => {
+                    if self.dirty_pages.read().is_empty() {
+                        // Writing the WAL header changes the WAL's checksum, which
+                        // makes every open read snapshot stale, so a commit that
+                        // appends no frame leaves it alone. The WAL may still be
+                        // dirty: frames written through write_frame_raw() bypass
+                        // dirty-page tracking, and callers (e.g. the sync engine
+                        // ending a raw-insert session) treat this commit as their
+                        // durability barrier. WaitSync fsyncs if the WAL is dirty.
+                        self.commit_info.write().state = CommitState::WaitSync;
+                        continue;
+                    }
                     let page_sz = self.get_page_size_unchecked();
                     let c = wal.prepare_wal_start(page_sz)?;
                     let Some(c) = c else {
@@ -4587,17 +4598,6 @@ impl Pager {
                 CommitState::ScanAndIssueReads { db_size } => {
                     let mut commit_info = self.commit_info.write();
                     let dirty_pages = self.dirty_pages.read();
-
-                    if dirty_pages.is_empty() {
-                        // No dirty pages to flush, but that does not mean the
-                        // WAL is clean: frames written through
-                        // write_frame_raw() bypass dirty-page tracking, and
-                        // callers (e.g. the sync engine ending a raw-insert
-                        // session) treat this commit as their durability
-                        // barrier. WaitSync fsyncs if the WAL is dirty.
-                        commit_info.state = CommitState::WaitSync;
-                        continue;
-                    }
                     commit_info.initialize(dirty_pages.len() as usize);
                     let mut cache = self.page_cache.write();
 
