@@ -75,5 +75,6 @@ mod test_ivm_refresh_dependent_matview;
 mod test_ivm_refresh_in_transaction;
 mod test_ivm_refresh_state_index_orphan;
 mod test_ivm_registered_scalar_fn;
+mod test_ivm_rowid_join_seek;
 mod test_ivm_text_array_words;
 mod test_match_counter_uninitialized_repro;

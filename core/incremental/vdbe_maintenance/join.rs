@@ -8,7 +8,7 @@ use super::stream::{
 use super::MaintenanceInput;
 use crate::incremental::dag;
 use crate::namespace::NamespaceId;
-use crate::schema::{Index, Schema};
+use crate::schema::{Column, Index, Schema};
 use crate::sync::Arc;
 use crate::translate::collate::{comparison_collation, CollationSeq};
 use crate::translate::emitter::Resolver;
@@ -347,9 +347,10 @@ fn emit_join_phase(
                     root_page: index.root_page,
                     db: 0,
                 });
-                cursor_id
+                Some(cursor_id)
             }
-            ProbeTarget::Ephemeral(probe_index) => probe_index.cursor_id,
+            ProbeTarget::Rowid => None,
+            ProbeTarget::Ephemeral(probe_index) => Some(probe_index.cursor_id),
         };
         (probe, index_cursor)
     });
@@ -380,7 +381,18 @@ fn emit_join_phase(
             next_labels[depth - 1]
         };
         match probe.as_ref().filter(|_| depth == 1) {
-            Some((probe, index_cursor)) => {
+            Some((probe, None)) => {
+                probe_loops[depth] = Some(emit_rowid_probe(
+                    program,
+                    cursor_ids[pos],
+                    probe,
+                    &table_references,
+                    resolver,
+                    skip_label,
+                    loop_labels[depth],
+                )?);
+            }
+            Some((probe, Some(index_cursor))) => {
                 probe_loops[depth] = Some(emit_index_probe(
                     program,
                     &contract.inputs[pos].arrangement,
@@ -558,9 +570,9 @@ fn bind_join_input(
     Ok(())
 }
 
-/// An ON term `column = key` that lets a join seek an index on `column`
-/// instead of scanning the btree: `key` reads only the outer input, and the
-/// comparison's affinity and collation agree with the index.
+/// An ON term `column = key` that lets a join seek `column` instead of
+/// scanning the btree: `key` reads only the outer input, and the
+/// comparison's affinity and collation agree with the target.
 struct IndexProbe {
     key: ast::Expr,
     affinity: Affinity,
@@ -569,11 +581,25 @@ struct IndexProbe {
 
 enum ProbeTarget {
     Stored(Arc<Index>),
+    /// The btree's own rowid, which the probed column holds.
+    Rowid,
     Ephemeral(ProbeIndex),
 }
 
-/// The first ON term the inner input of a phase can seek an index with,
-/// preferring a stored index to the probe index.
+impl ProbeTarget {
+    /// Lower is preferred: a stored index and the rowid need no build, and
+    /// a probe index is built only after many probes.
+    fn preference(&self) -> u8 {
+        match self {
+            Self::Stored(_) => 0,
+            Self::Rowid => 1,
+            Self::Ephemeral(_) => 2,
+        }
+    }
+}
+
+/// The ON term with the most preferred target the inner input of a phase
+/// can seek; among equal targets, the first term.
 fn index_probe(
     input: &JoinInputContract,
     on: &[ast::Expr],
@@ -582,7 +608,14 @@ fn index_probe(
     resolver: &Resolver,
 ) -> Result<Option<IndexProbe>> {
     let arrangement = &input.arrangement;
-    if arrangement.probe_index().is_none() && arrangement.stored_indexes().is_empty() {
+    let rowid_is_binding_rowid = matches!(
+        arrangement.binding_rowid_columns(),
+        [Some(ArrangementIdentityColumn::RowId)]
+    );
+    if arrangement.probe_index().is_none()
+        && arrangement.stored_indexes().is_empty()
+        && !rowid_is_binding_rowid
+    {
         return Ok(None);
     }
     let [binding] = input.schema.bindings.as_slice() else {
@@ -593,52 +626,98 @@ fn index_probe(
     let phase_id = *binding_remap.get(&binding.logical_id).ok_or_else(|| {
         LimboError::InternalError("join input has no phase-local binding".to_string())
     })?;
+    let mut best: Option<IndexProbe> = None;
     for condition in on {
         let bound = remap_bound_expr(condition, binding_remap)?;
         let ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) = &bound else {
             continue;
         };
         for (column_side, key) in [(lhs, rhs), (rhs, lhs)] {
-            let ast::Expr::Column { table, column, .. } = column_side.as_ref() else {
-                continue;
-            };
-            if *table != phase_id || reads_binding(key, phase_id)? {
-                continue;
-            }
-            let table_column = &binding.table.columns()[*column];
-            let context = ExprContext::new(Some(table_references), resolver);
-            let affinity = comparison_affinity(lhs.as_ref(), rhs.as_ref(), &context);
-            let collation = comparison_collation(lhs, rhs, &context)?;
-            let stored = arrangement.stored_indexes().iter().find(|stored| {
-                let index_column = &stored.index.columns[0];
-                stored.column == *column
-                    && index_column.collation == collation
-                    && stored_index_affinity_ok(
-                        table_column.affinity(),
-                        arrangement.table().columns()[index_column.pos_in_table].affinity(),
-                        affinity,
-                    )
-            });
-            if stored.is_none() && !table_column.affinity().index_affinity_ok(affinity) {
-                continue;
-            }
-            let target = match (stored, arrangement.probe_index()) {
-                (Some(stored), _) => ProbeTarget::Stored(stored.index.clone()),
-                (None, Some(probe_index))
-                    if probe_index.column == *column && collation == table_column.collation() =>
-                {
-                    ProbeTarget::Ephemeral(*probe_index)
-                }
+            let column = match skip_collate(column_side) {
+                ast::Expr::Column { table, column, .. } if *table == phase_id => Some(*column),
+                ast::Expr::RowId { table, .. } if *table == phase_id => None,
                 _ => continue,
             };
-            return Ok(Some(IndexProbe {
-                key: key.as_ref().clone(),
-                affinity,
-                target,
-            }));
+            if reads_binding(key, phase_id)? {
+                continue;
+            }
+            let context = ExprContext::new(Some(table_references), resolver);
+            let affinity = comparison_affinity(lhs.as_ref(), rhs.as_ref(), &context);
+            let target = match column {
+                None => rowid_is_binding_rowid.then_some(ProbeTarget::Rowid),
+                Some(column) => column_probe_target(
+                    arrangement,
+                    &binding.table.columns()[column],
+                    column,
+                    affinity,
+                    comparison_collation(lhs, rhs, &context)?,
+                ),
+            };
+            let Some(target) = target else {
+                continue;
+            };
+            if best
+                .as_ref()
+                .is_none_or(|best| target.preference() < best.target.preference())
+            {
+                best = Some(IndexProbe {
+                    key: key.as_ref().clone(),
+                    affinity,
+                    target,
+                });
+            }
         }
     }
-    Ok(None)
+    Ok(best)
+}
+
+/// The operand under COLLATE and parentheses, which change no value: the
+/// comparison's collation is taken from the whole term.
+fn skip_collate(mut expr: &ast::Expr) -> &ast::Expr {
+    loop {
+        match expr {
+            ast::Expr::Collate(inner, _) => expr = inner,
+            ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => expr = &exprs[0],
+            _ => return expr,
+        }
+    }
+}
+
+/// The target a join can seek for a term on logical column `column`.
+fn column_probe_target(
+    arrangement: &ArrangementHandle,
+    table_column: &Column,
+    column: usize,
+    affinity: Affinity,
+    collation: CollationSeq,
+) -> Option<ProbeTarget> {
+    let stored = arrangement.stored_indexes().iter().find(|stored| {
+        let index_column = &stored.index.columns[0];
+        stored.column == column
+            && index_column.collation == collation
+            && stored_index_affinity_ok(
+                table_column.affinity(),
+                arrangement.table().columns()[index_column.pos_in_table].affinity(),
+                affinity,
+            )
+    });
+    if let Some(stored) = stored {
+        return Some(ProbeTarget::Stored(stored.index.clone()));
+    }
+    // The join reads this column with `emit_column_or_rowid`.
+    if arrangement.table().columns()[arrangement.value_columns()[column]].is_rowid_alias() {
+        return Some(ProbeTarget::Rowid);
+    }
+    match arrangement.probe_index() {
+        Some(probe_index)
+            if probe_index.column == column
+                && collation == table_column.collation()
+                && table_column.affinity().index_affinity_ok(affinity) =>
+        {
+            Some(ProbeTarget::Ephemeral(*probe_index))
+        }
+        _ => None,
+    }
 }
 
 /// Whether an index whose entries have `index_affinity` finds every row the
@@ -673,13 +752,17 @@ pub(super) fn reads_binding(expr: &ast::Expr, binding: TableInternalId) -> Resul
 /// than building the index.
 const PROBES_BEFORE_INDEX: i64 = 32;
 
-/// The inner loop of a join phase that seeks an index. Over a probe index it
-/// scans the btree until the index is built.
-struct ProbeLoop {
-    index_cursor: usize,
-    seek_loop: BranchOffset,
-    /// For a probe index: the probe count and [`PROBES_BEFORE_INDEX`].
-    scan_before_index: Option<(usize, usize)>,
+/// The inner loop of a join phase that seeks. Over a probe index it scans
+/// the btree until the index is built.
+enum ProbeLoop {
+    /// A rowid seek positions the btree on at most one row.
+    Rowid,
+    Index {
+        index_cursor: usize,
+        seek_loop: BranchOffset,
+        /// For a probe index: the probe count and [`PROBES_BEFORE_INDEX`].
+        scan_before_index: Option<(usize, usize)>,
+    },
 }
 
 impl ProbeLoop {
@@ -689,10 +772,18 @@ impl ProbeLoop {
         btree_cursor: usize,
         scan_loop: BranchOffset,
     ) {
-        let Some((probe_count_reg, probes_before_index_reg)) = self.scan_before_index else {
+        let &Self::Index {
+            index_cursor,
+            seek_loop,
+            scan_before_index,
+        } = self
+        else {
+            return;
+        };
+        let Some((probe_count_reg, probes_before_index_reg)) = scan_before_index else {
             program.emit_insn(Insn::Next {
-                cursor_id: self.index_cursor,
-                pc_if_next: self.seek_loop,
+                cursor_id: index_cursor,
+                pc_if_next: seek_loop,
                 fullscan: false,
                 is_index: true,
             });
@@ -708,8 +799,8 @@ impl ProbeLoop {
             collation: CollationSeq::for_internal_values(),
         });
         program.emit_insn(Insn::Next {
-            cursor_id: self.index_cursor,
-            pc_if_next: self.seek_loop,
+            cursor_id: index_cursor,
+            pc_if_next: seek_loop,
             fullscan: false,
             is_index: true,
         });
@@ -746,6 +837,7 @@ fn emit_index_probe(
     let seek_loop = program.allocate_label();
     let scan_before_index = match &probe.target {
         ProbeTarget::Stored(_) => None,
+        ProbeTarget::Rowid => unreachable!("a rowid probe seeks no index"),
         ProbeTarget::Ephemeral(probe_index) => {
             let probes_before_index_reg = program.alloc_register();
             emit_probe_index_build(
@@ -760,25 +852,7 @@ fn emit_index_probe(
         }
     };
 
-    let key_reg = program.alloc_register();
-    translate_expr(
-        program,
-        Some(table_references),
-        &probe.key,
-        key_reg,
-        resolver,
-    )?;
-    if !matches!(probe.affinity, Affinity::Blob | Affinity::None) {
-        program.emit_insn(Insn::Affinity {
-            start_reg: key_reg,
-            count: NonZeroUsize::MIN,
-            affinities: probe.affinity.aff_mask().to_string(),
-        });
-    }
-    program.emit_insn(Insn::IsNull {
-        reg: key_reg,
-        target_pc: skip_label,
-    });
+    let key_reg = emit_probe_key(program, probe, table_references, resolver, skip_label)?;
     program.emit_insn(Insn::SeekGE {
         is_index: true,
         cursor_id: index_cursor,
@@ -808,11 +882,89 @@ fn emit_index_probe(
         });
     }
     program.preassign_label_to_next_insn(loop_label);
-    Ok(ProbeLoop {
+    Ok(ProbeLoop::Index {
         index_cursor,
         seek_loop,
         scan_before_index,
     })
+}
+
+/// Position `btree_cursor` on the row whose rowid equals the probe key, or
+/// skip when there is none. A key that is no integer after the comparison's
+/// affinity equals no rowid; `SeekRowid` alone would truncate a REAL key.
+fn emit_rowid_probe(
+    program: &mut ProgramBuilder,
+    btree_cursor: usize,
+    probe: &IndexProbe,
+    table_references: &TableReferences,
+    resolver: &Resolver,
+    skip_label: BranchOffset,
+    loop_label: BranchOffset,
+) -> Result<ProbeLoop> {
+    let key_reg = emit_probe_key(program, probe, table_references, resolver, skip_label)?;
+    let not_int_label = program.allocate_label();
+    let seek_label = program.allocate_label();
+    program.emit_insn(Insn::MustBeInt {
+        reg: key_reg,
+        target_pc: Some(not_int_label),
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: seek_label,
+    });
+    // MustBeInt rejects the REAL -2^63, which still equals the rowid i64::MIN.
+    program.preassign_label_to_next_insn(not_int_label);
+    let min_reg = program.alloc_register();
+    program.emit_insn(Insn::Real {
+        value: i64::MIN as f64,
+        dest: min_reg,
+    });
+    program.emit_insn(Insn::Ne {
+        lhs: key_reg,
+        rhs: min_reg,
+        target_pc: skip_label,
+        flags: CmpInsFlags::default(),
+        collation: CollationSeq::for_internal_values(),
+    });
+    program.emit_int(i64::MIN, key_reg);
+    program.preassign_label_to_next_insn(seek_label);
+    program.emit_insn(Insn::SeekRowid {
+        cursor_id: btree_cursor,
+        src_reg: key_reg,
+        target_pc: skip_label,
+    });
+    program.preassign_label_to_next_insn(loop_label);
+    Ok(ProbeLoop::Rowid)
+}
+
+/// The probe key in a new register, converted by the comparison's affinity;
+/// a NULL key jumps to `skip_label`, as it equals nothing.
+fn emit_probe_key(
+    program: &mut ProgramBuilder,
+    probe: &IndexProbe,
+    table_references: &TableReferences,
+    resolver: &Resolver,
+    skip_label: BranchOffset,
+) -> Result<usize> {
+    let key_reg = program.alloc_register();
+    translate_expr(
+        program,
+        Some(table_references),
+        &probe.key,
+        key_reg,
+        resolver,
+    )?;
+    if !matches!(probe.affinity, Affinity::Blob | Affinity::None) {
+        program.emit_insn(Insn::Affinity {
+            start_reg: key_reg,
+            count: NonZeroUsize::MIN,
+            affinities: probe.affinity.aff_mask().to_string(),
+        });
+    }
+    program.emit_insn(Insn::IsNull {
+        reg: key_reg,
+        target_pc: skip_label,
+    });
+    Ok(key_reg)
 }
 
 /// Count the probe; until [`PROBES_BEFORE_INDEX`] probes jump to `scan`,

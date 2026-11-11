@@ -533,15 +533,13 @@ impl CostCase {
             decl == self.keys.parent && !decl.refused() && self.keys.join == JoinCollate::Columns;
         let parent = self.parent_index.is_some_and(|form| form.fits(decl));
         let input = self.input_index.is_some_and(|form| form.fits(decl));
-        // A join on the rowid alias is not claimed flat.
-        let rowid = decl == Decl::Integer && self.id == IdConstraint::PrimaryKey;
         keys && match self.shape {
             Shape::Recursive => parent,
             Shape::MatviewOverMatview => input,
             // A recursive input may store a value outside its column's declared
             // class, so a join reads it without its index until each arm's stored type is known.
             Shape::MatviewOverRecursive => false,
-            Shape::PlainJoin => parent && self.id.fits() && !rowid,
+            Shape::PlainJoin => parent && self.id.fits(),
             Shape::RecursiveOverMatview => input,
         }
     }
