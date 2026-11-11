@@ -798,7 +798,7 @@ pub fn insn_to_row(
                 0,
                 String::new(),
             ),
-            Insn::ArrayLength { reg, dest } => (
+            Insn::ArrayLength { reg, dest, .. } => (
                 "ArrayLength",
                 *reg as i64,
                 *dest as i64,

@@ -24,7 +24,11 @@ pub(super) fn emit_array_element_loop(
     let reg_elem = program.alloc_register();
     let reg_acc = program.alloc_register();
 
-    program.emit_insn(Insn::ArrayLength { reg, dest: reg_len });
+    program.emit_insn(Insn::ArrayLength {
+        reg,
+        dest: reg_len,
+        text_elements: false,
+    });
     // ArrayLength is NULL for a value that is not an array. An array column
     // and each level of an array of arrays hold only arrays and NULLs, so
     // this is a damaged value; stop instead of looping with no end.
@@ -119,11 +123,15 @@ pub(crate) enum ArrayInput<'a> {
     /// Only array blobs, such as an array read from a column.
     Blob,
     /// Text such as `'{1,2}'`, parsed into an array. Any other value is an
-    /// error that names `target`.
-    Text(&'a ArrayEncodeTarget),
+    /// error that names `target`. `texts`: the array holds texts
+    /// ([array_holds_texts]).
+    Text {
+        target: &'a ArrayEncodeTarget,
+        texts: bool,
+    },
     /// Text parsed into an array when it is one. Any other value is left as it
     /// is, so that an index key such as `'x'` matches no row, as in a scan.
-    TextIfArray,
+    TextIfArray { texts: bool },
 }
 
 /// Runs `transform_leaf` on the register holding each leaf element of the
@@ -137,12 +145,13 @@ pub(crate) fn emit_array_leaf_loop(
     input: ArrayInput,
     transform_leaf: impl FnOnce(&mut ProgramBuilder, usize) -> Result<()>,
 ) -> Result<()> {
-    let parse = |program: &mut ProgramBuilder, target: ArrayEncodeTarget| {
+    let parse = |program: &mut ProgramBuilder, target: ArrayEncodeTarget, texts: bool| {
         program.emit_insn(Insn::ArrayEncode {
             data: Box::new(ArrayEncodeData {
                 reg,
                 element_type: "ANY".into(),
                 element_kind: StrictType::Any,
+                text_elements: texts,
                 dimensions,
                 target,
             }),
@@ -150,23 +159,24 @@ pub(crate) fn emit_array_leaf_loop(
     };
     let not_an_array_label = match input {
         ArrayInput::Blob => None,
-        ArrayInput::Text(target) => {
-            parse(program, target.clone());
+        ArrayInput::Text { target, texts } => {
+            parse(program, target.clone(), texts);
             None
         }
-        ArrayInput::TextIfArray => {
+        ArrayInput::TextIfArray { texts } => {
             // array_length is NULL for a value that is not an array.
             let length_reg = program.alloc_register();
             program.emit_insn(Insn::ArrayLength {
                 reg,
                 dest: length_reg,
+                text_elements: texts,
             });
             let label = program.allocate_label();
             program.emit_insn(Insn::IsNull {
                 reg: length_reg,
                 target_pc: label,
             });
-            parse(program, ArrayEncodeTarget::IndexKey);
+            parse(program, ArrayEncodeTarget::IndexKey, texts);
             Some(label)
         }
     };
@@ -215,13 +225,17 @@ pub(super) fn emit_array_encode_as(
     resolver: &Resolver,
     target: ArrayEncodeTarget,
 ) -> Result<()> {
+    let text_elements = expr_type::array_column_holds_texts(col, resolver.schema());
     if let Some(resolved) = resolved {
         if resolved.has_encode_or_coerce() {
             emit_array_leaf_loop(
                 program,
                 reg,
                 col.array_dimensions(),
-                ArrayInput::Text(&target),
+                ArrayInput::Text {
+                    target: &target,
+                    texts: text_elements,
+                },
                 |program, leaf_reg| {
                     emit_store_value(program, resolved, leaf_reg, &col.ty_params, resolver)
                 },
@@ -247,6 +261,7 @@ pub(super) fn emit_array_encode_as(
             reg,
             element_type,
             element_kind,
+            text_elements,
             dimensions: col.array_dimensions(),
             target,
         }),

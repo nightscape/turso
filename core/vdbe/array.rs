@@ -50,7 +50,7 @@ enum UnquotedElements {
 }
 
 fn parse_text_array_as(text: &str, unquoted: UnquotedElements) -> Option<Vec<Value>> {
-    let text = text.trim();
+    let text = text.trim_ascii();
     if text.starts_with('{') && text.ends_with('}') {
         return parse_pg_text_array(text, unquoted);
     }
@@ -62,7 +62,7 @@ fn parse_text_array_as(text: &str, unquoted: UnquotedElements) -> Option<Vec<Val
 /// Quoted strings use `"..."` with `\"` and `\\` escapes.
 /// Unquoted tokens are read as `unquoted` says.
 fn parse_pg_text_array(text: &str, unquoted: UnquotedElements) -> Option<Vec<Value>> {
-    let inner = text[1..text.len() - 1].trim();
+    let inner = text[1..text.len() - 1].trim_ascii();
     if inner.is_empty() {
         return Some(Vec::new());
     }
@@ -90,15 +90,14 @@ fn parse_pg_text_array(text: &str, unquoted: UnquotedElements) -> Option<Vec<Val
                 match bytes[pos] {
                     b'\\' => {
                         pos += 1;
-                        if pos >= bytes.len() {
-                            return None;
+                        let escaped = inner[pos..].chars().next()?;
+                        match escaped {
+                            'n' => s.push('\n'),
+                            't' => s.push('\t'),
+                            'r' => s.push('\r'),
+                            other => s.push(other),
                         }
-                        match bytes[pos] {
-                            b'n' => s.push('\n'),
-                            b't' => s.push('\t'),
-                            b'r' => s.push('\r'),
-                            other => s.push(other as char),
-                        }
+                        pos += escaped.len_utf8();
                     }
                     b'"' => {
                         pos += 1;
@@ -109,10 +108,8 @@ fn parse_pg_text_array(text: &str, unquoted: UnquotedElements) -> Option<Vec<Val
                         let ch = remaining.chars().next().unwrap_or('\u{FFFD}');
                         s.push(ch);
                         pos += ch.len_utf8();
-                        continue;
                     }
                 }
-                pos += 1;
             }
             elements.push(Value::build_text(s));
         } else {

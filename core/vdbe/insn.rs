@@ -418,6 +418,9 @@ pub struct ArrayEncodeData {
     /// The declared element type name, for error messages.
     pub element_type: Arc<str>,
     pub element_kind: crate::types::StrictType,
+    /// Whether a text literal's words stay texts: `{007}` holds '007' in a
+    /// TEXT[]. Otherwise a word that reads as a number becomes that number.
+    pub text_elements: bool,
     /// The number of dimensions of the array: 2 for INTEGER[][].
     pub dimensions: u32,
     pub target: ArrayEncodeTarget,
@@ -1047,6 +1050,8 @@ pub enum Insn {
     ArrayLength {
         reg: usize,
         dest: usize,
+        /// Read a text literal as [ArrayEncodeData::text_elements] says.
+        text_elements: bool,
     },
 
     /// Create an array from contiguous registers (static count).

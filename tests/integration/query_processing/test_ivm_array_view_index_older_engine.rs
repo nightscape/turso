@@ -6,6 +6,8 @@
 use crate::common::{try_limbo_exec_rows, TempDatabase};
 use proptest::prelude::*;
 use proptest::test_runner::{Config as RunnerConfig, TestCaseError, TestRunner};
+use rusqlite::types::Value;
+use std::collections::BTreeMap;
 
 /// Writes to `a` (the source table of `am`, whose `ints` and `words` columns
 /// `am_ints` and `am_words` index): insert, change either array, or delete.
@@ -16,9 +18,14 @@ fn older_engine_array_index_ops() -> impl Strategy<Value = Vec<String>> {
             v.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
         )
     });
-    // A user can write the word `nan` or `inf` (any case), but the engine refuses it as a
-    // non-finite number; the `{NAn}` example in the test pins that refusal until the parse is fixed.
-    let word = "[a-zA-Z]{1,3}".prop_filter("not a number", |w| w.parse::<f64>().is_err());
+    let word = prop_oneof![
+        "[a-zA-Z]{1,3}".boxed(),
+        prop::sample::select(vec![
+            "nan", "NAn", "inf", "-inf", "Infinity", "007", "1.50", "1e2"
+        ])
+        .prop_map(str::to_string)
+        .boxed(),
+    ];
     let words = prop::collection::vec(word, 0..4).prop_map(|v| format!("'{{{}}}'", v.join(",")));
     let op = (0u8..4, 1i64..12, ints, words).prop_map(|(kind, id, ints, words)| match kind {
         0 => format!("INSERT OR REPLACE INTO a VALUES ({id}, {ints}, {words}, 'x{id}')"),
@@ -60,13 +67,98 @@ fn older_engine_db() -> (tempfile::TempDir, TempDatabase) {
     (dir, db)
 }
 
+/// The `words` text per id of the rows the fixture's `.sql` sibling inserts.
+fn fixture_words() -> BTreeMap<i64, String> {
+    [
+        (1, "{b,a}"),
+        (2, "{a}"),
+        (3, "{ab}"),
+        (4, "{Z}"),
+        (5, "{a,b,c}"),
+        (6, "{}"),
+        (7, "{zz}"),
+        (8, "{ab,b}"),
+    ]
+    .into_iter()
+    .map(|(id, words)| (id, words.to_string()))
+    .collect()
+}
+
+/// The `words` per id after the statements of `older_engine_array_index_ops`.
+fn model_words(ops: &[String]) -> BTreeMap<i64, String> {
+    let mut words = fixture_words();
+    for sql in ops {
+        let quoted = |from: usize| {
+            let start = from + sql[from..].find('\'').unwrap() + 1;
+            let end = start + sql[start..].find('\'').unwrap();
+            (sql[start..end].to_string(), end + 1)
+        };
+        let id = |marker: &str| -> i64 {
+            let rest = &sql[sql.find(marker).unwrap() + marker.len()..];
+            rest[..rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len())]
+                .parse()
+                .unwrap()
+        };
+        if sql.starts_with("INSERT OR REPLACE") {
+            let (_, after_ints) = quoted(0);
+            words.insert(id("VALUES ("), quoted(after_ints).0);
+        } else if sql.starts_with("UPDATE a SET words") {
+            if let Some(w) = words.get_mut(&id("WHERE id = ")) {
+                *w = quoted(0).0;
+            }
+        } else if sql.starts_with("DELETE") {
+            words.remove(&id("WHERE id = "));
+        }
+    }
+    words
+}
+
+fn words_of(
+    conn: &std::sync::Arc<turso_core::Connection>,
+    db: &TempDatabase,
+    table: &str,
+) -> Result<BTreeMap<i64, String>, String> {
+    let sql = format!("SELECT id, words FROM {table}");
+    try_limbo_exec_rows(db, conn, &sql)
+        .map_err(|e| format!("`{sql}`: {e}"))?
+        .into_iter()
+        .map(|row| match row.as_slice() {
+            [Value::Integer(id), Value::Text(words)] => Ok((*id, words.clone())),
+            other => Err(format!("`{sql}`: unexpected row {other:?}")),
+        })
+        .collect()
+}
+
 fn writes_keep_the_view_indexes_consistent(ops: &[String]) -> Result<(), String> {
     let (_dir, db) = older_engine_db();
     let conn = db.connect_limbo();
     for sql in ops {
         conn.execute(sql).map_err(|e| format!("`{sql}`: {e}"))?;
     }
-    views_match_their_select(&conn, &db, ops)
+    views_match_their_select(&conn, &db, ops)?;
+    let want = model_words(ops);
+    let got = words_of(&conn, &db, "a")?;
+    if got != want {
+        return Err(format!(
+            "after {ops:?}: words of a {got:?}, expected {want:?}"
+        ));
+    }
+    // The view reads its array columns back as their stored record, so it is
+    // compared with the table by value.
+    let same_words = rows(
+        &conn,
+        &db,
+        "SELECT a.id FROM a JOIN am ON a.id = am.id WHERE a.words = am.words",
+    )?;
+    let ids = rows(&conn, &db, "SELECT id FROM a")?;
+    if same_words != ids {
+        return Err(format!(
+            "after {ops:?}: am holds the words of a for ids {same_words:?}, a has {ids:?}"
+        ));
+    }
+    Ok(())
 }
 
 fn views_match_their_select(
@@ -92,17 +184,13 @@ fn views_match_their_select(
 
 #[test]
 fn an_older_engines_indexes_on_array_view_columns_stay_consistent_under_writes() {
-    let (_dir, db) = older_engine_db();
-    let conn = db.connect_limbo();
-    let refused = vec!["INSERT OR REPLACE INTO a VALUES (1, '{}', '{NAn}', 'x1')".to_string()];
-    let err = conn.execute(&refused[0]).unwrap_err().to_string();
-    assert!(
-        err.contains("a.words"),
-        "the refusal must name the column: {err}"
-    );
-    views_match_their_select(&conn, &db, &refused).unwrap();
-
     let fixed: Vec<Vec<String>> = vec![
+        vec!["INSERT OR REPLACE INTO a VALUES (1, '{}', '{NAn}', 'x1')".to_string()],
+        vec![
+            "INSERT OR REPLACE INTO a VALUES (9, '{1}', '{007,1.50,1e2,-inf,Infinity,inf,nan}', 'x9')"
+                .to_string(),
+            "UPDATE a SET words = '{NAn,007}' WHERE id = 2".to_string(),
+        ],
         vec![],
         vec!["DELETE FROM a WHERE id = 1".to_string()],
         vec![

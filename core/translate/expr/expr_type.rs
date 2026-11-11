@@ -721,6 +721,17 @@ pub(crate) fn type_ordering(ty: &ExprType, schema: &Schema) -> Option<TypeOrderi
     }
 }
 
+/// Whether an array of type `ty` holds texts, so that a text literal of it
+/// keeps every word as written: `{007}` holds '007', not 7.
+pub(crate) fn array_holds_texts(ty: &ExprType, schema: &Schema) -> bool {
+    type_ordering(ty, schema) == Some(TypeOrdering::TextArray)
+}
+
+/// [array_holds_texts] for the array column `column` of a STRICT table.
+pub(crate) fn array_column_holds_texts(column: &Column, schema: &Schema) -> bool {
+    array_holds_texts(&column_type(column, true, schema), schema)
+}
+
 /// Custom types only apply to columns of STRICT tables.
 pub(crate) fn column_type(column: &Column, is_strict: bool, schema: &Schema) -> ExprType {
     let scalar = match schema.get_type_def(&column.ty_str, is_strict) {
@@ -743,7 +754,7 @@ pub(crate) fn column_type(column: &Column, is_strict: bool, schema: &Schema) -> 
     ExprType::array(scalar, column.array_dimensions())
 }
 
-fn cast_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
+pub(crate) fn cast_type(type_name: &ast::Type, schema: &Schema) -> ExprType {
     let name = crate::util::dequote(&type_name.name);
     let scalar = match custom_cast_target(&name, type_name, schema) {
         Some(custom) => custom,

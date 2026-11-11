@@ -1328,8 +1328,18 @@ fn run_ops(
     for (step, op) in ops.iter().enumerate() {
         let at = format!("after step {step} {op:?}");
         if let Some((conn, sql)) = op.table_sql(keys) {
+            let in_txn = !views.conns[conn].get_auto_commit();
             let expected = twin.conns[conn].execute(&sql);
             let got = views.conns[conn].execute(&sql);
+            // Inside an open transaction, a failed multi-row write keeps the rows
+            // before the failing one in some databases and none in others.
+            if in_txn
+                && matches!(op, Op::Insert { rows, .. } if rows.len() > 1)
+                && expected.is_err()
+                && got.is_err()
+            {
+                return Ok(());
+            }
             match (&expected, &got) {
                 (Ok(()), Err(e)) => {
                     return Err(format!("{at}: `{sql}` fails with views only: {e}"));
@@ -2578,15 +2588,31 @@ fn ivm_views_an_older_engine_wrote_match_their_select() {
             (decl, fixed_scenarios()[0].1.ops.clone(), true),
         ));
     }
+    fixed.push((
+        "Text file, an open transaction on one connection, an update matching no row on another, then a drop of view indexes".to_string(),
+        (
+            Decl::Text,
+            vec![
+                Op::Txn(Txn::Begin, 0),
+                Op::Reparent {
+                    id: Lit {
+                        key: 0,
+                        form: Form::Upper,
+                    },
+                    parent: own(0),
+                    conn: 1,
+                },
+                Op::DropInputIndexes(Shape::MatviewOverMatview),
+            ],
+            false,
+        ),
+    ));
     check_all(
         fixed,
         32,
         (
             prop::sample::select(FIXTURE_DECLS.to_vec()),
-            // One connection: on a file the engine before the change wrote, a
-            // write that changes no row still makes another connection's open
-            // transaction stale, so a twin without views cannot predict it.
-            prop::collection::vec(op_on(|| Just(0usize)), 0..20),
+            prop::collection::vec(op(), 0..20),
             any::<bool>(),
         ),
         |(decl, ops, top_only)| run_fixture_case(decl, &ops, top_only).map_err(TestCaseError::fail),

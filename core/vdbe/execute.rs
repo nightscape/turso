@@ -162,7 +162,8 @@ use super::{
         exec_array_append, exec_array_cat, exec_array_contains, exec_array_contains_all,
         exec_array_overlap, exec_array_position, exec_array_prepend, exec_array_remove,
         exec_array_slice, exec_array_to_string, exec_string_to_array, make_array_from_registers,
-        parse_text_array, serialize_array_from_blob, values_to_record_blob,
+        parse_text_array, parse_text_array_of_texts, serialize_array_from_blob,
+        values_to_record_blob,
     },
     insn::{
         AddSequenceData, AggStepData, ArrayEncodeData, ArrayEncodeTarget, ClearBtreeCount, Cookie,
@@ -2701,6 +2702,7 @@ pub fn op_array_encode(
         reg,
         element_type,
         element_kind,
+        text_elements,
         dimensions,
         target,
     } = data.as_ref();
@@ -2737,6 +2739,7 @@ pub fn op_array_encode(
     // Extract elements from either blob (MakeArray) or text (JSON literal)
     let raw_elements = match val {
         Value::Blob(b) => array_values_from_blob(b).ok(),
+        Value::Text(text) if *text_elements => parse_text_array_of_texts(text.as_str()),
         Value::Text(text) => parse_text_array(text.as_str()),
         _ => None,
     };
@@ -2943,10 +2946,22 @@ pub fn op_array_length(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(ArrayLength { reg, dest }, insn);
+    load_insn!(
+        ArrayLength {
+            reg,
+            dest,
+            text_elements
+        },
+        insn
+    );
 
-    let val = state.registers[*reg].get_value();
-    match compute_array_length(val) {
+    let len = match state.registers[*reg].get_value() {
+        Value::Text(text) if *text_elements => {
+            parse_text_array_of_texts(text.as_str()).map(|elements| elements.len() as i64)
+        }
+        val => compute_array_length(val),
+    };
+    match len {
         Some(count) => state.registers[*dest].set_int(count),
         None => state.registers[*dest].set_null(),
     };
