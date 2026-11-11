@@ -221,13 +221,13 @@ Every element of an `INTEGER[][]` must be an array (or NULL), and the elements o
 
 An array type has at most 7 dimensions. A type with more bracket pairs, such as `INTEGER[][][][][][][][]`, is an error.
 
-Arrays can be inserted using the `ARRAY[...]` constructor or as JSON text:
+Arrays can be inserted using the `ARRAY[...]` constructor or as text in the `{...}` form (JSON array text such as `'["a","b"]'` is an error):
 
 ```sql
-INSERT INTO sensors VALUES (1, ARRAY[1.5, 2.5, 3.5], '["a","b"]', '[0, 1, 1]');
+INSERT INTO sensors VALUES (1, ARRAY[1.5, 2.5, 3.5], '{a,b}', '{0,1,1}');
 ```
 
-Arrays are displayed as JSON arrays on output. Element types are validated against the declared base type — for example, an `INTEGER[]` column rejects non-numeric text elements. The element type must be one a STRICT column accepts (INTEGER, INT, REAL, TEXT, BLOB, ANY) or a custom type, in columns and in `CAST(... AS type[])` alike: `CAST('{5}' AS FLOAT[])` is an error.
+Arrays are displayed as `{...}` text on output, for example `{a,b}`. Element types are validated against the declared base type — for example, an `INTEGER[]` column rejects non-numeric text elements. The element type must be one a STRICT column accepts (INTEGER, INT, REAL, TEXT, BLOB, ANY) or a custom type, in columns and in `CAST(... AS type[])` alike: `CAST('{5}' AS FLOAT[])` is an error.
 
 Arrays compare element by element, each element by its stored value: in an `INTEGER[]`, `'{1}'` and `'{1.0}'` are equal, while in a `TEXT[]` they are the different texts `'1'` and `'1.0'`. Because of this, an array of a type with its own order, such as `numeric[]`, is an error: its elements would not compare in that type's order.
 

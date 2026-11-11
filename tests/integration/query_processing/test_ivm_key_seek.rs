@@ -1331,8 +1331,10 @@ fn run_ops(
             let in_txn = !views.conns[conn].get_auto_commit();
             let expected = twin.conns[conn].execute(&sql);
             let got = views.conns[conn].execute(&sql);
-            // Inside an open transaction, a failed multi-row write keeps the rows
-            // before the failing one in some databases and none in others.
+            // Inside an open transaction, a failed row rolls back the earlier rows of
+            // its statement only when the statement may abort (statement journal, as
+            // in SQLite). View maintenance counts as such a source; a runtime type
+            // error on a plain table does not, so that table keeps the earlier rows.
             if in_txn
                 && matches!(op, Op::Insert { rows, .. } if rows.len() > 1)
                 && expected.is_err()

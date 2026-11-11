@@ -18,7 +18,7 @@ pub(crate) fn array_values_from_blob(blob: &[u8]) -> Result<Vec<Value>> {
 }
 
 /// Extract elements from any Value that represents an array.
-/// Handles record blobs, JSON text input, and NULL (empty array).
+/// Handles record blobs, `{...}` text input, and NULL (empty array).
 /// Returns None if the value cannot be interpreted as an array.
 pub fn array_values_from_any(arr: &Value) -> Option<Vec<Value>> {
     match arr {

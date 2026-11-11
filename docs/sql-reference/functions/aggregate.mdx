@@ -497,15 +497,15 @@ Collects all values of X (including NULLs) into an array. Returns NULL if the gr
 
 ```sql
 SELECT array_agg(name) FROM users;
--- ["Alice","Bob","Charlie"]
+-- {Alice,Bob,Charlie}
 
 SELECT department, array_agg(name) FROM employees GROUP BY department;
 ```
 
 | department | array_agg(name) |
 |------------|-----------------|
-| Engineering | ["Alice","Bob"] |
-| Sales | ["Charlie","Diana","Eve"] |
+| Engineering | {Alice,Bob} |
+| Sales | {Charlie,Diana,Eve} |
 
 ```sql
 -- Control ordering with a subquery
